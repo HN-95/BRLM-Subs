@@ -16,14 +16,19 @@ const subtitleCache = new Map();
 
 const manifest = {
     id: "com.arabic.elite.autoshift",
-    version: "18.0.0",
+    version: "18.1.0",
     name: "BRLM Subs (Tri-Core Engine)",
     description: "Perfectly synced Arabic subtitles using Checkpoint Enforcers & temporal math.",
     resources: ["subtitles"],
     types: ["movie", "series"],
     idPrefixes: ["tt"],
     behaviorHints: { configurable: true, configurationRequired: true },
-    catalogs: []
+    catalogs: [],
+    // WE ADDED THIS: Now Stremio knows exactly how to read the URL!
+    config: [
+        { key: "osApiKey", type: "text", required: false },
+        { key: "subdlApiKey", type: "text", required: false }
+    ]
 };
 
 const builder = new addonBuilder(manifest);
