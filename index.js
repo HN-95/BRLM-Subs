@@ -24,7 +24,6 @@ const manifest = {
     idPrefixes: ["tt"],
     behaviorHints: { configurable: true, configurationRequired: true },
     catalogs: [],
-    // WE ADDED THIS: Now Stremio knows exactly how to read the URL!
     config: [
         { key: "osApiKey", type: "text", required: false },
         { key: "subdlApiKey", type: "text", required: false }
@@ -71,6 +70,29 @@ function formatTime(ms) {
     return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(x).padStart(3,'0')}`;
 }
 
+// ==========================================
+// THE WATERMARK INJECTOR
+// ==========================================
+function injectWatermark(srtText, isSynced) {
+    try {
+        let parsed = srtParser.fromSrt(srtText);
+        parsed = parsed.map((line, idx) => ({ ...line, id: (idx + 2).toString() }));
+        const syncMessage = isSynced ? "⚙️ Auto-Synced by BRLM Engine" : "⚠️ Raw Fallback Subtitle";
+        parsed.unshift({
+            id: "1",
+            startTime: "00:00:01,000",
+            endTime: "00:00:06,000",
+            text: `${syncMessage}\nMade by HN95`
+        });
+        return srtParser.toSrt(parsed);
+    } catch {
+        return srtText; 
+    }
+}
+
+// ==========================================
+// SOURCE FETCHERS
+// ==========================================
 async function searchOS(url, osKey) {
     try {
         const res = await fetch(url, { headers: { 'Api-Key': osKey, 'User-Agent': 'BRLM_TriCore_v18' } });
@@ -187,6 +209,9 @@ async function getZipSrt(zipUrl) {
     } catch { return null; }
 }
 
+// ==========================================
+// TRI-CORE MATH ENGINE
+// ==========================================
 function buildEngIndex(engParsed) { return engParsed.map(l => l.startSeconds * 1000).sort((a, b) => a - b); }
 
 function nearestValue(sortedArr, target) {
@@ -242,9 +267,15 @@ function computePrecisionShift(englishText, arabicText, label = '') {
     const consensusLines = allDeltas.filter(d => Math.abs(d - globalMedian) < 300).length;
     let alignmentPct = (consensusLines / arParsed.length) * 100;
 
-    console.log(`    [V18] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms`);
+    // --> V17 LOGGING RESTORED <--
+    console.log(`    [V18.1] ${label} | Raw Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms`);
 
-    if (driftMs > 350) alignmentPct -= 40; 
+    // The Penalty Box
+    if (driftMs > 350) {
+        alignmentPct -= 40; 
+        console.log(`      ↳ ⚠️ Penalized for drifting! Score dropped to ${alignmentPct.toFixed(1)}%`);
+    }
+
     if (alignmentPct < 40) return { passed: false, alignmentPct };
 
     let fixedText = arabicText;
@@ -259,8 +290,10 @@ function computePrecisionShift(englishText, arabicText, label = '') {
     return { passed: true, fixedText, offsetMs: globalMedian, alignmentPct, driftMs };
 }
 
+// ==========================================
+// MAIN HANDLER
+// ==========================================
 builder.defineSubtitlesHandler(async (args) => {
-    // Extract User APIs from the URL (or fall back to yours)
     const osKey = args.config?.osApiKey || DEFAULT_OS_KEY;
     const subdlKey = args.config?.subdlApiKey || DEFAULT_SUBDL_KEY;
 
@@ -273,9 +306,12 @@ builder.defineSubtitlesHandler(async (args) => {
 
     const releaseTokens = tokeniseRelease(streamName || '');
 
-    console.log(`\n[V18 Request] IMDb: ${imdbId} | Hash: ${videoHash||'none'} | Configured User`);
+    // --> V17 LOGGING RESTORED <--
+    console.log(`\n===========================================`);
+    console.log(`[V18.1 Request] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Hash: ${videoHash||'none'}`);
 
     try {
+        console.log(`\n[Step 1] Fetching English baseline...`);
         const engOsCandidates = await fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: 3, osKey });
         const engSubdlCandidates = await fetchSubdlCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2, subdlKey });
         const engYtsCandidates = await fetchYtsCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2 });
@@ -289,10 +325,17 @@ builder.defineSubtitlesHandler(async (args) => {
 
         for (const c of allEngCandidates) {
             englishData = await c._fetchFn();
-            if (englishData) break;
+            if (englishData) {
+                console.log(`✅ Baseline found via ${c.source}`);
+                break;
+            }
         }
-        if (!englishData) return { subtitles: [] };
+        if (!englishData) {
+            console.log(`❌ No English baseline found. Aborting.`);
+            return { subtitles: [] };
+        }
 
+        console.log(`\n[Step 2] Fetching Top Arabic candidates from OS, SubDL, and YTS...`);
         const [arOsCandidates, arSubdlCandidates, arYtsCandidates] = await Promise.all([
             fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: 4, osKey }),
             fetchSubdlCandidates({ imdbId, lang: 'ar', season, episode, releaseTokens, limit: 4, subdlKey }),
@@ -305,29 +348,38 @@ builder.defineSubtitlesHandler(async (args) => {
             ...arYtsCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl) }))
         ];
 
+        console.log(`\n[Step 3] Tri-Core Scan of ${allArabic.length} candidates...`);
+
         let bestFallback = null;
         let successfulMatches = [];
 
         for (let i = 0; i < allArabic.length; i++) {
             const candidate = allArabic[i];
+            console.log(`--> #${i + 1} ${candidate.source} | "${candidate.releaseName}"`);
+
             const arabicData = await candidate._fetchFn();
             if (!arabicData) continue;
+            
             if (!bestFallback) bestFallback = { candidate: candidate, text: arabicData.text };
+            
             const result = computePrecisionShift(englishData.text, arabicData.text, `#${i+1}`);
 
             if (result.passed) {
                 successfulMatches.push({ ...result, candidate, index: i + 1 });
             }
         }
-if (successfulMatches.length > 0) {
+
+        if (successfulMatches.length > 0) {
             successfulMatches.sort((a, b) => b.alignmentPct - a.alignmentPct);
             const champion = successfulMatches[0];
-            
-            // ---> WE ARE ADDING THIS LINE BACK IN <---
-            console.log(`\n🏆 [APEX CHAMPION] ${champion.candidate.source} | Align: ${champion.alignmentPct.toFixed(1)}% | Shift: ${champion.offsetMs.toFixed(0)}ms\n`);
-            
             const cacheId = `elite_true_${Date.now()}.srt`;
-            subtitleCache.set(cacheId, champion.fixedText);
+            
+            // --> V17 LOGGING RESTORED <--
+            console.log(`\n🏆 [APEX CHAMPION] Candidate #${champion.index} (${champion.candidate.source}) won with ${champion.alignmentPct.toFixed(1)}% match!`);
+
+            const finalSrt = injectWatermark(champion.fixedText, true);
+            subtitleCache.set(cacheId, finalSrt);
+            
             let offsetDisplay = champion.offsetMs > 0 ? `+${champion.offsetMs.toFixed(0)}` : `${champion.offsetMs.toFixed(0)}`;
 
             return {
@@ -339,19 +391,27 @@ if (successfulMatches.length > 0) {
         }
 
         if (bestFallback) {
-            console.log(`\n⚠️ [FALLBACK USED] No candidate passed the threshold.\n`);
             const cacheId = `elite_false_${Date.now()}.srt`;
-            subtitleCache.set(cacheId, bestFallback.text);
+            
+            // --> V17 LOGGING RESTORED <--
+            console.log(`\n[Done] No passing candidate found. Serving fallback.`);
+
+            const finalSrt = injectWatermark(bestFallback.text, false);
+            subtitleCache.set(cacheId, finalSrt);
+            
             return {
                 subtitles: [{
                     id: cacheId, url: `${BASE_URL}/dl/${cacheId}`, lang: "ara",
-                    title: `[isSynced: False] ⚠️ Unverified Fallback\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}`
+                    title: `[isSynced: False] ⚠️ Raw Fallback\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}`
                 }]
             };
         }
         return { subtitles: [] };
 
-    } catch (error) { return { subtitles: [] }; }
+    } catch (error) { 
+        console.error("❌ Fatal:", error.message);
+        return { subtitles: [] }; 
+    }
 });
 
 const app = express();
@@ -385,7 +445,6 @@ app.get('/', (req, res) => {
         <div class="container">
             <h1>BRLM Tri-Core Engine</h1>
             <p class="subtitle">Perfectly synced Arabic subtitles via temporal math.</p>
-            <p class="subtitle">Made By HN95.</p>
             <form id="configForm">
                 <label for="osApiKey">OpenSubtitles API Key (Optional)</label>
                 <input type="text" id="osApiKey" placeholder="Leave blank to use default server key">
@@ -402,19 +461,12 @@ app.get('/', (req, res) => {
                 e.preventDefault();
                 const osKey = document.getElementById('osApiKey').value.trim();
                 const subdlKey = document.getElementById('subdlApiKey').value.trim();
-                
                 let configObj = {};
                 if (osKey) configObj.osApiKey = osKey;
                 if (subdlKey) configObj.subdlApiKey = subdlKey;
-
-                // Build the Stremio installation URL
                 const baseUrl = window.location.origin.replace('https://', '').replace('http://', '');
                 let finalUrl = 'stremio://' + baseUrl;
-                
-                if (Object.keys(configObj).length > 0) {
-                    finalUrl += '/' + encodeURIComponent(JSON.stringify(configObj));
-                }
-                
+                if (Object.keys(configObj).length > 0) finalUrl += '/' + encodeURIComponent(JSON.stringify(configObj));
                 finalUrl += '/manifest.json';
                 window.location.href = finalUrl;
             });
@@ -436,5 +488,8 @@ app.get('/dl/:cacheId', (req, res) => {
 app.use(getRouter(builder.getInterface()));
 
 app.listen(PORT, () => {
-    console.log(`\n🚀 BRLM Tri-Core Engine V18 is LIVE!`);
+    console.log(`\n=========================================`);
+    console.log(`🚀 Arabic Elite Engine V18.1 (Tri-Core) is LIVE`);
+    console.log(`➡️  Base URL: ${BASE_URL}`);
+    console.log(`=========================================\n`);
 });
