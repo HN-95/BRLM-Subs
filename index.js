@@ -376,6 +376,7 @@ app.get('/', (req, res) => {
         <div class="container">
             <h1>BRLM Tri-Core Engine</h1>
             <p class="subtitle">Perfectly synced Arabic subtitles via temporal math.</p>
+            <p class="subtitle">Made By HN95.</p>
             <form id="configForm">
                 <label for="osApiKey">OpenSubtitles API Key (Optional)</label>
                 <input type="text" id="osApiKey" placeholder="Leave blank to use default server key">
