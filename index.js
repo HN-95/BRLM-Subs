@@ -319,10 +319,13 @@ builder.defineSubtitlesHandler(async (args) => {
                 successfulMatches.push({ ...result, candidate, index: i + 1 });
             }
         }
-
-        if (successfulMatches.length > 0) {
+if (successfulMatches.length > 0) {
             successfulMatches.sort((a, b) => b.alignmentPct - a.alignmentPct);
             const champion = successfulMatches[0];
+            
+            // ---> WE ARE ADDING THIS LINE BACK IN <---
+            console.log(`\n🏆 [APEX CHAMPION] ${champion.candidate.source} | Align: ${champion.alignmentPct.toFixed(1)}% | Shift: ${champion.offsetMs.toFixed(0)}ms\n`);
+            
             const cacheId = `elite_true_${Date.now()}.srt`;
             subtitleCache.set(cacheId, champion.fixedText);
             let offsetDisplay = champion.offsetMs > 0 ? `+${champion.offsetMs.toFixed(0)}` : `${champion.offsetMs.toFixed(0)}`;
@@ -336,6 +339,7 @@ builder.defineSubtitlesHandler(async (args) => {
         }
 
         if (bestFallback) {
+            console.log(`\n⚠️ [FALLBACK USED] No candidate passed the threshold.\n`);
             const cacheId = `elite_false_${Date.now()}.srt`;
             subtitleCache.set(cacheId, bestFallback.text);
             return {
