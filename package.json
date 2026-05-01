@@ -1,0 +1,22 @@
+{
+  "name": "stremio-arabic",
+  "version": "1.0.0",
+  "description": "Arabic Elite Tri-Core Engine",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "adm-zip": "^0.5.17",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "iconv-lite": "^0.7.2",
+    "srt-parser-2": "^1.2.3",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
