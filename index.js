@@ -15,16 +15,24 @@ const PORT = 7000;
 const subtitleCache = new Map();
 
 const manifest = {
-    id: "com.arabic.elite.autoshift",
-    version: "17.1.0",
-    name: "Arabic Elite Engine (V17 + Addic7ed)",
-    description: "Slices movies into 5 checkpoints across OS, SubDL, YTS, and Addic7ed.",
-    resources: ["subtitles"],
+    id: "org.brlm.arabicelitev17",
+    version: "1.0.0",
+    name: "Arabic Elite Engine V17",
+    description: "Dual-Engine Arabic Subtitle Auto-Shifter.",
     types: ["movie", "series"],
-    idPrefixes: ["tt"],
-    catalogs: []
+    catalogs: [],
+    resources: ["subtitles"],
+    
+    // 🔥 ADD THESE TWO BLOCKS:
+    behaviorHints: { 
+        configurable: true, 
+        configurationRequired: true 
+    },
+    config: [
+        { key: "osKey", type: "text", title: "OpenSubtitles API Key", required: true },
+        { key: "subdlKey", type: "text", title: "SubDL API Key", required: true }
+    ]
 };
-
 const builder = new addonBuilder(manifest);
 
 const RELEASE_TOKENS = [
@@ -464,6 +472,14 @@ builder.defineSubtitlesHandler(async (args) => {
     const episodeStr = idPartsStr[2] ?? '0';
     const videoHash  = args.extra?.videoHash ?? null; 
     
+    const userOsKey = args.config?.osKey;
+    const userSubdlKey = args.config?.subdlKey;
+
+    if (!userOsKey || !userSubdlKey) {
+        console.log(`\n❌ [Access Denied] User attempted to fetch subtitles without mandatory API keys.`);
+        return { subtitles: [] };
+    }
+    
     const requestKey = `${imdbIdStr}:${seasonStr}:${episodeStr}`;
     const now = Date.now();
 
@@ -683,6 +699,8 @@ builder.defineSubtitlesHandler(async (args) => {
 
 const app = express();
 app.use(cors());
+
+// 1. The Subtitle Download Route (You already have this)
 app.get('/dl/:cacheId', (req, res) => {
     const subText = subtitleCache.get(req.params.cacheId);
     if (subText) {
@@ -692,10 +710,93 @@ app.get('/dl/:cacheId', (req, res) => {
         res.status(404).send('Subtitle expired or not found.');
     }
 });
+
+// 🔥 2. THE NEW LANDING PAGE ROUTE
+// 🔥 2. THE NEW CONFIGURATION LANDING PAGE
+app.get('/', (req, res) => {
+    const host = req.get('host');
+    
+    const html = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Arabic Elite Engine V17 | Setup</title>
+        <style>
+            body { 
+                background-color: #141414; color: #e5e5e5; font-family: 'Segoe UI', Tahoma, sans-serif; 
+                display: flex; flex-direction: column; align-items: center; justify-content: center; 
+                height: 100vh; margin: 0; text-align: center;
+            }
+            .container { background-color: #202020; padding: 40px; border-radius: 12px; border: 1px solid #333; max-width: 500px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+            h1 { color: #8A5A99; font-size: 2rem; margin-top: 0; }
+            p { color: #a0a0a0; font-size: 1rem; margin-bottom: 30px; }
+            .input-group { text-align: left; margin-bottom: 20px; }
+            label { font-size: 0.9rem; color: #bbb; display: block; margin-bottom: 8px; font-weight: bold; }
+            input { 
+                width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #444; 
+                background-color: #111; color: white; font-size: 1rem; box-sizing: border-box;
+            }
+            input:focus { outline: none; border-color: #8A5A99; }
+            .install-btn { 
+                background-color: #8A5A99; color: white; padding: 15px; width: 100%; border: none;
+                border-radius: 8px; font-size: 1.2rem; font-weight: bold; cursor: pointer;
+                transition: background-color 0.2s; margin-top: 10px;
+            }
+            .install-btn:hover { background-color: #6c4777; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Arabic Elite Engine</h1>
+            <p>To use this private auto-shifting engine, you must provide your own API keys.</p>
+            
+            <div class="input-group">
+                <label>OpenSubtitles REST API Key *</label>
+                <input type="text" id="osKey" placeholder="Enter OS API Key" required>
+            </div>
+            
+            <div class="input-group">
+                <label>SubDL API Key *</label>
+                <input type="text" id="subdlKey" placeholder="Enter SubDL API Key" required>
+            </div>
+
+            <button class="install-btn" onclick="installAddon()">Install to Stremio</button>
+        </div>
+
+        <script>
+            function installAddon() {
+                const os = document.getElementById('osKey').value.trim();
+                const subdl = document.getElementById('subdlKey').value.trim();
+                
+                if (!os || !subdl) {
+                    alert("⚠️ Both API keys are mandatory to use this engine!");
+                    return;
+                }
+
+                // Create the Stremio configuration object
+                const configObj = { osKey: os, subdlKey: subdl };
+                const configStr = encodeURIComponent(JSON.stringify(configObj));
+                
+                // Fire the Stremio app with their custom configuration locked into the URL
+                window.location.href = "stremio://${host}/" + configStr + "/manifest.json";
+            }
+        </script>
+    </body>
+    </html>
+    `;
+    
+    res.send(html);
+});
+
+// 3. Mount the Stremio Addon Router
 app.use(getRouter(builder.getInterface()));
+
+// 4. Start the Server
 app.listen(PORT, () => {
     console.log(`\n=========================================`);
-    console.log(`🚀 Arabic Elite Engine V17 (+ Addic7ed Test) is LIVE`);
-    console.log(`➡️  Add to Stremio: http://127.0.0.1:${PORT}/manifest.json`);
+    console.log(`🚀 Arabic Elite Engine V17 is LIVE`);
+    console.log(`➡️  Landing Page: http://127.0.0.1:${PORT}`);
     console.log(`=========================================\n`);
 });
