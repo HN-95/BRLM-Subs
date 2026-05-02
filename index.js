@@ -743,6 +743,7 @@ app.get('/', (req, res) => {
         <div class="container">
             <h1>Arabic Elite Engine</h1>
             <p>Provide your API keys to install this private auto-shifting engine into Stremio.</p>
+            <p>Made By HN95.</p>
             <div class="input-group">
                 <label>OpenSubtitles REST API Key *</label>
                 <input type="text" id="osKey" placeholder="Enter OS API Key" required>
