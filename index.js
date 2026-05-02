@@ -10,7 +10,7 @@ const AdmZip = require("adm-zip");
 // ---> PASTE YOUR CHROME COOKIE HERE TO BYPASS THE LOGIN WALL <---
 const ADDIC7ED_COOKIE = process.env.ADDIC7ED_COOKIE || "your_fallback_cookie_here";
 
-const PORT = 7000;
+const PORT = process.env.PORT || 7000;
 const subtitleCache = new Map();
 
 const manifest = {
