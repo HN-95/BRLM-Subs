@@ -6,8 +6,7 @@ const parser = require("srt-parser-2").default;
 const srtParser = new parser();
 const AdmZip = require("adm-zip");
 
-const OS_API_KEY = "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL";
-const SUBDL_API_KEY = "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp";
+
 // ---> PASTE YOUR CHROME COOKIE HERE TO BYPASS THE LOGIN WALL <---
 const ADDIC7ED_COOKIE = process.env.ADDIC7ED_COOKIE || "your_fallback_cookie_here";
 
@@ -79,20 +78,21 @@ function formatTime(ms) {
 
 // ==========================================
 // SOURCE 1: OPENSUBTITLES
-// ==========================================
-async function searchOS(url) {
+// Add apiKey parameter
+async function searchOS(url, apiKey) {
     try {
-        const res = await fetch(url, { headers: { 'Api-Key': OS_API_KEY, 'User-Agent': 'StremioArabicElite v17' } });
+        const res = await fetch(url, { headers: { 'Api-Key': apiKey, 'User-Agent': 'StremioArabicElite v17' } });
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
 }
 
-async function getOsSrt(fileId) {
+// Add apiKey parameter
+async function getOsSrt(fileId, apiKey) {
     try {
         const req = await fetch('https://api.opensubtitles.com/api/v1/download', {
             method: 'POST',
-            headers: { 'Api-Key': OS_API_KEY, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite v17', 'Accept': 'application/json' },
+            headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite v17', 'Accept': 'application/json' },
             body: JSON.stringify({ file_id: parseInt(fileId) })
         });
         if (!req.ok) return null;
@@ -104,20 +104,18 @@ async function getOsSrt(fileId) {
     } catch { return null; }
 }
 
-async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10 }) {
+// Add apiKey parameter to the destructured arguments
+async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey }) {
     let results = [];
     if (videoHash) {
         const url = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&moviehash=${videoHash}`;
-        const hashData = await searchOS(url);
-        if (hashData.data?.length) {
-            results.push(...hashData.data.map(s => ({
-                fileId: s.attributes.files[0].file_id, releaseName: s.attributes.release || '', source: 'OS', hashMatch: true
-            })));
-        }
+        const hashData = await searchOS(url, apiKey); // Pass it down
+        // ... rest stays the same
     }
     let poolUrl = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&imdb_id=${imdbId}&order_by=download_count&order_direction=desc`;
     if (season && episode) poolUrl += `&season_number=${season}&episode_number=${episode}`;
-    const poolData = await searchOS(poolUrl);
+    const poolData = await searchOS(poolUrl, apiKey); // Pass it down
+    // ... rest stays the same
 
     if (poolData.data?.length) {
         const poolEntries = poolData.data.slice(0, 20).map(s => ({
@@ -135,9 +133,10 @@ async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, rel
 // ==========================================
 // SOURCE 2: SUBDL
 // ==========================================
-async function getSubdlCandidates(imdbId, langCode, season, episode) {
+async function getSubdlCandidates(imdbId, langCode, season, episode, apiKey) {
     try {
-        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${SUBDL_API_KEY}&imdb_id=tt${imdbId}&languages=${langCode.toLowerCase()}`;
+        // Inject the user's apiKey directly into the URL
+        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${apiKey}&imdb_id=tt${imdbId}&languages=${langCode.toLowerCase()}`;
         url += season && episode ? `&type=tv&season_number=${season}&episode_number=${episode}` : `&type=movie`;
         const res = await fetch(url);
         const data = await res.json();
@@ -151,8 +150,8 @@ async function getSubdlCandidates(imdbId, langCode, season, episode) {
     } catch { return []; }
 }
 
-async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10 }) {
-    const all = await getSubdlCandidates(imdbId, lang, season, episode);
+async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10, apiKey }) {
+    const all = await getSubdlCandidates(imdbId, lang, season, episode, apiKey); // Pass it down
     if (!all.length) return [];
     const scored = all.map(c => ({ ...c, score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(c.releaseName)) : 0 }));
     scored.sort((a, b) => b.score - a.score);
@@ -519,9 +518,8 @@ builder.defineSubtitlesHandler(async (args) => {
             // STEP 1: FETCHING BASELINES (THE RULERS)
             // ==========================================
             console.log(`\n[Step 1] Fetching English Baselines...`);
-            const engOsCandidates = await fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: 3 });
-            const engSubdlCandidates = await fetchSubdlCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2 });
-            
+           const engOsCandidates = await fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: 3, apiKey: userOsKey });
+            const engSubdlCandidates = await fetchSubdlCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2, apiKey: userSubdlKey });
             let tvBaseline = null;
             let movieOsBaseline = null;
             let movieSubdlBaseline = null;
@@ -532,7 +530,7 @@ builder.defineSubtitlesHandler(async (args) => {
                 const allTvCandidates = [
                      ...engAddic7edCandidates.map(c => ({ ...c, _fetchFn: () => getAddic7edSrt(c.downloadUrl, c.refererUrl) })),
                      ...engSubdlCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl, c.refererUrl) })),
-                     ...engOsCandidates.map(c => ({ ...c, _fetchFn: () => getOsSrt(c.fileId) }))
+                     ...engOsCandidates.map(c => ({ ...c, _fetchFn: () => getOsSrt(c.fileId, userOsKey) }))
                 ];
                 for (const c of allTvCandidates) {
                     tvBaseline = await c._fetchFn();
@@ -542,8 +540,8 @@ builder.defineSubtitlesHandler(async (args) => {
             } else {
                 console.log(`[Step 1] Movie detected. Engaging Dual-Baseline Engine (OS & SubDL)...`);
                 // 1. Lock OS Baseline
-                for (const c of engOsCandidates) {
-                    movieOsBaseline = await getOsSrt(c.fileId);
+               for (const c of engOsCandidates) {
+                    movieOsBaseline = await getOsSrt(c.fileId, userOsKey);
                     if (movieOsBaseline) { console.log(`✅ OS Baseline Locked`); break; }
                 }
                 // 2. Lock SubDL Baseline
