@@ -9,7 +9,7 @@ const AdmZip = require("adm-zip");
 const OS_API_KEY = "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL";
 const SUBDL_API_KEY = "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp";
 // ---> PASTE YOUR CHROME COOKIE HERE TO BYPASS THE LOGIN WALL <---
-const ADDIC7ED_COOKIE = "PHPSESSID=7ahdnps9hv4388rhqqk0cqabk7; wikisubtitlesuser=1189026; wikisubtitlespass=c999fd9f819578dfbbe69dcb919d0536";
+const ADDIC7ED_COOKIE = process.env.ADDIC7ED_COOKIE || "your_fallback_cookie_here";
 
 const PORT = 7000;
 const subtitleCache = new Map();
