@@ -491,10 +491,18 @@ builder.defineSubtitlesHandler(async (args) => {
         }
     }
 
-    if (mainRequestCache.has(requestKey)) {
+if (mainRequestCache.has(requestKey)) {
         const cachedEntry = mainRequestCache.get(requestKey);
+        
         if (videoHash && !cachedEntry.hasHash) {
-            console.log(`\n⚔️ [Hash Override] Precision Fetch detected! Breaking the blind lock...`);
+            // 🔥 THE FIX: If the blind request has been running for more than 1.5s, 
+            // it is already actively downloading. Do NOT break the lock and trigger an API ban!
+            if (now - cachedEntry.timestamp > 1500) {
+                console.log(`⏳ [Hash Merge] Blind request is already processing. Piggybacking to save API limits...`);
+                return await cachedEntry.promise;
+            } else {
+                console.log(`\n⚔️ [Hash Override] Precision Fetch detected! Breaking the blind lock...`);
+            }
         } else if (now - cachedEntry.timestamp < 10000) {
             console.log(`⏳ [GLOBAL LOCK] Concurrency detected. Waiting for primary thread...`);
             return await cachedEntry.promise;
