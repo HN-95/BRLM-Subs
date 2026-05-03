@@ -393,7 +393,7 @@ function median(arr) {
     return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-function computePrecisionShift(englishText, arabicText, label = '') {
+function computePrecisionShift(englishText, arabicText, label = '', isHashed = false, fileType = 'UNKNOWN') {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
     let engParsed, arParsed;
     try {
@@ -439,16 +439,31 @@ function computePrecisionShift(englishText, arabicText, label = '') {
 
     if (alignmentPct < 40) return { passed: false, alignmentPct };
 
-    let fixedText = arabicText;
+   let fixedText = arabicText;
+    let finalParsed = arParsed; // Hold a reference to the array to modify
+
     if (Math.abs(globalMedian) > 50) {
-        const shifted = arParsed.map(line => ({
+        finalParsed = arParsed.map(line => ({
             ...line,
             startTime: formatTime(Math.max(0, line.startSeconds * 1000 - globalMedian)),
             endTime:   formatTime(Math.max(0, line.endSeconds   * 1000 - globalMedian))
         }));
-        fixedText = srtParser.toSrt(shifted);
         console.log(`    [Auto-Shift] −${globalMedian.toFixed(1)}ms applied.`);
     }
+
+    // 🔥 ONSCREEN WATERMARK INJECTION 🔥
+    let rating = "Way off 🔴";
+    if (alignmentPct >= 95) rating = "Accurate 🟢";
+    else if (alignmentPct >= 80) rating = "A bit off 🟡";
+
+   finalParsed.unshift({
+        id: "0",
+        startTime: "00:00:01,000",
+        endTime: "00:00:06,000",
+        text: `{\\an8}<font color="#8A5A99"><b>[ Arabic Elite Engine ]</b></font>\nType: ${fileType} | isHashed: ${isHashed ? 'T' : 'F'} | SyncLevel: ${rating}\nMatch: ${alignmentPct.toFixed(0)}% | Delay: ${globalMedian > 0 ? '+' : ''}${globalMedian.toFixed(0)}ms`
+    });
+
+    fixedText = srtParser.toSrt(finalParsed);
 
     return { passed: true, fixedText, offsetMs: globalMedian, alignmentPct, driftMs };
 }
@@ -462,7 +477,9 @@ const mainRequestCache = new Map();
 // MAIN HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 builder.defineSubtitlesHandler(async (args) => {
-    const idPartsStr = args.id.split(':');
+	console.log(`\n🕵️ [PAYLOAD DEBUG] Raw Stremio Extras:`, JSON.stringify(args.extra || {}));
+
+   const idPartsStr = args.id.split(':');
     const imdbIdStr  = idPartsStr[0].replace('tt', '');
     const seasonStr  = idPartsStr[1] ?? '0';
     const episodeStr = idPartsStr[2] ?? '0';
@@ -479,27 +496,35 @@ builder.defineSubtitlesHandler(async (args) => {
     const requestKey = `${imdbIdStr}:${seasonStr}:${episodeStr}`;
     const now = Date.now();
 
-    if (!videoHash) {
-        console.log(`\n⏱️  [Blind Request] No hash. Sleeping 1.5s for precision fetch...`);
-        await new Promise(r => setTimeout(r, 1500));
-        if (mainRequestCache.has(requestKey) && mainRequestCache.get(requestKey).hasHash) {
-            console.log(`🛑 [Blind Request] Hash request took the lock. Aborting.`);
-            return { subtitles: [] };
+    // ── 1. VIP HASH ROUTE ──────────────────────────────────────────────
+    if (videoHash) {
+        // If a blind request managed to lock the cache, we smash the lock
+        if (mainRequestCache.has(requestKey) && !mainRequestCache.get(requestKey).hasHash) {
+            console.log(`\n⚔️  [Hash Override] VIP Hash arrived! Smashing the blind lock...`);
+            mainRequestCache.delete(requestKey);
+        } 
+        // If another hash request is already running perfectly, piggyback on it
+        else if (mainRequestCache.has(requestKey)) {
+            console.log(`⏳ [GLOBAL LOCK] Hash request already processing. Piggybacking...`);
+            return await mainRequestCache.get(requestKey).promise;
         }
     }
 
-    if (mainRequestCache.has(requestKey)) {
-        const cachedEntry = mainRequestCache.get(requestKey);
-        if (videoHash && !cachedEntry.hasHash) {
-            if (now - cachedEntry.timestamp > 1500) {
-                console.log(`⏳ [Hash Merge] Blind request already processing. Piggybacking...`);
-                return await cachedEntry.promise;
+    // ── 2. BLIND ROUTE ─────────────────────────────────────────────────
+    if (!videoHash) {
+        console.log(`\n⏱️  [Blind Request] No hash. Sleeping 4000ms for VIP fetch...`);
+        await new Promise(r => setTimeout(r, 4000));
+
+        // Waking up: Did a VIP Hash request arrive while we slept?
+        if (mainRequestCache.has(requestKey)) {
+            const cache = mainRequestCache.get(requestKey);
+            if (cache.hasHash) {
+                console.log(`🛑 [Blind Request] VIP took over! Yielding to the Hash thread...`);
+                return await cache.promise;
             } else {
-                console.log(`\n⚔️  [Hash Override] Breaking blind lock for precision fetch...`);
+                console.log(`⏳ [GLOBAL LOCK] Another blind request running. Piggybacking...`);
+                return await cache.promise;
             }
-        } else if (now - cachedEntry.timestamp < 10000) {
-            console.log(`⏳ [GLOBAL LOCK] Waiting for primary thread...`);
-            return await cachedEntry.promise;
         }
     }
 
@@ -512,16 +537,29 @@ builder.defineSubtitlesHandler(async (args) => {
             const episode       = idParts[2] ?? null;
             const releaseTokens = tokeniseRelease(streamName || '');
 
+            // 🔥 SCANNER: Identify the primary file type for the telemetry UI
+            let detectedType = 'Unknown';
+            const typeTokens = ['remux', 'bluray', 'bdrip', 'web-dl', 'webdl', 'webrip', 'hdtv'];
+            for (const t of typeTokens) {
+                if (releaseTokens.has(t)) {
+                    detectedType = t === 'webdl' ? 'WEB-DL' : t.toUpperCase();
+                    break;
+                }
+            }
+
             console.log(`\n===========================================`);
-            console.log(`[V17] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Hash: ${videoHash||'none'}`);
+            console.log(`[V17] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Hash: ${videoHash||'none'} | Type: ${detectedType}`);
             console.log(`[HOST] ${HOST}`);
 
             // ── STEP 1: ENGLISH BASELINES ──────────────────────────────────────
             console.log(`\n[Step 1] Fetching English baselines...`);
-            const engOsCandidates    = await fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: 3, apiKey: userOsKey });
-            const engSubdlCandidates = await fetchSubdlCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2, apiKey: userSubdlKey });
+            const [engOsCandidates, engSubdlCandidates, engYtsCandidates] = await Promise.all([
+                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: 3, apiKey: userOsKey }),
+                fetchSubdlCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2, apiKey: userSubdlKey }),
+                fetchYtsCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2 })
+            ]);
 
-            let tvBaseline = null, movieOsBaseline = null, movieSubdlBaseline = null;
+            let tvBaseline = null, movieOsBaseline = null, movieSubdlBaseline = null, movieYtsBaseline = null;
 
             if (season && episode) {
                 console.log(`[Step 1] TV — Addic7ed > SubDL > OS hierarchy...`);
@@ -537,7 +575,7 @@ builder.defineSubtitlesHandler(async (args) => {
                 }
                 if (!tvBaseline) { console.log(`❌ No TV baseline found.`); return { subtitles: [] }; }
             } else {
-                console.log(`[Step 1] Movie — Dual-Baseline Engine...`);
+                console.log(`[Step 1] Movie — Tri-Baseline Engine...`);
                 for (const c of engOsCandidates) {
                     movieOsBaseline = await getOsSrt(c.fileId, userOsKey);
                     if (movieOsBaseline) { console.log(`✅ OS baseline locked`); break; }
@@ -546,11 +584,17 @@ builder.defineSubtitlesHandler(async (args) => {
                     movieSubdlBaseline = await getZipSrt(c.downloadUrl, c.refererUrl);
                     if (movieSubdlBaseline) { console.log(`✅ SubDL baseline locked`); break; }
                 }
-                if (!movieOsBaseline && !movieSubdlBaseline) { console.log(`❌ No movie baseline found.`); return { subtitles: [] }; }
+                for (const c of engYtsCandidates) {
+                    movieYtsBaseline = await getZipSrt(c.downloadUrl, c.refererUrl);
+                    if (movieYtsBaseline) { console.log(`✅ YTS baseline locked`); break; }
+                }
+                if (!movieOsBaseline && !movieSubdlBaseline && !movieYtsBaseline) { console.log(`❌ No movie baseline found.`); return { subtitles: [] }; }
+            
             }
 
-            // ── STEP 2: ARABIC CANDIDATES ──────────────────────────────────────
-            let successfulTvMatches = [], successfulOsMatches = [], successfulSubdlMatches = [];
+        
+           // ── STEP 2: ARABIC CANDIDATES ──────────────────────────────────────
+            let successfulTvMatches = [], successfulOsMatches = [], successfulSubdlMatches = [], successfulYtsMatches = [];
             let fastTrackWinner = null, bestFallback = null;
 
             // Phase 1: TV fast-track via Addic7ed
@@ -562,7 +606,7 @@ builder.defineSubtitlesHandler(async (args) => {
                     const arabicData = await getAddic7edSrt(c.downloadUrl, c.refererUrl);
                     if (!arabicData) continue;
                     if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
-                    const result = computePrecisionShift(tvBaseline.text, arabicData.text, `Addic7ed #${i+1}`);
+                    const result = computePrecisionShift(tvBaseline.text, arabicData.text, `Addic7ed #${i+1}`, c.hashMatch || false, detectedType);
                     if (result.passed) {
                         successfulTvMatches.push({ candidate: c, ...result });
                         if (result.alignmentPct >= 95 && result.driftMs <= 100) {
@@ -574,13 +618,16 @@ builder.defineSubtitlesHandler(async (args) => {
             }
 
             // Phase 2: Movies + TV backups via OS / SubDL
+           // Phase 2: Movies + TV backups via OS / SubDL / YTS
             if (!fastTrackWinner) {
-                console.log(`\n[Phase 2] OS + SubDL candidates...`);
-                const [arOsCandidates, arSubdlCandidates] = await Promise.all([
+                console.log(`\n[Phase 2] OS + SubDL + YTS candidates...`);
+                const [arOsCandidates, arSubdlCandidates, arYtsCandidates] = await Promise.all([
                     fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: 8, apiKey: userOsKey }),
-                    fetchSubdlCandidates({ imdbId, lang: 'ar', season, episode, releaseTokens, limit: 8, apiKey: userSubdlKey })
+                    fetchSubdlCandidates({ imdbId, lang: 'ar', season, episode, releaseTokens, limit: 8, apiKey: userSubdlKey }),
+                    fetchYtsCandidates({ imdbId, lang: 'ar', season, episode, releaseTokens, limit: 8 })
                 ]);
                 const allPhase2 = [
+                    ...arYtsCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl, c.refererUrl) })),
                     ...arSubdlCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl, c.refererUrl) })),
                     ...arOsCandidates.map(c => ({ ...c, _fetchFn: () => getOsSrt(c.fileId, userOsKey) }))
                 ];
@@ -589,24 +636,29 @@ builder.defineSubtitlesHandler(async (args) => {
                     const arabicData = await c._fetchFn();
                     if (!arabicData) continue;
                     if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
+                    
                     if (season && episode && tvBaseline) {
-                        const result = computePrecisionShift(tvBaseline.text, arabicData.text, `TV Backup #${i+1}`);
+                        const result = computePrecisionShift(tvBaseline.text, arabicData.text, `TV Backup #${i+1}`, c.hashMatch || false, detectedType);
                         if (result.passed) successfulTvMatches.push({ candidate: c, ...result });
                     } else {
                         if (movieOsBaseline) {
-                            const resOs = computePrecisionShift(movieOsBaseline.text, arabicData.text, `OS Ruler #${i+1}`);
+                            const resOs = computePrecisionShift(movieOsBaseline.text, arabicData.text, `OS Ruler #${i+1}`, c.hashMatch || false, detectedType);
                             if (resOs.passed) successfulOsMatches.push({ candidate: c, ...resOs });
                         }
                         if (movieSubdlBaseline) {
-                            const resSubdl = computePrecisionShift(movieSubdlBaseline.text, arabicData.text, `SubDL Ruler #${i+1}`);
+                            const resSubdl = computePrecisionShift(movieSubdlBaseline.text, arabicData.text, `SubDL Ruler #${i+1}`, c.hashMatch || false, detectedType);
                             if (resSubdl.passed) successfulSubdlMatches.push({ candidate: c, ...resSubdl });
+                        }
+                        if (movieYtsBaseline) {
+                            const resYts = computePrecisionShift(movieYtsBaseline.text, arabicData.text, `YTS Ruler #${i+1}`, c.hashMatch || false, detectedType);
+                            if (resYts.passed) successfulYtsMatches.push({ candidate: c, ...resYts });
                         }
                     }
                 }
             }
 
             // ── STEP 3: CROWN THE CHAMPION(S) ─────────────────────────────────
-            const SOURCE_WEIGHTS = { 'Addic7ed': 5, 'OS': 2, 'SubDL': 1 };
+            const SOURCE_WEIGHTS = { 'Addic7ed': 5, 'OS': 2, 'YTS': 2, 'SubDL': 1 };
             const sortFn = (a, b) => {
                 const sB = b.alignmentPct + (SOURCE_WEIGHTS[b.candidate.source] || 0);
                 const sA = a.alignmentPct + (SOURCE_WEIGHTS[a.candidate.source] || 0);
@@ -657,6 +709,18 @@ builder.defineSubtitlesHandler(async (args) => {
                         title: `[isSynced: SubDL Ruler | ${subdlChamp.alignmentPct.toFixed(0)}%] (${subdlChamp.offsetMs>0?'+':''}${subdlChamp.offsetMs.toFixed(0)}ms)\n[${subdlChamp.candidate.source}] ${subdlChamp.candidate.releaseName}`
                     });
                 }
+				if (successfulYtsMatches.length > 0) {
+                    successfulYtsMatches.sort(sortFn);
+                    const ytsChamp = successfulYtsMatches[0];
+                    const cacheId = `elite_yts_${Date.now()}.srt`;
+                    subtitleCache.set(cacheId, ytsChamp.fixedText);
+                    finalOutput.push({
+                        id: cacheId,
+                        url: `${HOST}/dl/${cacheId}`,
+                        lang: "ara",
+                        title: `[isSynced: YTS Ruler | ${ytsChamp.alignmentPct.toFixed(0)}%] (${ytsChamp.offsetMs>0?'+':''}${ytsChamp.offsetMs.toFixed(0)}ms)\n[${ytsChamp.candidate.source}] ${ytsChamp.candidate.releaseName}`
+                    });
+                }
             }
 
             if (finalOutput.length > 0) {
@@ -665,14 +729,28 @@ builder.defineSubtitlesHandler(async (args) => {
             }
 
             // Unverified fallback
-            if (bestFallback) {
+  if (bestFallback) {
                 console.log(`⚠️  Math engine found no passing candidates. Serving unverified fallback.`);
+
+                // 🔥 Inject an Unverified Warning Watermark 🔥
+                let fallbackParsed;
+                try {
+                    fallbackParsed = srtParser.fromSrt(bestFallback.text);
+                    fallbackParsed.unshift({
+                        id: "0",
+                        startTime: "00:00:01,000",
+                        endTime: "00:00:06,000",
+                        text: `{\\an8}<font color="#8A5A99"><b>[ Arabic Elite Engine ]</b></font>\nisHashed: ${bestFallback.candidate.hashMatch ? 'T' : 'F'} | SyncLevel: Unverified ⚠️\nMatch rate: N/A | Delay: N/A`
+                    });
+                    bestFallback.text = srtParser.toSrt(fallbackParsed);
+                } catch(e) {} // Silently ignore if raw text parsing fails
+
                 const cacheId = `elite_fallback_${Date.now()}.srt`;
                 subtitleCache.set(cacheId, bestFallback.text);
                 return {
                     subtitles: [{
                         id: cacheId,
-                        url: `${HOST}/dl/${cacheId}`,   // ← FIX #1: dynamic HOST
+                        url: `${HOST}/dl/${cacheId}`,
                         lang: "ara",
                         title: `⚠️ Arabic (Unverified Fallback)`
                     }]
