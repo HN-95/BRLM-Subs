@@ -6,47 +6,94 @@ const parser = require("srt-parser-2").default;
 const srtParser = new parser();
 const AdmZip = require("adm-zip");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENVIRONMENT
-//
-// FIX #1 — THE ROOT CAUSE OF THE RAILWAY BUG:
-// The old code hardcoded "http://127.0.0.1:7000" as the URL it told Stremio
-// to fetch the subtitle file from. On Railway, Stremio tries to reach 127.0.0.1
-// on the USER'S own device, which has no such server. Result: no subtitles.
-//
-// The fix: read the public URL from a HOST environment variable.
-// In Railway → Variables, add:  HOST = https://your-app.up.railway.app
-// For local dev, it falls back to 127.0.0.1 automatically.
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// ⚙️ THE MASTER CONFIGURATION HUB
+// Change these variables to tune the entire engine.
+// ═════════════════════════════════════════════════════════════════════════════
+const CONFIG = {
+    // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
+    ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
+    ADDON_VERSION: "1.5.0",
+
+    // ─── API KEYS ─────────────────────────────────────────────────────────────
+    OS_API_KEY: "KNoS2hDPWbOhEzUw557gKLeZ14JEAEGd",
+    SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
+    SUBSOURCE_KEY: "sk_5e25899dbf3a10bd8581778b2fa65698a50d27bec099309d24a185a29ea2bceb",
+    ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
+
+    // ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
+    ARABIC_CANDIDATE_LIMIT: 10,        // Max Arabic subtitles to fetch per provider
+    MOVIE_BASELINE_LIMIT: 3,           // Max English baselines to check per provider (Movies)
+    TV_BASELINE_FETCH_POOL: 60,        // How deep to dig into OS to find distinct TV cuts
+    TV_DISTINCT_CUTS_LIMIT: 3,         // How many distinct TV baselines to lock and test against
+
+    // ─── MATH ENGINE TUNING ───────────────────────────────────────────────────
+    MATH_CHUNKS: 5,                    // Test Points: Number of segments to split the movie into for drift calculation
+    MIN_ACCEPTABLE_DELAY_MS: 50,       // Any delay smaller than this will NOT trigger an auto-shift
+    DISTINCT_CUT_THRESHOLD_SEC: 0.5,   // Minimum seconds of difference needed to treat a TV baseline as a "New Cut"
+    MIN_PASSING_ALIGNMENT_PCT: 40,     // If a subtitle scores below this %, it is immediately trashed
+
+    // ─── DRIFT PENALTIES (If drift > X ms, subtract Y %) ──────────────────────
+    PENALTY_SEVERE_MS: 2500,   PENALTY_SEVERE_PCT: 40,
+    PENALTY_MODERATE_MS: 1200, PENALTY_MODERATE_PCT: 20,
+    PENALTY_LIGHT_MS: 750,     PENALTY_LIGHT_PCT: 10,
+
+    // ─── ONSCREEN RATINGS & LABELS ────────────────────────────────────────────
+    RATINGS: {
+        ACCURATE:   { minPct: 90, maxDriftMs: 500,  label: "Accurate 💎" },
+        STABLE:     { minPct: 75, maxDriftMs: 1500, label: "Stable ✅" },
+        POOR:       { minPct: 50,                   label: "A bit off ⚠️" },
+        UNRELIABLE: {                               label: "Unreliable 🔴" },
+        UNVERIFIED: {                               label: "Unverified ⚠️" },
+        DIAGNOSTIC: {                               label: "Master Ruler 👑" }
+    },
+
+    // ─── NETWORK TIMEOUTS ─────────────────────────────────────────────────────
+    FETCH_TIMEOUT_MS: 6000,            // Standard API timeout
+    SRT_FETCH_TIMEOUT_MS: 8000,        // Subtitle file download timeout
+	
+	
+	// ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
+    STRICT_TYPE_MATCHING: true,        // Force baselines to match stream type (WEB/BluRay/HDTV)
+    ARABIC_CANDIDATE_LIMIT: 10,        // Max Arabic subtitles to fetch per provider
+};
+// ═════════════════════════════════════════════════════════════════════════════
+
 const PORT = process.env.PORT || 7000;
 const HOST = (process.env.HOST || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
-
-const ADDIC7ED_COOKIE = process.env.ADDIC7ED_COOKIE || "";
-
 const subtitleCache = new Map();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MANIFEST
 // ─────────────────────────────────────────────────────────────────────────────
 const manifest = {
-    id: "org.brlm.arabicelitev17",
-    version: "1.0.0",
-    name: "Arabic Elite Engine V17",
-    description: "Dual-Engine Arabic Subtitle Auto-Shifter.",
+    id: "org.brlm." + CONFIG.ADDON_NAME.replace(/[^a-z0-9]/gi, '').toLowerCase(),
+    version: CONFIG.ADDON_VERSION,
+    name: CONFIG.ADDON_NAME,
+    description: "Multi-Cut Sweep & Cross-Matrix Engine. Fully Configurable.",
     types: ["movie", "series"],
     catalogs: [],
-    resources: ["subtitles"],
-    behaviorHints: {
-        configurable: true,
-        configurationRequired: true
-    },
-    config: [
-        { key: "osKey",    type: "text", title: "OpenSubtitles API Key", required: true },
-        { key: "subdlKey", type: "text", title: "SubDL API Key",         required: true }
-    ]
+    resources: ["subtitles"]
 };
 
 const builder = new addonBuilder(manifest);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UNIVERSAL TIMEOUT FETCHER
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchWithTimeout(resource, options = {}) {
+    const { timeout = CONFIG.FETCH_TIMEOUT_MS } = options;
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+        const response = await fetch(resource, { ...options, signal: controller.signal });
+        clearTimeout(id);
+        return response;
+    } catch (error) {
+        clearTimeout(id);
+        throw error;
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RELEASE TOKENISER
@@ -57,14 +104,12 @@ const RELEASE_TOKENS = [
     '2160p','1080p','720p','480p',
     'hevc','x265','x264','h265','h264','av1',
     'hdr','dv','dolby','atmos',
-    'dts','aac','dd5','ac3',
-    'yts','yify','galaxy','mkvking','sparks','fgt','ettv','eztv','rarbg',
-    'ctrlhd','ntb','flux','evo','ion10','telesync','hdts'
+    'dts','aac','dd5','ac3'
 ];
 
 function tokeniseRelease(name) {
     if (!name) return new Set();
-    const lower = name.toLowerCase().replace(/[._\-\s]+/g, ' ');
+   const lower = name.toLowerCase().replace(/[._\s]+/g, ' ');
     const found = new Set();
     for (const token of RELEASE_TOKENS) {
         if (new RegExp(`(?<![a-z])${token.replace('-', '-?')}(?![a-z])`, 'i').test(lower)) {
@@ -81,9 +126,30 @@ function releaseScore(setA, setB) {
     return (2 * matches) / (setA.size + setB.size);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ENCODING & FORMATTING
-// ─────────────────────────────────────────────────────────────────────────────
+function getReleaseTypeGroup(tokens) {
+    if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) return 'WEB';
+    if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip')) return 'BLURAY';
+    if (tokens.has('hdtv') || tokens.has('hdrip')) return 'HDTV';
+    if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) return 'DVD';
+    if (tokens.has('cam') || tokens.has('ts')) return 'CAM';
+    return null;
+}
+
+function filterBaselinesByType(candidates, streamTypeGroup) {
+    // Skip if config is off, or if we couldn't detect the stream type
+    if (!CONFIG.STRICT_TYPE_MATCHING || !streamTypeGroup) return candidates;
+    
+    return candidates.filter(c => {
+        const cTokens = tokeniseRelease(c.releaseName);
+        const cGroup = getReleaseTypeGroup(cTokens);
+        
+        // Strict enforce: Only keep baselines that match the exact group
+        // Note: If cGroup is null (e.g., filename is just "The.Boys.S1E2.srt"), we discard it 
+        // to ensure 100% accuracy, as requested.
+        return cGroup === streamTypeGroup;
+    });
+}
+
 function decodeArabicFile(buffer) {
     const utf8 = buffer.toString('utf8');
     if (/[\u0600-\u06FF]/.test(utf8)) return utf8;
@@ -101,265 +167,161 @@ function formatTime(ms) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 1: OPENSUBTITLES
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchOS(url, apiKey) {
+async function searchOS(url) {
     try {
-        const res = await fetch(url, {
-            headers: { 'Api-Key': apiKey, 'User-Agent': 'StremioArabicElite v17' }
-        });
+        const res = await fetchWithTimeout(url, { headers: { 'Api-Key': CONFIG.OS_API_KEY, 'User-Agent': 'StremioArabicElite' } });
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
 }
 
-async function getOsSrt(fileId, apiKey) {
+async function getOsSrt(fileId) {
     try {
-        const req = await fetch('https://api.opensubtitles.com/api/v1/download', {
+        const req = await fetchWithTimeout('https://api.opensubtitles.com/api/v1/download', {
             method: 'POST',
-            headers: {
-                'Api-Key': apiKey, 'Content-Type': 'application/json',
-                'User-Agent': 'StremioArabicElite v17', 'Accept': 'application/json'
-            },
+            timeout: CONFIG.SRT_FETCH_TIMEOUT_MS,
+            headers: { 'Api-Key': CONFIG.OS_API_KEY, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite', 'Accept': 'application/json' },
             body: JSON.stringify({ file_id: parseInt(fileId) })
         });
         if (!req.ok) return null;
         const data = await req.json();
         if (!data.link) return null;
-        const textReq = await fetch(data.link);
+        
+        const textReq = await fetchWithTimeout(data.link, { timeout: CONFIG.SRT_FETCH_TIMEOUT_MS });
         const buffer = await textReq.arrayBuffer();
         return { text: decodeArabicFile(Buffer.from(buffer)) };
     } catch { return null; }
 }
 
-// FIX #2 — SILENT BUG IN fetchOsCandidates:
-// The hash-search block fetched results but never pushed them into `results`.
-// Hash matches were silently discarded, so the engine always fell back to the
-// popularity pool and often picked the wrong cut.
-async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey }) {
+async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10 }) {
     let results = [];
-
     if (videoHash) {
         const url = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&moviehash=${videoHash}`;
-        const hashData = await searchOS(url, apiKey);
+        const hashData = await searchOS(url);
         if (hashData.data?.length) {
-            // Push hash results FIRST — these are the highest-confidence matches
             results.push(...hashData.data.map(s => ({
                 fileId: s.attributes.files[0].file_id,
-                releaseName: s.attributes.release || '',
-                source: 'OS',
-                hashMatch: true,
-                score: 1
+                releaseName: s.attributes.release || 'OS Hash Match',
+                source: 'OpenSubtitles',
+                score: 2
             })));
         }
     }
 
     let poolUrl = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&imdb_id=${imdbId}&order_by=download_count&order_direction=desc`;
     if (season && episode) poolUrl += `&season_number=${season}&episode_number=${episode}`;
-    const poolData = await searchOS(poolUrl, apiKey);
+    const poolData = await searchOS(poolUrl);
 
     if (poolData.data?.length) {
-        const poolEntries = poolData.data.slice(0, 20).map(s => ({
+        const poolEntries = poolData.data.map(s => ({
             fileId: s.attributes.files[0].file_id,
-            releaseName: s.attributes.release || '',
-            source: 'OS',
-            hashMatch: false,
+            releaseName: s.attributes.release || 'OS Search Match',
+            source: 'OpenSubtitles',
             score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(s.attributes.release || '')) : 0
         }));
-        poolEntries.sort((a, b) => b.score - a.score);
         results.push(...poolEntries);
     }
 
-    // Deduplicate — a hash result may also appear in the popularity pool
+    results.sort((a, b) => b.score - a.score);
     const seen = new Set();
-    results = results.filter(r => {
+    return results.filter(r => {
         if (seen.has(r.fileId)) return false;
         seen.add(r.fileId);
         return true;
-    });
-
-    return results.slice(0, limit);
+    }).slice(0, limit);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 2: SUBDL
 // ─────────────────────────────────────────────────────────────────────────────
-async function getSubdlCandidates(imdbId, langCode, season, episode, apiKey) {
+async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10 }) {
     try {
-        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${apiKey}&imdb_id=tt${imdbId}&languages=${langCode.toLowerCase()}`;
+        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${CONFIG.SUBDL_API_KEY}&imdb_id=tt${imdbId}&languages=${lang.toLowerCase()}`;
         url += season && episode ? `&type=tv&season_number=${season}&episode_number=${episode}` : `&type=movie`;
-        const res = await fetch(url);
+        
+        const res = await fetchWithTimeout(url);
+        if (!res.ok) return [];
         const data = await res.json();
         if (!data.subtitles?.length) return [];
-        return data.subtitles.map(sub => ({
+        
+        const scored = data.subtitles.map(sub => ({
             id: sub.url,
-            releaseName: sub.release_name || 'SubDL',
+            releaseName: sub.release_name || 'SubDL Match',
             downloadUrl: "https://dl.subdl.com" + (sub.url.startsWith('/') ? sub.url : '/' + sub.url),
-            source: 'SubDL'
+            source: 'SubDL',
+            score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(sub.release_name || '')) : 0
         }));
+        
+        scored.sort((a, b) => b.score - a.score);
+        return scored.slice(0, limit);
     } catch { return []; }
 }
 
-async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10, apiKey }) {
-    const all = await getSubdlCandidates(imdbId, lang, season, episode, apiKey);
-    if (!all.length) return [];
-    const scored = all.map(c => ({
-        ...c,
-        score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(c.releaseName)) : 0
-    }));
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, limit);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SOURCE 3: YTS
-// ─────────────────────────────────────────────────────────────────────────────
-async function getYtsCandidates(imdbId, langCode) {
+async function getZipSrt(zipUrl) {
     try {
-        const url = `https://yifysubtitles.org/movie-imdb/tt${imdbId}`;
-        const res = await fetch(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36' }
-        });
-        if (!res.ok) return [];
-        const html = await res.text();
-        const langString = langCode.toLowerCase() === 'ar' ? 'arabic' : 'english';
-        const regex = new RegExp(`href="\\/subtitles\\/([^"]+?-${langString}-[^"]+?)"`, 'gi');
-        let matches;
-        const candidates = [];
-        const seen = new Set();
-        while ((matches = regex.exec(html)) !== null) {
-            const subId = matches[1];
-            if (!seen.has(subId)) {
-                seen.add(subId);
-                candidates.push({
-                    id: subId,
-                    releaseName: subId.replace(/-/g, '.'),
-                    downloadUrl: `https://yifysubtitles.org/subtitle/${subId}.zip`,
-                    refererUrl: url,
-                    source: 'YTS'
-                });
-            }
-        }
-        return candidates;
-    } catch { return []; }
-}
-
-async function fetchYtsCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10 }) {
-    if (season || episode) return [];
-    const all = await getYtsCandidates(imdbId, lang);
-    if (!all.length) return [];
-    const scored = all.map(c => ({
-        ...c,
-        score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(c.releaseName)) : 0
-    }));
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, limit);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SOURCE 4: ADDIC7ED
-// ─────────────────────────────────────────────────────────────────────────────
-async function getShowName(imdbId) {
-    try {
-        const res = await fetch(`https://v3-cinemeta.strem.io/meta/series/tt${imdbId}.json`);
-        const data = await res.json();
-        return data.meta?.name || null;
+        const headers = { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' };
+        const res = await fetchWithTimeout(zipUrl, { headers, timeout: CONFIG.SRT_FETCH_TIMEOUT_MS });
+        if (!res.ok) return null;
+        
+        const buffer = await res.arrayBuffer();
+        const textPreview = Buffer.from(buffer).toString('utf8', 0, 100);
+        if (textPreview.includes('<html') || textPreview.includes('<!DOCTYPE')) return null;
+        
+        const zip = new AdmZip(Buffer.from(buffer));
+        const srtEntry = zip.getEntries().find(e => e.entryName.toLowerCase().endsWith('.srt'));
+        if (!srtEntry) return null;
+        
+        return { text: decodeArabicFile(srtEntry.getData()) };
     } catch { return null; }
 }
 
-async function getAddic7edCandidates(imdbId, langCode, season, episode) {
-    if (!season || !episode) return [];
-    const showName = await getShowName(imdbId);
-    if (!showName) return [];
-    const formattedName = showName.replace(/[^\w\s]/g, '').replace(/\s+/g, '_');
-    const addic7edLang = langCode.toLowerCase() === 'ar' ? '38' : '1';
-    const url = `https://www.addic7ed.com/serie/${formattedName}/${season}/${episode}/${addic7edLang}`;
+// ─────────────────────────────────────────────────────────────────────────────
+// SOURCE 3: SUBSOURCE
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, releaseTokens, limit = 10 }) {
     try {
-        const res = await fetch(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Cookie': ADDIC7ED_COOKIE
-            }
-        });
+        const searchUrl = `https://api.subsource.net/api/v1/movies/search?searchType=imdb&imdb=tt${imdbId}`;
+        const sRes = await fetchWithTimeout(searchUrl, { headers: { 'X-API-Key': CONFIG.SUBSOURCE_KEY } });
+        if (!sRes.ok) return [];
+        
+        const sData = await sRes.json();
+        const movie = sData.data?.[0];
+        if (!movie) return [];
+
+        const targetLang = langCode.toLowerCase() === 'ar' ? 'arabic' : 'english';
+        let url = `https://api.subsource.net/api/v1/subtitles?movieId=${movie.movieId}&language=${targetLang}`;
+        if (season && episode) url += `&season=${season}&episode=${episode}`;
+
+        const res = await fetchWithTimeout(url, { headers: { 'X-API-Key': CONFIG.SUBSOURCE_KEY } });
         if (!res.ok) return [];
-        const html = await res.text();
-        const candidates = [];
-        const seen = new Set();
-        const chunks = html.split('class="language"');
-        for (let i = 1; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            if (chunk.substring(0, 20).includes('Arabic')) {
-                const linkMatch = chunk.match(/href="(\/(?:original|updated)\/\d+\/\d+)"/i);
-                if (linkMatch) {
-                    const downloadPath = linkMatch[1];
-                    if (!seen.has(downloadPath)) {
-                        seen.add(downloadPath);
-                        candidates.push({
-                            id: downloadPath,
-                            releaseName: `Addic7ed.${formattedName}.S${season}E${episode}.ARABIC`,
-                            downloadUrl: `https://www.addic7ed.com${downloadPath}`,
-                            refererUrl: url,
-                            source: 'Addic7ed'
-                        });
-                    }
-                }
-            }
-        }
-        return candidates;
+        
+        const data = await res.json();
+        let subs = Array.isArray(data) ? data : (data.data || data.items || data.subtitles || []);
+        
+        subs = subs.filter(s => s.language?.toLowerCase() === targetLang);
+
+        const scored = subs.map(sub => ({
+            id: sub.subtitleId,
+            releaseName: (sub.releaseInfo && sub.releaseInfo[0]) || 'SubSource Match',
+            downloadUrl: `https://api.subsource.net/api/v1/subtitles/${sub.subtitleId}/download`,
+            source: 'SubSource',
+            score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease((sub.releaseInfo && sub.releaseInfo[0]) || '')) : 0
+        }));
+
+        scored.sort((a, b) => b.score - a.score);
+        return scored.slice(0, limit);
     } catch { return []; }
 }
 
-async function fetchAddic7edCandidates({ imdbId, lang, season, episode, limit = 5 }) {
-    const all = await getAddic7edCandidates(imdbId, lang, season, episode);
-    return all.slice(0, limit);
-}
-
-const activeAddic7edFetches = new Map();
-
-async function getAddic7edSrt(downloadUrl, refererUrl) {
-    if (activeAddic7edFetches.has(downloadUrl)) {
-        console.log(`⏳ [Concurrency Lock] Waiting for active Addic7ed fetch...`);
-        return await activeAddic7edFetches.get(downloadUrl);
-    }
-    const fetchPromise = (async () => {
-        try {
-            const res = await fetch(downloadUrl, {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                    'Referer': refererUrl,
-                    'Cookie': ADDIC7ED_COOKIE
-                }
-            });
-            if (!res.ok) return null;
-            const buffer = await res.arrayBuffer();
-            const text = decodeArabicFile(Buffer.from(buffer));
-            if (text.includes('<!DOCTYPE html>') || text.includes('<html')) {
-                console.log(`❌ [Addic7ed] Session cookie expired or rate-limited.`);
-                return null;
-            }
-            return { text };
-        } catch { return null; }
-        finally { setTimeout(() => activeAddic7edFetches.delete(downloadUrl), 5000); }
-    })();
-    activeAddic7edFetches.set(downloadUrl, fetchPromise);
-    return await fetchPromise;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UNIVERSAL ZIP EXTRACTOR (SubDL + YTS)
-// ─────────────────────────────────────────────────────────────────────────────
-async function getZipSrt(zipUrl, refererUrl = null) {
+async function getSubsourceSrt(zipUrl) {
     try {
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-        };
-        if (refererUrl) headers['Referer'] = refererUrl;
-        const res = await fetch(zipUrl, { headers });
+        const res = await fetchWithTimeout(zipUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'X-API-Key': CONFIG.SUBSOURCE_KEY }, timeout: CONFIG.SRT_FETCH_TIMEOUT_MS });
         if (!res.ok) return null;
         const buffer = await res.arrayBuffer();
-        const textPreview = Buffer.from(buffer).toString('utf8', 0, 100);
-        if (textPreview.includes('<html') || textPreview.includes('<!DOCTYPE')) {
-            console.log(`  ❌ [Firewall] ZIP URL returned an HTML page — likely a Captcha.`);
-            return null;
+        const preview = Buffer.from(buffer).toString('utf8', 0, 50);
+        if (preview.trim().startsWith('{') || preview.trim().startsWith('<')) return null;
+        if (preview.includes('1\n') || preview.includes('1\r') || preview.includes('-->')) {
+            return { text: decodeArabicFile(Buffer.from(buffer)) };
         }
         const zip = new AdmZip(Buffer.from(buffer));
         const srtEntry = zip.getEntries().find(e => e.entryName.toLowerCase().endsWith('.srt'));
@@ -369,11 +331,20 @@ async function getZipSrt(zipUrl, refererUrl = null) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// V17 MATH ENGINE
+// MATH ENGINE (SDH DE-NOISER, SCALING, & DISTINCT CUT CHECKER)
 // ─────────────────────────────────────────────────────────────────────────────
-function buildEngIndex(engParsed) {
-    return engParsed.map(l => l.startSeconds * 1000).sort((a, b) => a - b);
+function stripSdhAndClean(parsedArray) {
+    let cleanArray = [];
+    for (const line of parsedArray) {
+        let cleanText = line.text.replace(/<[^>]+>/g, '');
+        cleanText = cleanText.replace(/\[.*?\]/g, '');
+        cleanText = cleanText.replace(/\(.*?\)/g, '');
+        if (cleanText.trim().length > 0) cleanArray.push(line);
+    }
+    return cleanArray;
 }
+
+function buildEngIndex(engParsed) { return engParsed.map(l => l.startSeconds * 1000).sort((a, b) => a - b); }
 
 function nearestValue(sortedArr, target) {
     let lo = 0, hi = sortedArr.length - 1;
@@ -393,386 +364,388 @@ function median(arr) {
     return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-function computePrecisionShift(englishText, arabicText, label = '', isHashed = false, fileType = 'UNKNOWN') {
-    if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
-    let engParsed, arParsed;
+function isDistinctCut(textA, textB) {
     try {
-        engParsed = srtParser.fromSrt(englishText);
-        arParsed  = srtParser.fromSrt(arabicText);
+        const pA = stripSdhAndClean(srtParser.fromSrt(textA));
+        const pB = stripSdhAndClean(srtParser.fromSrt(textB));
+        if (pA.length < 20 || pB.length < 20) return false;
+
+        let diffs = [];
+        const idxB = pB.map(l => l.startSeconds);
+        for (let i = 0; i < 30 && i < pA.length; i++) {
+            const target = pA[i].startSeconds;
+            let minDiff = Infinity;
+            for (let j = 0; j < idxB.length; j++) {
+                const diff = idxB[j] - target;
+                if (Math.abs(diff) < Math.abs(minDiff)) minDiff = diff;
+            }
+            diffs.push(minDiff);
+        }
+        
+        const medianDiff = median(diffs);
+        // Linked to CONFIG
+        return Math.abs(medianDiff) >= CONFIG.DISTINCT_CUT_THRESHOLD_SEC;
+    } catch { return false; }
+}
+
+function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false) {
+    if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
+    
+    let originalArParsed, engParsedClean, arParsedClean;
+    try {
+        const rawEng = srtParser.fromSrt(englishText);
+        originalArParsed = srtParser.fromSrt(arabicText); 
+        engParsedClean = stripSdhAndClean(rawEng);
+        arParsedClean  = stripSdhAndClean(originalArParsed);
     } catch { return { passed: false, alignmentPct: 0 }; }
 
-    if (engParsed.length < 50 || arParsed.length < 50) return { passed: false, alignmentPct: 0 };
+    if (engParsedClean.length < 50 || arParsedClean.length < 50) return { passed: false, alignmentPct: 0 };
 
-    const engIndex   = buildEngIndex(engParsed);
-    const durationMs = engParsed[engParsed.length - 1].startSeconds * 1000;
-    const chunkSizeMs = durationMs / 5;
-    const chunks = [[], [], [], [], []];
+    const engIndex   = buildEngIndex(engParsedClean);
+    const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
+    const chunkSizeMs = durationMs / CONFIG.MATH_CHUNKS; // Linked to CONFIG
+    
+    // Create chunk arrays dynamically based on CONFIG
+    const chunks = Array.from({ length: CONFIG.MATH_CHUNKS }, () => []);
 
-    arParsed.forEach(line => {
+    arParsedClean.forEach(line => {
         const arMs  = line.startSeconds * 1000;
         const engMs = nearestValue(engIndex, arMs);
         const delta = arMs - engMs;
         let ci = Math.floor(arMs / chunkSizeMs);
-        if (ci > 4) ci = 4;
+        if (ci >= CONFIG.MATH_CHUNKS) ci = CONFIG.MATH_CHUNKS - 1;
         chunks[ci].push(delta);
     });
 
-    const chunkOffsets = chunks
-        .map(deltas => deltas.length > 15 ? median(deltas) : null)
-        .filter(val => val !== null);
-
+    const chunkOffsets = chunks.map(deltas => deltas.length > 15 ? median(deltas) : null).filter(val => val !== null);
     if (chunkOffsets.length < 3) return { passed: false, alignmentPct: 0 };
 
-    const driftMs     = Math.abs(Math.max(...chunkOffsets) - Math.min(...chunkOffsets));
-    const allDeltas   = chunks.flat();
+    const driftMs      = Math.abs(Math.max(...chunkOffsets) - Math.min(...chunkOffsets));
+    const allDeltas    = chunks.flat();
     const globalMedian = median(allDeltas);
+    const consensusLines = allDeltas.filter(d => Math.abs(d - globalMedian) < 400).length;
+    let alignmentPct = (consensusLines / arParsedClean.length) * 100;
 
-    const consensusLines = allDeltas.filter(d => Math.abs(d - globalMedian) < 300).length;
-    let alignmentPct = (consensusLines / arParsed.length) * 100;
+    console.log(`    [Math] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms`);
 
-    console.log(`    [V17] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms`);
+    // Penalties linked to CONFIG
+    if (driftMs > CONFIG.PENALTY_SEVERE_MS) alignmentPct -= CONFIG.PENALTY_SEVERE_PCT;
+    else if (driftMs > CONFIG.PENALTY_MODERATE_MS) alignmentPct -= CONFIG.PENALTY_MODERATE_PCT;
+    else if (driftMs > CONFIG.PENALTY_LIGHT_MS) alignmentPct -= CONFIG.PENALTY_LIGHT_PCT;
+    
+    if (alignmentPct < CONFIG.MIN_PASSING_ALIGNMENT_PCT) return { passed: false, alignmentPct };
 
-    if (driftMs > 350) {
-        alignmentPct -= 40;
-        console.log(`      ↳ ⚠️  Drift penalty → ${alignmentPct.toFixed(1)}%`);
-    }
-
-    if (alignmentPct < 40) return { passed: false, alignmentPct };
-
-   let fixedText = arabicText;
-    let finalParsed = arParsed; // Hold a reference to the array to modify
-
-    if (Math.abs(globalMedian) > 50) {
-        finalParsed = arParsed.map(line => ({
+    let finalParsed = originalArParsed;
+    // Delay shift linked to CONFIG
+    if (Math.abs(globalMedian) > CONFIG.MIN_ACCEPTABLE_DELAY_MS) {
+        finalParsed = originalArParsed.map(line => ({
             ...line,
             startTime: formatTime(Math.max(0, line.startSeconds * 1000 - globalMedian)),
             endTime:   formatTime(Math.max(0, line.endSeconds   * 1000 - globalMedian))
         }));
-        console.log(`    [Auto-Shift] −${globalMedian.toFixed(1)}ms applied.`);
     }
 
-    // 🔥 ONSCREEN WATERMARK INJECTION 🔥
-    let rating = "Way off 🔴";
-    if (alignmentPct >= 95) rating = "Accurate 🟢";
-    else if (alignmentPct >= 80) rating = "A bit off 🟡";
+    // Ratings linked to CONFIG
+    let rating = CONFIG.RATINGS.UNRELIABLE.label;
+    if (alignmentPct >= CONFIG.RATINGS.ACCURATE.minPct && driftMs <= CONFIG.RATINGS.ACCURATE.maxDriftMs) rating = CONFIG.RATINGS.ACCURATE.label;
+    else if (alignmentPct >= CONFIG.RATINGS.STABLE.minPct && driftMs <= CONFIG.RATINGS.STABLE.maxDriftMs) rating = CONFIG.RATINGS.STABLE.label;
+    else if (alignmentPct >= CONFIG.RATINGS.POOR.minPct) rating = CONFIG.RATINGS.POOR.label;
 
-   finalParsed.unshift({
+    finalParsed.unshift({
         id: "0",
         startTime: "00:00:01,000",
         endTime: "00:00:06,000",
-        text: `{\\an8}<font color="#8A5A99"><b>[ Arabic Elite Engine ]</b></font>\nType: ${fileType} | isHashed: ${isHashed ? 'T' : 'F'} | SyncLevel: ${rating}\nMatch: ${alignmentPct.toFixed(0)}% | Delay: ${globalMedian > 0 ? '+' : ''}${globalMedian.toFixed(0)}ms`
+        text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ]</b></font>\nSource: ${sourceName} | Type: ${mediaType} | Accuracy: ${rating}\nMatch: ${alignmentPct.toFixed(0)}% | Delay: ${globalMedian > 0 ? '+' : ''}${globalMedian.toFixed(0)}ms\nFile: ${releaseName}`
     });
 
-    fixedText = srtParser.toSrt(finalParsed);
-
-    return { passed: true, fixedText, offsetMs: globalMedian, alignmentPct, driftMs };
+    return { passed: true, fixedText: srtParser.toSrt(finalParsed), offsetMs: globalMedian, alignmentPct, driftMs };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONCURRENCY LOCK
+// ENGLISH DIAGNOSTIC HELPER
 // ─────────────────────────────────────────────────────────────────────────────
-const mainRequestCache = new Map();
+function processEnglishRuler(baselineObj, rulerName, detectedType) {
+    if (!baselineObj || !baselineObj.text || !baselineObj.candidate) return null;
+    try {
+        let parsed = srtParser.fromSrt(baselineObj.text);
+        parsed.unshift({
+            id: "0",
+            startTime: "00:00:01,000",
+            endTime: "00:00:06,000",
+            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ]</b></font>\nSource: ${baselineObj.candidate.source} | Type: ${detectedType} | Accuracy: ${CONFIG.RATINGS.DIAGNOSTIC.label}\nMatch: 100% | Delay: 0ms\nFile: ${baselineObj.candidate.releaseName}`
+        });
+        
+        const fixedText = srtParser.toSrt(parsed);
+        const cacheId = `elite_eng_ruler_${rulerName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}.srt`;
+        subtitleCache.set(cacheId, fixedText);
+        
+        return {
+            id: cacheId,
+            url: `${HOST}/dl/${cacheId}`,
+            lang: "eng", 
+            title: `[👑 ${rulerName} Ruler]\n[${baselineObj.candidate.source}] ${baselineObj.candidate.releaseName}`
+        };
+    } catch(e) { return null; }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 builder.defineSubtitlesHandler(async (args) => {
-	console.log(`\n🕵️ [PAYLOAD DEBUG] Raw Stremio Extras:`, JSON.stringify(args.extra || {}));
+    try {
+        const streamName    = args.extra?.filename ?? args.extra?.name ?? null;
+        const idParts       = args.id.split(':');
+        const imdbId        = idParts[0].replace('tt', '');
+        const season        = idParts[1] ?? null;
+        const episode       = idParts[2] ?? null;
+        const videoHash     = args.extra?.videoHash ?? null;
+        const releaseTokens = tokeniseRelease(streamName || '');
+		const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
+        const isTV          = !!(season && episode);
 
-   const idPartsStr = args.id.split(':');
-    const imdbIdStr  = idPartsStr[0].replace('tt', '');
-    const seasonStr  = idPartsStr[1] ?? '0';
-    const episodeStr = idPartsStr[2] ?? '0';
-    const videoHash  = args.extra?.videoHash ?? null;
-
-    const userOsKey    = args.config?.osKey;
-    const userSubdlKey = args.config?.subdlKey;
-
-    if (!userOsKey || !userSubdlKey) {
-        console.log(`\n❌ [Access Denied] Missing API keys.`);
-        return { subtitles: [] };
-    }
-
-    const requestKey = `${imdbIdStr}:${seasonStr}:${episodeStr}`;
-    const now = Date.now();
-
-    // ── 1. VIP HASH ROUTE ──────────────────────────────────────────────
-    if (videoHash) {
-        // If a blind request managed to lock the cache, we smash the lock
-        if (mainRequestCache.has(requestKey) && !mainRequestCache.get(requestKey).hasHash) {
-            console.log(`\n⚔️  [Hash Override] VIP Hash arrived! Smashing the blind lock...`);
-            mainRequestCache.delete(requestKey);
-        } 
-        // If another hash request is already running perfectly, piggyback on it
-        else if (mainRequestCache.has(requestKey)) {
-            console.log(`⏳ [GLOBAL LOCK] Hash request already processing. Piggybacking...`);
-            return await mainRequestCache.get(requestKey).promise;
-        }
-    }
-
-    // ── 2. BLIND ROUTE ─────────────────────────────────────────────────
-    if (!videoHash) {
-        console.log(`\n⏱️  [Blind Request] No hash. Sleeping 4000ms for VIP fetch...`);
-        await new Promise(r => setTimeout(r, 4000));
-
-        // Waking up: Did a VIP Hash request arrive while we slept?
-        if (mainRequestCache.has(requestKey)) {
-            const cache = mainRequestCache.get(requestKey);
-            if (cache.hasHash) {
-                console.log(`🛑 [Blind Request] VIP took over! Yielding to the Hash thread...`);
-                return await cache.promise;
-            } else {
-                console.log(`⏳ [GLOBAL LOCK] Another blind request running. Piggybacking...`);
-                return await cache.promise;
+        let detectedType = 'Unknown';
+        const typeTokens = ['remux', 'bluray', 'bdrip', 'web-dl', 'webdl', 'webrip', 'hdtv'];
+        for (const t of typeTokens) {
+            if (releaseTokens.has(t)) {
+                detectedType = t === 'webdl' ? 'WEB-DL' : t.toUpperCase();
+                break;
             }
         }
-    }
 
-    const handlerPromise = (async () => {
-        try {
-            const streamName    = args.extra?.filename ?? args.extra?.name ?? null;
-            const idParts       = args.id.split(':');
-            const imdbId        = idParts[0].replace('tt', '');
-            const season        = idParts[1] ?? null;
-            const episode       = idParts[2] ?? null;
-            const releaseTokens = tokeniseRelease(streamName || '');
+        console.log(`\n===========================================`);
+        console.log(`[${CONFIG.ADDON_NAME}] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}`);
 
-            // 🔥 SCANNER: Identify the primary file type for the telemetry UI
-            let detectedType = 'Unknown';
-            const typeTokens = ['remux', 'bluray', 'bdrip', 'web-dl', 'webdl', 'webrip', 'hdtv'];
-            for (const t of typeTokens) {
-                if (releaseTokens.has(t)) {
-                    detectedType = t === 'webdl' ? 'WEB-DL' : t.toUpperCase();
-                    break;
-                }
-            }
+        let finalOutput = [];
+        let bestFallback = null;
 
-            console.log(`\n===========================================`);
-            console.log(`[V17] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Hash: ${videoHash||'none'} | Type: ${detectedType}`);
-            console.log(`[HOST] ${HOST}`);
-
-            // ── STEP 1: ENGLISH BASELINES ──────────────────────────────────────
-            console.log(`\n[Step 1] Fetching English baselines...`);
-            const [engOsCandidates, engSubdlCandidates, engYtsCandidates] = await Promise.all([
-                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: 3, apiKey: userOsKey }),
-                fetchSubdlCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2, apiKey: userSubdlKey }),
-                fetchYtsCandidates({ imdbId, lang: 'en', season, episode, releaseTokens, limit: 2 })
+        // =====================================================================
+        // PATH A: THE TV MULTI-CUT SWEEP
+        // =====================================================================
+       if (isTV) {
+            console.log(`\n[TV Mode] Fetching OS Rulers + Arabic Candidates...`);
+            let [engOs, arOs, arSubdl, arSubsource] = await Promise.all([
+                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL }), 
+                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
+                fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
+                fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
             ]);
 
-            let tvBaseline = null, movieOsBaseline = null, movieSubdlBaseline = null, movieYtsBaseline = null;
+            // --- ADD THIS FILTERING BLOCK ---
+            const originalCount = engOs.length;
+            engOs = filterBaselinesByType(engOs, streamTypeGroup);
+            console.log(`  🔍 Strict Type Matching: Retained ${engOs.length}/${originalCount} baselines matching type [${streamTypeGroup || 'Unknown'}]`);
+            // --------------------------------
 
-            if (season && episode) {
-                console.log(`[Step 1] TV — Addic7ed > SubDL > OS hierarchy...`);
-                const engAddic7edCandidates = await fetchAddic7edCandidates({ imdbId, lang: 'en', season, episode, limit: 2 });
-                const allTv = [
-                    ...engAddic7edCandidates.map(c => ({ ...c, _fetchFn: () => getAddic7edSrt(c.downloadUrl, c.refererUrl) })),
-                    ...engSubdlCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl, c.refererUrl) })),
-                    ...engOsCandidates.map(c => ({ ...c, _fetchFn: () => getOsSrt(c.fileId, userOsKey) }))
-                ];
-                for (const c of allTv) {
-                    tvBaseline = await c._fetchFn();
-                    if (tvBaseline) { console.log(`✅ TV baseline via ${c.source}`); break; }
-                }
-                if (!tvBaseline) { console.log(`❌ No TV baseline found.`); return { subtitles: [] }; }
-            } else {
-                console.log(`[Step 1] Movie — Tri-Baseline Engine...`);
-                for (const c of engOsCandidates) {
-                    movieOsBaseline = await getOsSrt(c.fileId, userOsKey);
-                    if (movieOsBaseline) { console.log(`✅ OS baseline locked`); break; }
-                }
-                for (const c of engSubdlCandidates) {
-                    movieSubdlBaseline = await getZipSrt(c.downloadUrl, c.refererUrl);
-                    if (movieSubdlBaseline) { console.log(`✅ SubDL baseline locked`); break; }
-                }
-                for (const c of engYtsCandidates) {
-                    movieYtsBaseline = await getZipSrt(c.downloadUrl, c.refererUrl);
-                    if (movieYtsBaseline) { console.log(`✅ YTS baseline locked`); break; }
-                }
-                if (!movieOsBaseline && !movieSubdlBaseline && !movieYtsBaseline) { console.log(`❌ No movie baseline found.`); return { subtitles: [] }; }
-            
-            }
+            let osRulers = [];
+            let seenTextSnippets = new Set(); // The Clone Firewall
 
-        
-           // ── STEP 2: ARABIC CANDIDATES ──────────────────────────────────────
-            let successfulTvMatches = [], successfulOsMatches = [], successfulSubdlMatches = [], successfulYtsMatches = [];
-            let fastTrackWinner = null, bestFallback = null;
+            for (const c of engOs) {
+                const srt = await getOsSrt(c.fileId);
+                if (srt) {
+                    const textSnippet = srt.text.substring(0, 200).trim();
+                    if (seenTextSnippets.has(textSnippet)) continue;
+                    seenTextSnippets.add(textSnippet);
 
-            // Phase 1: TV fast-track via Addic7ed
-            if (season && episode) {
-                console.log(`\n[Phase 1] TV Fast-Track (Addic7ed)...`);
-                const arAddic7edCandidates = await fetchAddic7edCandidates({ imdbId, lang: 'ar', season, episode, limit: 4 });
-                for (let i = 0; i < arAddic7edCandidates.length; i++) {
-                    const c = arAddic7edCandidates[i];
-                    const arabicData = await getAddic7edSrt(c.downloadUrl, c.refererUrl);
-                    if (!arabicData) continue;
-                    if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
-                    const result = computePrecisionShift(tvBaseline.text, arabicData.text, `Addic7ed #${i+1}`, c.hashMatch || false, detectedType);
-                    if (result.passed) {
-                        successfulTvMatches.push({ candidate: c, ...result });
-                        if (result.alignmentPct >= 95 && result.driftMs <= 100) {
-                            fastTrackWinner = successfulTvMatches[successfulTvMatches.length - 1];
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Phase 2: Movies + TV backups via OS / SubDL
-           // Phase 2: Movies + TV backups via OS / SubDL / YTS
-            if (!fastTrackWinner) {
-                console.log(`\n[Phase 2] OS + SubDL + YTS candidates...`);
-                const [arOsCandidates, arSubdlCandidates, arYtsCandidates] = await Promise.all([
-                    fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: 8, apiKey: userOsKey }),
-                    fetchSubdlCandidates({ imdbId, lang: 'ar', season, episode, releaseTokens, limit: 8, apiKey: userSubdlKey }),
-                    fetchYtsCandidates({ imdbId, lang: 'ar', season, episode, releaseTokens, limit: 8 })
-                ]);
-                const allPhase2 = [
-                    ...arYtsCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl, c.refererUrl) })),
-                    ...arSubdlCandidates.map(c => ({ ...c, _fetchFn: () => getZipSrt(c.downloadUrl, c.refererUrl) })),
-                    ...arOsCandidates.map(c => ({ ...c, _fetchFn: () => getOsSrt(c.fileId, userOsKey) }))
-                ];
-                for (let i = 0; i < allPhase2.length; i++) {
-                    const c = allPhase2[i];
-                    const arabicData = await c._fetchFn();
-                    if (!arabicData) continue;
-                    if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
-                    
-                    if (season && episode && tvBaseline) {
-                        const result = computePrecisionShift(tvBaseline.text, arabicData.text, `TV Backup #${i+1}`, c.hashMatch || false, detectedType);
-                        if (result.passed) successfulTvMatches.push({ candidate: c, ...result });
+                    if (osRulers.length === 0) {
+                        osRulers.push({ text: srt.text, candidate: c });
+                        console.log(`  ✅ OS TV Ruler 1 locked [Score: ${c.score.toFixed(2)}]`);
                     } else {
-                        if (movieOsBaseline) {
-                            const resOs = computePrecisionShift(movieOsBaseline.text, arabicData.text, `OS Ruler #${i+1}`, c.hashMatch || false, detectedType);
-                            if (resOs.passed) successfulOsMatches.push({ candidate: c, ...resOs });
+                        let isDistinct = true;
+                        for (const r of osRulers) {
+                            if (!isDistinctCut(r.text, srt.text)) {
+                                isDistinct = false;
+                                break;
+                            }
                         }
-                        if (movieSubdlBaseline) {
-                            const resSubdl = computePrecisionShift(movieSubdlBaseline.text, arabicData.text, `SubDL Ruler #${i+1}`, c.hashMatch || false, detectedType);
-                            if (resSubdl.passed) successfulSubdlMatches.push({ candidate: c, ...resSubdl });
-                        }
-                        if (movieYtsBaseline) {
-                            const resYts = computePrecisionShift(movieYtsBaseline.text, arabicData.text, `YTS Ruler #${i+1}`, c.hashMatch || false, detectedType);
-                            if (resYts.passed) successfulYtsMatches.push({ candidate: c, ...resYts });
+                        if (isDistinct) {
+                            osRulers.push({ text: srt.text, candidate: c });
+                            console.log(`  ✅ OS TV Ruler ${osRulers.length} locked (Distinct Cut) [Score: ${c.score.toFixed(2)}]`);
+                            if (osRulers.length === CONFIG.TV_DISTINCT_CUTS_LIMIT) break; 
                         }
                     }
                 }
             }
 
-            // ── STEP 3: CROWN THE CHAMPION(S) ─────────────────────────────────
-            const SOURCE_WEIGHTS = { 'Addic7ed': 5, 'OS': 2, 'YTS': 2, 'SubDL': 1 };
-            const sortFn = (a, b) => {
-                const sB = b.alignmentPct + (SOURCE_WEIGHTS[b.candidate.source] || 0);
-                const sA = a.alignmentPct + (SOURCE_WEIGHTS[a.candidate.source] || 0);
-                return sB === sA ? (a.driftMs - b.driftMs) : (sB - sA);
-            };
+            if (osRulers.length === 0) {
+                console.log(`❌ Could not lock any OS TV Rulers. Aborting sync.`);
+                return { subtitles: [] };
+            }
 
-            let finalOutput = [];
+            const allCandidates = [
+                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId) })),
+                ...arSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl) })),
+                ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl) }))
+            ];
 
-            // TV: single best result
-            if (season && episode) {
-                if (fastTrackWinner) successfulTvMatches = [fastTrackWinner];
-                if (successfulTvMatches.length > 0) {
-                    successfulTvMatches.sort(sortFn);
-                    const champ = successfulTvMatches[0];
-                    const cacheId = `elite_tv_${Date.now()}.srt`;
+            let tvRulerMatches = Array.from({ length: osRulers.length }, () => []);
+
+            console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
+            for (let i = 0; i < allCandidates.length; i++) {
+                const c = allCandidates[i];
+                const arabicData = await c.fetchFn();
+                if (!arabicData) continue;
+                if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
+
+                for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
+                    const ruler = osRulers[rIdx];
+                    const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true);
+                    if (result.passed) {
+                        tvRulerMatches[rIdx].push({ candidate: c, ...result });
+                    }
+                }
+            }
+
+            const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
+            
+            for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
+                if (tvRulerMatches[rIdx].length > 0) {
+                    tvRulerMatches[rIdx].sort(sortFn);
+                    const champ = tvRulerMatches[rIdx][0];
+                    const cacheId = `elite_tv_cut${rIdx+1}_${Date.now()}.srt`;
+                    subtitleCache.set(cacheId, champ.fixedText);
+                    
+                    finalOutput.push({
+                        id: cacheId,
+                        url: `${HOST}/dl/${cacheId}`,
+                        lang: "ara",
+                        title: `[Synced to OS Cut ${rIdx+1} | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
+                    });
+                }
+                
+                const diagnosticRuler = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType);
+                if (diagnosticRuler) finalOutput.push(diagnosticRuler);
+            }
+        } 
+        
+        // =====================================================================
+        // PATH B: THE MOVIE CROSS-MATRIX
+        // =====================================================================
+        else {
+            console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Arabic Candidates...`);
+            let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
+                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
+                fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
+                fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
+                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
+                fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
+                fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
+            ]);
+
+            // --- ADD THIS FILTERING BLOCK ---
+            engOs = filterBaselinesByType(engOs, streamTypeGroup);
+            engSubdl = filterBaselinesByType(engSubdl, streamTypeGroup);
+            engSubsource = filterBaselinesByType(engSubsource, streamTypeGroup);
+            // --------------------------------
+
+            let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
+
+            for (const c of engOs) {
+                osBaseline = await getOsSrt(c.fileId);
+                if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked`); break; }
+            }
+            for (const c of engSubdl) {
+                subdlBaseline = await getZipSrt(c.downloadUrl);
+                if (subdlBaseline) { subdlBaseline.candidate = c; console.log(`  ✅ SubDL Ruler locked`); break; }
+            }
+            for (const c of engSubsource) {
+                subsourceBaseline = await getSubsourceSrt(c.downloadUrl);
+                if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked`); break; }
+            }
+
+            if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
+                console.log(`❌ No Master Rulers could be locked. Aborting sync.`);
+                return { subtitles: [] };
+            }
+
+            const allArabicCandidates = [
+                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId) })),
+                ...arSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl) })),
+                ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl) })),
+            ];
+
+            let rulerMatches = { 'OpenSubtitles': [], 'SubDL': [], 'SubSource': [] };
+
+            console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
+            for (let i = 0; i < allArabicCandidates.length; i++) {
+                const c = allArabicCandidates[i];
+                const arabicData = await c.fetchFn();
+                if (!arabicData) continue;
+                if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
+                
+                let bestMatrixScore = null;
+
+                const testAgainstRuler = (baseline, rulerName) => {
+                    if (!baseline) return;
+                    const result = computePrecisionShift(baseline.text, arabicData.text, `${c.source} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false);
+                    if (result.passed && (!bestMatrixScore || result.alignmentPct > bestMatrixScore.alignmentPct)) {
+                        bestMatrixScore = { candidate: c, rulerName, ...result };
+                    }
+                };
+
+                testAgainstRuler(osBaseline, 'OpenSubtitles');
+                testAgainstRuler(subdlBaseline, 'SubDL');
+                testAgainstRuler(subsourceBaseline, 'SubSource');
+
+                if (bestMatrixScore) rulerMatches[bestMatrixScore.rulerName].push(bestMatrixScore);
+            }
+
+            const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
+            for (const ruler of ['OpenSubtitles', 'SubDL', 'SubSource']) {
+                if (rulerMatches[ruler].length > 0) {
+                    rulerMatches[ruler].sort(sortFn);
+                    const champ = rulerMatches[ruler][0];
+                    const cacheId = `elite_${ruler.toLowerCase()}_${Date.now()}.srt`;
                     subtitleCache.set(cacheId, champ.fixedText);
                     finalOutput.push({
                         id: cacheId,
                         url: `${HOST}/dl/${cacheId}`,
                         lang: "ara",
-                        title: `[isSynced: True | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
-                    });
-                }
-            }
-            // Movies: Top 1 from OS ruler + Top 1 from SubDL ruler (your original 2-result design)
-            else {
-                if (successfulOsMatches.length > 0) {
-                    successfulOsMatches.sort(sortFn);
-                    const osChamp = successfulOsMatches[0];
-                    const cacheId = `elite_os_${Date.now()}.srt`;
-                    subtitleCache.set(cacheId, osChamp.fixedText);
-                    finalOutput.push({
-                        id: cacheId,
-                        url: `${HOST}/dl/${cacheId}`,
-                        lang: "ara",
-                        title: `[isSynced: OS Ruler | ${osChamp.alignmentPct.toFixed(0)}%] (${osChamp.offsetMs>0?'+':''}${osChamp.offsetMs.toFixed(0)}ms)\n[${osChamp.candidate.source}] ${osChamp.candidate.releaseName}`
-                    });
-                }
-                if (successfulSubdlMatches.length > 0) {
-                    successfulSubdlMatches.sort(sortFn);
-                    const subdlChamp = successfulSubdlMatches[0];
-                    const cacheId = `elite_subdl_${Date.now()}.srt`;
-                    subtitleCache.set(cacheId, subdlChamp.fixedText);
-                    finalOutput.push({
-                        id: cacheId,
-                        url: `${HOST}/dl/${cacheId}`,
-                        lang: "ara",
-                        title: `[isSynced: SubDL Ruler | ${subdlChamp.alignmentPct.toFixed(0)}%] (${subdlChamp.offsetMs>0?'+':''}${subdlChamp.offsetMs.toFixed(0)}ms)\n[${subdlChamp.candidate.source}] ${subdlChamp.candidate.releaseName}`
-                    });
-                }
-				if (successfulYtsMatches.length > 0) {
-                    successfulYtsMatches.sort(sortFn);
-                    const ytsChamp = successfulYtsMatches[0];
-                    const cacheId = `elite_yts_${Date.now()}.srt`;
-                    subtitleCache.set(cacheId, ytsChamp.fixedText);
-                    finalOutput.push({
-                        id: cacheId,
-                        url: `${HOST}/dl/${cacheId}`,
-                        lang: "ara",
-                        title: `[isSynced: YTS Ruler | ${ytsChamp.alignmentPct.toFixed(0)}%] (${ytsChamp.offsetMs>0?'+':''}${ytsChamp.offsetMs.toFixed(0)}ms)\n[${ytsChamp.candidate.source}] ${ytsChamp.candidate.releaseName}`
+                        title: `[Synced to ${ruler} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
                     });
                 }
             }
 
-            if (finalOutput.length > 0) {
-                console.log(`\n✅ [Done] ${finalOutput.length} result(s) returned.`);
-                return { subtitles: finalOutput };
-            }
-
-            // Unverified fallback
-  if (bestFallback) {
-                console.log(`⚠️  Math engine found no passing candidates. Serving unverified fallback.`);
-
-                // 🔥 Inject an Unverified Warning Watermark 🔥
-                let fallbackParsed;
-                try {
-                    fallbackParsed = srtParser.fromSrt(bestFallback.text);
-                    fallbackParsed.unshift({
-                        id: "0",
-                        startTime: "00:00:01,000",
-                        endTime: "00:00:06,000",
-                        text: `{\\an8}<font color="#8A5A99"><b>[ Arabic Elite Engine ]</b></font>\nisHashed: ${bestFallback.candidate.hashMatch ? 'T' : 'F'} | SyncLevel: Unverified ⚠️\nMatch rate: N/A | Delay: N/A`
-                    });
-                    bestFallback.text = srtParser.toSrt(fallbackParsed);
-                } catch(e) {} // Silently ignore if raw text parsing fails
-
-                const cacheId = `elite_fallback_${Date.now()}.srt`;
-                subtitleCache.set(cacheId, bestFallback.text);
-                return {
-                    subtitles: [{
-                        id: cacheId,
-                        url: `${HOST}/dl/${cacheId}`,
-                        lang: "ara",
-                        title: `⚠️ Arabic (Unverified Fallback)`
-                    }]
-                };
-            }
-
-            console.log(`\n[Done] No subtitles found.`);
-            return { subtitles: [] };
-
-        } catch (error) {
-            console.error("❌ Fatal:", error.message);
-            return { subtitles: [] };
-        } finally {
-            setTimeout(() => {
-                const entry = mainRequestCache.get(requestKey);
-                if (entry && entry.timestamp === now) mainRequestCache.delete(requestKey);
-            }, 10000);
+            if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType));
+            if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
+            if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType));
         }
-    })();
 
-    mainRequestCache.set(requestKey, { promise: handlerPromise, timestamp: now, hasHash: !!videoHash });
-    return await handlerPromise;
+        // =====================================================================
+        // FINAL DELIVERY & FALLBACK
+        // =====================================================================
+        finalOutput = finalOutput.filter(item => item !== null);
+
+        if (finalOutput.length > 0) {
+            console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
+            return { subtitles: finalOutput };
+        }
+
+        if (bestFallback) {
+            console.log(`⚠️ Math engine failed. Serving unverified fallback from ${bestFallback.candidate.source}.`);
+            let fallbackParsed;
+            try {
+                fallbackParsed = srtParser.fromSrt(bestFallback.text);
+                fallbackParsed.unshift({
+                    id: "0",
+                    startTime: "00:00:01,000",
+                    endTime: "00:00:06,000",
+                    text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ]</b></font>\nSource: ${bestFallback.candidate.source} | Type: ${detectedType} | Accuracy: ${CONFIG.RATINGS.UNVERIFIED.label}\nMatch: N/A | Delay: N/A\nFile: ${bestFallback.candidate.releaseName}`
+                });
+                bestFallback.text = srtParser.toSrt(fallbackParsed);
+            } catch(e) {}
+
+            const cacheId = `elite_fallback_${Date.now()}.srt`;
+            subtitleCache.set(cacheId, bestFallback.text);
+            return { subtitles: [{ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `⚠️ Arabic (${CONFIG.RATINGS.UNVERIFIED.label})` }] };
+        }
+
+        console.log(`\n[Done] No subtitles found.`);
+        return { subtitles: [] };
+
+    } catch (error) {
+        console.error("❌ Fatal:", error.message);
+        return { subtitles: [] };
+    }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -792,55 +765,27 @@ app.get('/dl/:cacheId', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    // Derive the install host: env var wins, else infer from the request
-    const installHost = process.env.HOST
-        ? process.env.HOST.replace(/\/$/, '').replace(/^https?:\/\//, '')
-        : req.get('host');
-
     res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Arabic Elite Engine V17 | Setup</title>
+        <title>${CONFIG.ADDON_NAME} | Setup</title>
         <style>
-            body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',Tahoma,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0; text-align:center; }
+            body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0; text-align:center; }
             .container { background-color:#202020; padding:40px; border-radius:12px; border:1px solid #333; max-width:500px; box-shadow:0 10px 30px rgba(0,0,0,.5); }
             h1 { color:#8A5A99; font-size:2rem; margin-top:0; }
             p { color:#a0a0a0; font-size:1rem; margin-bottom:30px; }
-            .input-group { text-align:left; margin-bottom:20px; }
-            label { font-size:.9rem; color:#bbb; display:block; margin-bottom:8px; font-weight:bold; }
-            input { width:100%; padding:12px; border-radius:6px; border:1px solid #444; background-color:#111; color:white; font-size:1rem; box-sizing:border-box; }
-            input:focus { outline:none; border-color:#8A5A99; }
-            .install-btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.2rem; font-weight:bold; cursor:pointer; transition:background-color .2s; margin-top:10px; }
+            .install-btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.2rem; font-weight:bold; cursor:pointer; text-decoration:none; display:inline-block; margin-top:10px; }
             .install-btn:hover { background-color:#6c4777; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>Arabic Elite Engine</h1>
-            <p>Provide your API keys to install this private auto-shifting engine into Stremio.</p>
-            <p>Made By HN95.</p>
-            <div class="input-group">
-                <label>OpenSubtitles REST API Key *</label>
-                <input type="text" id="osKey" placeholder="Enter OS API Key" required>
-            </div>
-            <div class="input-group">
-                <label>SubDL API Key *</label>
-                <input type="text" id="subdlKey" placeholder="Enter SubDL API Key" required>
-            </div>
-            <button class="install-btn" onclick="installAddon()">Install to Stremio</button>
+            <h1>${CONFIG.ADDON_NAME}</h1>
+            <p>V${CONFIG.ADDON_VERSION} (Config-Driven Engine) is active. Click below to install.</p>
+            <a class="install-btn" href="stremio://${HOST.replace(/^https?:\/\//, '')}/manifest.json">Install to Stremio</a>
         </div>
-        <script>
-            function installAddon() {
-                const os    = document.getElementById('osKey').value.trim();
-                const subdl = document.getElementById('subdlKey').value.trim();
-                if (!os || !subdl) { alert('⚠️ Both API keys are required!'); return; }
-                const configStr = encodeURIComponent(JSON.stringify({ osKey: os, subdlKey: subdl }));
-                window.location.href = 'stremio://${installHost}/' + configStr + '/manifest.json';
-            }
-        </script>
     </body>
     </html>
     `);
@@ -850,8 +795,7 @@ app.use(getRouter(builder.getInterface()));
 
 app.listen(PORT, () => {
     console.log(`\n=========================================`);
-    console.log(`🚀 Arabic Elite Engine V17 is LIVE`);
+    console.log(`🚀 ${CONFIG.ADDON_NAME} V${CONFIG.ADDON_VERSION} is LIVE`);
     console.log(`🌍 Public HOST: ${HOST}`);
-    console.log(`➡️  Landing Page: ${HOST}`);
     console.log(`=========================================\n`);
 });
