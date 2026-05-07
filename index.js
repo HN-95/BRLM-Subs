@@ -13,10 +13,10 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.5.0",
+    ADDON_VERSION: "1.0.0",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
-    OS_API_KEY: "KNoS2hDPWbOhEzUw557gKLeZ14JEAEGd",
+    OS_API_KEY: "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL",
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
     SUBSOURCE_KEY: "sk_5e25899dbf3a10bd8581778b2fa65698a50d27bec099309d24a185a29ea2bceb",
     ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
@@ -70,7 +70,7 @@ const manifest = {
     id: "org.brlm." + CONFIG.ADDON_NAME.replace(/[^a-z0-9]/gi, '').toLowerCase(),
     version: CONFIG.ADDON_VERSION,
     name: CONFIG.ADDON_NAME,
-    description: "Multi-Cut Sweep & Cross-Matrix Engine. Fully Configurable.",
+    description: "Perfectly Synced Arabic Subtitles",
     types: ["movie", "series"],
     catalogs: [],
     resources: ["subtitles"]
@@ -455,7 +455,7 @@ function computePrecisionShift(englishText, arabicText, label = '', sourceName =
         id: "0",
         startTime: "00:00:01,000",
         endTime: "00:00:06,000",
-        text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ]</b></font>\nSource: ${sourceName} | Type: ${mediaType} | Accuracy: ${rating}\nMatch: ${alignmentPct.toFixed(0)}% | Delay: ${globalMedian > 0 ? '+' : ''}${globalMedian.toFixed(0)}ms\nFile: ${releaseName}`
+        text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${mediaType}`
     });
 
     return { passed: true, fixedText: srtParser.toSrt(finalParsed), offsetMs: globalMedian, alignmentPct, driftMs };
