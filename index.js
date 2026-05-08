@@ -16,7 +16,7 @@ const CONFIG = {
     ADDON_VERSION: "1.0.0",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
-    OS_API_KEY: "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL",
+    OS_API_KEY: "4PHmqEFg4DgsRWIV3jUBz9LQ6gAsxYWv",
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
     SUBSOURCE_KEY: "sk_5e25899dbf3a10bd8581778b2fa65698a50d27bec099309d24a185a29ea2bceb",
     ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
