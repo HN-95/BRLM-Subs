@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.2",
+    ADDON_VERSION: "1.0.3",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     OS_API_KEY: "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL",
@@ -915,7 +915,17 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.use(getRouter(builder.getInterface()));
+const router = getRouter(builder.getInterface());
+
+// Force the manifest to be served with the correct headers for Nuvio
+app.get('/manifest.json', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/json');
+    res.send(manifest);
+});
+
+// Explicitly bind the router so it captures the config from the URL parameters
+app.use(router);
 
 app.listen(PORT, () => {
     console.log(`\n=========================================`);
