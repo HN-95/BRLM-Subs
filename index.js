@@ -62,7 +62,7 @@ const CONFIG = {
 const PORT = process.env.PORT || 7000;
 const HOST = (process.env.HOST || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 const subtitleCache = new Map();
-
+let isApiLimitReached = false;
 // ─────────────────────────────────────────────────────────────────────────────
 // MANIFEST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,11 +149,13 @@ function filterBaselinesByType(candidates, streamTypeGroup) {
         return cGroup === streamTypeGroup;
     });
 }
-
 function decodeArabicFile(buffer) {
     const utf8 = buffer.toString('utf8');
-    if (/[\u0600-\u06FF]/.test(utf8)) return utf8;
-    return iconv.decode(buffer, 'win1256');
+    // 🔥 Fixes "?????": If it contains the Unicode replacement character, UTF-8 failed.
+    if (utf8.includes('')) return iconv.decode(buffer, 'win1256');
+    // If no valid Arabic characters exist, it's likely win1256
+    if (!/[\u0600-\u06FF]/.test(utf8)) return iconv.decode(buffer, 'win1256');
+    return utf8;
 }
 
 function formatTime(ms) {
@@ -170,6 +172,8 @@ function formatTime(ms) {
 async function searchOS(url) {
     try {
         const res = await fetchWithTimeout(url, { headers: { 'Api-Key': CONFIG.OS_API_KEY, 'User-Agent': 'StremioArabicElite' } });
+        // 🔥 Trips the alarm if quota is hit
+        if (res.status === 429 || res.status === 403 || res.status === 401) isApiLimitReached = true;
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
@@ -183,6 +187,8 @@ async function getOsSrt(fileId) {
             headers: { 'Api-Key': CONFIG.OS_API_KEY, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite', 'Accept': 'application/json' },
             body: JSON.stringify({ file_id: parseInt(fileId) })
         });
+        // 🔥 Trips the alarm if download limit is hit
+        if (req.status === 429 || req.status === 403 || req.status === 401) isApiLimitReached = true;
         if (!req.ok) return null;
         const data = await req.json();
         if (!data.link) return null;
@@ -493,24 +499,24 @@ function processEnglishRuler(baselineObj, rulerName, detectedType) {
 // ─────────────────────────────────────────────────────────────────────────────
 builder.defineSubtitlesHandler(async (args) => {
     try {
-        const streamName    = args.extra?.filename ?? args.extra?.name ?? null;
+        // 🔥 Pulled 'args.extra?.title' to ensure we never miss metadata
+        const streamName    = args.extra?.filename ?? args.extra?.title ?? args.extra?.name ?? null;
         const idParts       = args.id.split(':');
         const imdbId        = idParts[0].replace('tt', '');
         const season        = idParts[1] ?? null;
         const episode       = idParts[2] ?? null;
         const videoHash     = args.extra?.videoHash ?? null;
         const releaseTokens = tokeniseRelease(streamName || '');
-		const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
+        const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
         const isTV          = !!(season && episode);
 
+        // 🔥 Uses the reliable TypeGroup instead of regex checking
         let detectedType = 'Unknown';
-        const typeTokens = ['remux', 'bluray', 'bdrip', 'web-dl', 'webdl', 'webrip', 'hdtv'];
-        for (const t of typeTokens) {
-            if (releaseTokens.has(t)) {
-                detectedType = t === 'webdl' ? 'WEB-DL' : t.toUpperCase();
-                break;
-            }
-        }
+        if (streamTypeGroup === 'WEB') detectedType = 'WEB-DL';
+        else if (streamTypeGroup === 'BLURAY') detectedType = 'BLURAY';
+        else if (streamTypeGroup === 'HDTV') detectedType = 'HDTV';
+        else if (streamTypeGroup === 'DVD') detectedType = 'DVD';
+        else if (streamTypeGroup === 'CAM') detectedType = 'CAM';
 
         console.log(`\n===========================================`);
         console.log(`[${CONFIG.ADDON_NAME}] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}`);
@@ -714,7 +720,17 @@ builder.defineSubtitlesHandler(async (args) => {
         // FINAL DELIVERY & FALLBACK
         // =====================================================================
         finalOutput = finalOutput.filter(item => item !== null);
-
+        if (isApiLimitReached) {
+            const limitCacheId = `api_limit_${Date.now()}.srt`;
+            const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ أنتهت صلاحية الرخصة, جددها يا حلو</b></font>`;
+            subtitleCache.set(limitCacheId, limitText);
+            finalOutput.unshift({
+                id: limitCacheId,
+                url: `${HOST}/dl/${limitCacheId}`,
+                lang: "ara",
+                title: `⚠️ API Key Expired!`
+            });
+        }
         if (finalOutput.length > 0) {
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
             return { subtitles: finalOutput };
