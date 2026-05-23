@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.0",
+    ADDON_VERSION: "1.0.2",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     OS_API_KEY: "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL",
@@ -73,7 +73,17 @@ const manifest = {
     description: "Perfectly Synced Arabic Subtitles",
     types: ["movie", "series"],
     catalogs: [],
-    resources: ["subtitles"]
+    resources: ["subtitles"],
+    // 🔥 ADDED CONFIGURATION SUPPORT:
+    behaviorHints: { configurable: true, configurationRequired: false },
+    config: [
+        {
+            key: "userOsKey",
+            type: "text",
+            title: "OpenSubtitles API Key (Optional)",
+            description: "Enter your own OpenSubtitles API Key to bypass the limit. Leave blank to use the shared key."
+        }
+    ]
 };
 
 const builder = new addonBuilder(manifest);
@@ -152,8 +162,8 @@ function filterBaselinesByType(candidates, streamTypeGroup) {
 function decodeArabicFile(buffer) {
     const utf8 = buffer.toString('utf8');
     
-    // Count how many broken characters exist
-    const brokenCharCount = (utf8.match(//g) || []).length;
+    // 🔥 Uses exact hex code so it never gets erased: Counts broken symbols
+    const brokenCharCount = (utf8.match(/\uFFFD/g) || []).length;
     
     // Only drop to win1256 if the file is completely unreadable in UTF-8
     if (brokenCharCount > 30) {
@@ -181,25 +191,23 @@ function formatTime(ms) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 1: OPENSUBTITLES
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchOS(url) {
+async function searchOS(url, apiKey) {
     try {
-        const res = await fetchWithTimeout(url, { headers: { 'Api-Key': CONFIG.OS_API_KEY, 'User-Agent': 'StremioArabicElite' } });
-        // 🔥 Trips the alarm if quota is hit
+        const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey, 'User-Agent': 'StremioArabicElite' } });
         if (res.status === 429 || res.status === 403 || res.status === 401) isApiLimitReached = true;
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
 }
 
-async function getOsSrt(fileId) {
+async function getOsSrt(fileId, apiKey) {
     try {
         const req = await fetchWithTimeout('https://api.opensubtitles.com/api/v1/download', {
             method: 'POST',
             timeout: CONFIG.SRT_FETCH_TIMEOUT_MS,
-            headers: { 'Api-Key': CONFIG.OS_API_KEY, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite', 'Accept': 'application/json' },
+            headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite', 'Accept': 'application/json' },
             body: JSON.stringify({ file_id: parseInt(fileId) })
         });
-        // 🔥 Trips the alarm if download limit is hit
         if (req.status === 429 || req.status === 403 || req.status === 401) isApiLimitReached = true;
         if (!req.ok) return null;
         const data = await req.json();
@@ -210,12 +218,11 @@ async function getOsSrt(fileId) {
         return { text: decodeArabicFile(Buffer.from(buffer)) };
     } catch { return null; }
 }
-
-async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10 }) {
+async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey }) {
     let results = [];
     if (videoHash) {
         const url = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&moviehash=${videoHash}`;
-        const hashData = await searchOS(url);
+        const hashData = await searchOS(url, apiKey);
         if (hashData.data?.length) {
             results.push(...hashData.data.map(s => ({
                 fileId: s.attributes.files[0].file_id,
@@ -228,7 +235,7 @@ async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, rel
 
     let poolUrl = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&imdb_id=${imdbId}&order_by=download_count&order_direction=desc`;
     if (season && episode) poolUrl += `&season_number=${season}&episode_number=${episode}`;
-    const poolData = await searchOS(poolUrl);
+    const poolData = await searchOS(poolUrl, apiKey);
 
     if (poolData.data?.length) {
         const poolEntries = poolData.data.map(s => ({
@@ -511,6 +518,12 @@ function processEnglishRuler(baselineObj, rulerName, detectedType) {
 // ─────────────────────────────────────────────────────────────────────────────
 builder.defineSubtitlesHandler(async (args) => {
     try {
+        // 🔥 Extract User's API Key from Stremio Config (Fallback to global key if empty)
+        const activeOsKey = args.config?.userOsKey && args.config.userOsKey.trim() !== "" ? args.config.userOsKey.trim() : CONFIG.OS_API_KEY;
+        
+        // 🔥 Masked Key Debugger: Only shows last 3 digits
+        const maskedKey = activeOsKey ? `...${activeOsKey.slice(-3)}` : "None";
+        
         // 🔥 Pulled 'args.extra?.title' to ensure we never miss metadata
         const streamName    = args.extra?.filename ?? args.extra?.title ?? args.extra?.name ?? null;
         const idParts       = args.id.split(':');
@@ -522,16 +535,15 @@ builder.defineSubtitlesHandler(async (args) => {
         const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
         const isTV          = !!(season && episode);
 
-        // 🔥 Uses the reliable TypeGroup instead of regex checking
         let detectedType = 'Unknown';
         if (streamTypeGroup === 'WEB') detectedType = 'WEB-DL';
-        else if (streamTypeGroup === 'BLURAY') detectedType = 'BLURAY';
+        else if (streamTypeGroup === 'BLURAY') detectedType = releaseTokens.has('remux') ? 'REMUX' : 'BLURAY';
         else if (streamTypeGroup === 'HDTV') detectedType = 'HDTV';
         else if (streamTypeGroup === 'DVD') detectedType = 'DVD';
         else if (streamTypeGroup === 'CAM') detectedType = 'CAM';
 
         console.log(`\n===========================================`);
-        console.log(`[${CONFIG.ADDON_NAME}] IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}`);
+        console.log(`[${CONFIG.ADDON_NAME}] API: ${maskedKey} | IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}`);
 
         let finalOutput = [];
         let bestFallback = null;
@@ -539,11 +551,12 @@ builder.defineSubtitlesHandler(async (args) => {
         // =====================================================================
         // PATH A: THE TV MULTI-CUT SWEEP
         // =====================================================================
-       if (isTV) {
+        if (isTV) {
             console.log(`\n[TV Mode] Fetching OS Rulers + Arabic Candidates...`);
             let [engOs, arOs, arSubdl, arSubsource] = await Promise.all([
-                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL }), 
-                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
+                // 🔥 Injected activeOsKey
+                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey }), 
+                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
             ]);
@@ -558,7 +571,8 @@ builder.defineSubtitlesHandler(async (args) => {
             let seenTextSnippets = new Set(); // The Clone Firewall
 
             for (const c of engOs) {
-                const srt = await getOsSrt(c.fileId);
+                // 🔥 Passed activeOsKey
+                const srt = await getOsSrt(c.fileId, activeOsKey);
                 if (srt) {
                     const textSnippet = srt.text.substring(0, 200).trim();
                     if (seenTextSnippets.has(textSnippet)) continue;
@@ -590,7 +604,8 @@ builder.defineSubtitlesHandler(async (args) => {
             }
 
             const allCandidates = [
-                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId) })),
+                // 🔥 Passed activeOsKey
+                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl) })),
                 ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl) }))
             ];
@@ -619,7 +634,7 @@ builder.defineSubtitlesHandler(async (args) => {
                 if (tvRulerMatches[rIdx].length > 0) {
                     tvRulerMatches[rIdx].sort(sortFn);
                     const champ = tvRulerMatches[rIdx][0];
-                    const cacheId = `elite_tv_cut${rIdx+1}_${Date.now()}.srt`;
+                    const cacheId = `elite_tv_cut${rIdx+1}_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                     subtitleCache.set(cacheId, champ.fixedText);
                     
                     finalOutput.push({
@@ -628,10 +643,11 @@ builder.defineSubtitlesHandler(async (args) => {
                         lang: "ara",
                         title: `[Synced to OS Cut ${rIdx+1} | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
                     });
+                    
+                    // Diagnostic Ruler tied properly inside the block
+                    const diagnosticRuler = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType);
+                    if (diagnosticRuler) finalOutput.push(diagnosticRuler);
                 }
-                
-                const diagnosticRuler = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType);
-                if (diagnosticRuler) finalOutput.push(diagnosticRuler);
             }
         } 
         
@@ -641,10 +657,11 @@ builder.defineSubtitlesHandler(async (args) => {
         else {
             console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Arabic Candidates...`);
             let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
+                // 🔥 Injected activeOsKey
+                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
-                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
+                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
             ]);
@@ -658,7 +675,8 @@ builder.defineSubtitlesHandler(async (args) => {
             let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
             for (const c of engOs) {
-                osBaseline = await getOsSrt(c.fileId);
+                // 🔥 Passed activeOsKey
+                osBaseline = await getOsSrt(c.fileId, activeOsKey);
                 if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked`); break; }
             }
             for (const c of engSubdl) {
@@ -676,7 +694,8 @@ builder.defineSubtitlesHandler(async (args) => {
             }
 
             const allArabicCandidates = [
-                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId) })),
+                // 🔥 Passed activeOsKey
+                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl) })),
                 ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl) })),
             ];
@@ -712,7 +731,7 @@ builder.defineSubtitlesHandler(async (args) => {
                 if (rulerMatches[ruler].length > 0) {
                     rulerMatches[ruler].sort(sortFn);
                     const champ = rulerMatches[ruler][0];
-                    const cacheId = `elite_${ruler.toLowerCase()}_${Date.now()}.srt`;
+                    const cacheId = `elite_${ruler.toLowerCase()}_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                     subtitleCache.set(cacheId, champ.fixedText);
                     finalOutput.push({
                         id: cacheId,
@@ -720,19 +739,28 @@ builder.defineSubtitlesHandler(async (args) => {
                         lang: "ara",
                         title: `[Synced to ${ruler} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
                     });
+                    
+                    // Diagnostic Ruler tied properly inside the block
+                    let baselineObj = null;
+                    if (ruler === 'OpenSubtitles') baselineObj = osBaseline;
+                    if (ruler === 'SubDL') baselineObj = subdlBaseline;
+                    if (ruler === 'SubSource') baselineObj = subsourceBaseline;
+                    
+                    if (baselineObj) {
+                        const diagnosticRuler = processEnglishRuler(baselineObj, ruler, detectedType);
+                        if (diagnosticRuler) finalOutput.push(diagnosticRuler);
+                    }
                 }
             }
-
-            if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType));
-            if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
-            if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType));
         }
 
         // =====================================================================
         // FINAL DELIVERY & FALLBACK
         // =====================================================================
         finalOutput = finalOutput.filter(item => item !== null);
-        if (isApiLimitReached) {
+
+        // 🔥 Forces a warning subtitle into the player if the API is burned out
+        if (typeof isApiLimitReached !== 'undefined' && isApiLimitReached) {
             const limitCacheId = `api_limit_${Date.now()}.srt`;
             const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ أنتهت صلاحية الرخصة, جددها يا حلو</b></font>`;
             subtitleCache.set(limitCacheId, limitText);
@@ -743,6 +771,7 @@ builder.defineSubtitlesHandler(async (args) => {
                 title: `⚠️ API Key Expired!`
             });
         }
+
         if (finalOutput.length > 0) {
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
             return { subtitles: finalOutput };
@@ -801,19 +830,86 @@ app.get('/', (req, res) => {
         <title>${CONFIG.ADDON_NAME} | Setup</title>
         <style>
             body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0; text-align:center; }
-            .container { background-color:#202020; padding:40px; border-radius:12px; border:1px solid #333; max-width:500px; box-shadow:0 10px 30px rgba(0,0,0,.5); }
-            h1 { color:#8A5A99; font-size:2rem; margin-top:0; }
-            p { color:#a0a0a0; font-size:1rem; margin-bottom:30px; }
-            .install-btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.2rem; font-weight:bold; cursor:pointer; text-decoration:none; display:inline-block; margin-top:10px; }
-            .install-btn:hover { background-color:#6c4777; }
+            .container { background-color:#202020; padding:40px; border-radius:12px; border:1px solid #333; max-width:500px; width: 90%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; }
+            h1 { color:#8A5A99; font-size:2.2rem; margin-top:0; margin-bottom: 5px; }
+            p { color:#a0a0a0; font-size:1rem; margin-bottom:25px; }
+            input { width: 100%; padding: 14px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
+            input:focus { border-color: #8A5A99; }
+            .btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.1rem; font-weight:bold; cursor:pointer; text-decoration:none; display:block; margin-top:10px; box-sizing: border-box; transition: 0.2s; }
+            .btn:hover { background-color:#6c4777; }
+            .btn-secondary { background-color: #333; margin-top: 15px; }
+            .btn-secondary:hover { background-color: #444; }
+            .error { color: #ff4c4c; font-size: 0.9rem; display: none; margin-bottom: 15px; text-align: left; padding-left: 5px; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>${CONFIG.ADDON_NAME}</h1>
-            <p>V${CONFIG.ADDON_VERSION} (Config-Driven Engine) is active. Click below to install.</p>
-            <a class="install-btn" href="stremio://${HOST.replace(/^https?:\/\//, '')}/manifest.json">Install to Stremio</a>
+            <p>V${CONFIG.ADDON_VERSION} | Configuration</p>
+            
+            <div style="text-align: left;">
+                <input type="text" id="osKey" placeholder="Enter OpenSubtitles API Key (Required)">
+                <div id="errorMsg" class="error">⚠️ You must enter your API key to continue.</div>
+            </div>
+
+            <a href="#" id="installBtn" class="btn">1. Install to Stremio</a>
+            <button id="copyBtn" class="btn btn-secondary">2. Copy Manifest Link (For Nuvio)</button>
         </div>
+
+        <script>
+            const host = "${HOST}";
+            const installBtn = document.getElementById('installBtn');
+            const copyBtn = document.getElementById('copyBtn');
+            const osKeyInput = document.getElementById('osKey');
+            const errorMsg = document.getElementById('errorMsg');
+
+            // Generates the dynamic URLs containing the user's API Key
+            function getUrls() {
+                const key = osKeyInput.value.trim();
+                const configPath = key ? 'userOsKey=' + encodeURIComponent(key) + '/' : '';
+                const httpsUrl = host + '/' + configPath + 'manifest.json';
+                const stremioUrl = httpsUrl.replace(/^https?:/, 'stremio:');
+                return { httpsUrl, stremioUrl, key };
+            }
+
+            installBtn.addEventListener('click', (e) => {
+                const urls = getUrls();
+                if (!urls.key) {
+                    e.preventDefault(); // Stop the click if empty
+                    errorMsg.style.display = 'block';
+                } else {
+                    errorMsg.style.display = 'none';
+                    installBtn.href = urls.stremioUrl; // Route to Stremio app
+                }
+            });
+
+            copyBtn.addEventListener('click', () => {
+                const urls = getUrls();
+                if (!urls.key) {
+                    errorMsg.style.display = 'block';
+                    return;
+                }
+                errorMsg.style.display = 'none';
+                
+                // Copy the HTTPS manifest link directly to clipboard
+                navigator.clipboard.writeText(urls.httpsUrl).then(() => {
+                    const originalText = copyBtn.innerText;
+                    copyBtn.innerText = '✅ Copied to Clipboard!';
+                    copyBtn.style.backgroundColor = '#4caf50';
+                    setTimeout(() => {
+                        copyBtn.innerText = originalText;
+                        copyBtn.style.backgroundColor = '#333';
+                    }, 2000);
+                });
+            });
+
+            // Hide error message when they start typing
+            osKeyInput.addEventListener('input', () => {
+                if (osKeyInput.value.trim() !== '') {
+                    errorMsg.style.display = 'none';
+                }
+            });
+        </script>
     </body>
     </html>
     `);
