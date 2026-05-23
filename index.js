@@ -109,7 +109,7 @@ async function fetchWithTimeout(resource, options = {}) {
 // RELEASE TOKENISER
 // ─────────────────────────────────────────────────────────────────────────────
 const RELEASE_TOKENS = [
-    'remux','bluray','blu-ray','bdrip','brrip','web-dl','webdl','webrip','web',
+    'remux','bluray','blu-ray','bdrip','brrip','bdremux','web-dl','webdl','webrip','web',
     'hdtv','dvdrip','dvdscr','dvd','hdrip','hd','ts','cam',
     '2160p','1080p','720p','480p',
     'hevc','x265','x264','h265','h264','av1',
@@ -138,7 +138,8 @@ function releaseScore(setA, setB) {
 
 function getReleaseTypeGroup(tokens) {
     if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) return 'WEB';
-    if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip')) return 'BLURAY';
+    // 🔥 Added bdremux check here
+    if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) return 'BLURAY';
     if (tokens.has('hdtv') || tokens.has('hdrip')) return 'HDTV';
     if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) return 'DVD';
     if (tokens.has('cam') || tokens.has('ts')) return 'CAM';
