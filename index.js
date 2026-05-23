@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.3",
+    ADDON_VERSION: "1.0.4",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     OS_API_KEY: "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL",
