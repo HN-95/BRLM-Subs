@@ -151,10 +151,22 @@ function filterBaselinesByType(candidates, streamTypeGroup) {
 }
 function decodeArabicFile(buffer) {
     const utf8 = buffer.toString('utf8');
-    // 🔥 Fixes "?????": If it contains the Unicode replacement character, UTF-8 failed.
-    if (utf8.includes('')) return iconv.decode(buffer, 'win1256');
-    // If no valid Arabic characters exist, it's likely win1256
-    if (!/[\u0600-\u06FF]/.test(utf8)) return iconv.decode(buffer, 'win1256');
+    
+    // Count how many broken characters exist
+    const brokenCharCount = (utf8.match(//g) || []).length;
+    
+    // Only drop to win1256 if the file is completely unreadable in UTF-8
+    if (brokenCharCount > 30) {
+        return iconv.decode(buffer, 'win1256');
+    }
+    
+    // If UTF-8 produced no Arabic text at all, test win1256 just in case
+    if (!/[\u0600-\u06FF]/.test(utf8)) {
+        const win1256 = iconv.decode(buffer, 'win1256');
+        if (/[\u0600-\u06FF]/.test(win1256)) return win1256;
+    }
+    
+    // Otherwise, trust the UTF-8 decode
     return utf8;
 }
 
