@@ -13,10 +13,9 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.4",
+    ADDON_VERSION: "1.0.5",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
-    OS_API_KEY: "0RrM7pMhpM4n2pVN0ldnzNXYnxh72LIL",
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
     SUBSOURCE_KEY: "sk_5e25899dbf3a10bd8581778b2fa65698a50d27bec099309d24a185a29ea2bceb",
     ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
@@ -74,14 +73,14 @@ const manifest = {
     types: ["movie", "series"],
     catalogs: [],
     resources: ["subtitles"],
-    // 🔥 ADDED CONFIGURATION SUPPORT:
-    behaviorHints: { configurable: true, configurationRequired: false },
+   // 🔥 ADDED CONFIGURATION SUPPORT:
+    behaviorHints: { configurable: true, configurationRequired: true },
     config: [
         {
             key: "userOsKey",
             type: "text",
-            title: "OpenSubtitles API Key (Optional)",
-            description: "Enter your own OpenSubtitles API Key to bypass the limit. Leave blank to use the shared key."
+            title: "OpenSubtitles API Key (Required)",
+            description: "You MUST enter your own OpenSubtitles API Key for this addon to work."
         }
     ]
 };
@@ -518,10 +517,25 @@ function processEnglishRuler(baselineObj, rulerName, detectedType) {
 // MAIN HANDLER
 // ─────────────────────────────────────────────────────────────────────────────
 builder.defineSubtitlesHandler(async (args) => {
-    try {
-        // 🔥 Extract User's API Key from Stremio Config (Fallback to global key if empty)
-        const activeOsKey = args.config?.userOsKey && args.config.userOsKey.trim() !== "" ? args.config.userOsKey.trim() : CONFIG.OS_API_KEY;
-        
+   try {
+        // 🔥 Extract User's API Key strictly. NO SHARED FALLBACK.
+        const activeOsKey = args.config?.userOsKey && args.config.userOsKey.trim() !== "" ? args.config.userOsKey.trim() : null;
+
+        // 🔥 KILL SWITCH: If they didn't provide a key, serve a warning subtitle instantly and abort.
+        if (!activeOsKey) {
+            console.log(`❌ Blocked request: User did not provide an API Key.`);
+            const missingKeyCacheId = `nokey_${Date.now()}.srt`;
+            const missingKeyText = `1\n00:00:01,000 --> 00:00:55,000\n{\\an8}<font color="#ff0000"><b>⚠️ الإضافة تفتقد مفتاح API. يرجى إعادة التثبيت وإدخال المفتاح الخاص بك.</b></font>`;
+            subtitleCache.set(missingKeyCacheId, missingKeyText);
+            return {
+                subtitles: [{
+                    id: missingKeyCacheId,
+                    url: `${HOST}/dl/${missingKeyCacheId}`,
+                    lang: "ara",
+                    title: `⚠️ Missing API Key! Reinstall Addon.`
+                }]
+            };
+        }
         // 🔥 Masked Key Debugger: Only shows last 3 digits
         const maskedKey = activeOsKey ? `...${activeOsKey.slice(-3)}` : "None";
         
@@ -865,9 +879,14 @@ app.get('/', (req, res) => {
             const errorMsg = document.getElementById('errorMsg');
 
             // Generates the dynamic URLs containing the user's API Key
-            function getUrls() {
+        function getUrls() {
                 const key = osKeyInput.value.trim();
-                const configPath = key ? 'userOsKey=' + encodeURIComponent(key) + '/' : '';
+                // 🔥 Bulletproof Stremio JSON format for third-party apps
+                let configPath = '';
+                if (key) {
+                    const configObj = { userOsKey: key };
+                    configPath = encodeURIComponent(JSON.stringify(configObj)) + '/';
+                }
                 const httpsUrl = host + '/' + configPath + 'manifest.json';
                 const stremioUrl = httpsUrl.replace(/^https?:/, 'stremio:');
                 return { httpsUrl, stremioUrl, key };
