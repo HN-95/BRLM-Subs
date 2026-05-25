@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.5",
+    ADDON_VERSION: "1.0.6",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -62,6 +62,10 @@ const PORT = process.env.PORT || 7000;
 const HOST = (process.env.HOST || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 const subtitleCache = new Map();
 let isApiLimitReached = false;
+
+// 🔥 NEW: Caches the final calculated subtitle list for 2 hours to prevent API burn
+const responseCache = new Map();
+const CACHE_TTL_MS = 1000 * 60 * 60 * 2;
 // ─────────────────────────────────────────────────────────────────────────────
 // MANIFEST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,7 +529,7 @@ builder.defineSubtitlesHandler(async (args) => {
         if (!activeOsKey) {
             console.log(`❌ Blocked request: User did not provide an API Key.`);
             const missingKeyCacheId = `nokey_${Date.now()}.srt`;
-            const missingKeyText = `1\n00:00:01,000 --> 00:00:55,000\n{\\an8}<font color="#ff0000"><b>⚠️ الإضافة تفتقد مفتاح API. يرجى إعادة التثبيت وإدخال المفتاح الخاص بك.</b></font>`;
+            const missingKeyText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ الإضافة تفتقد مفتاح API. يرجى إعادة التثبيت وإدخال المفتاح الخاص بك.</b></font>`;
             subtitleCache.set(missingKeyCacheId, missingKeyText);
             return {
                 subtitles: [{
@@ -536,8 +540,9 @@ builder.defineSubtitlesHandler(async (args) => {
                 }]
             };
         }
-        // 🔥 Masked Key Debugger: Only shows last 3 digits
-        const maskedKey = activeOsKey ? `...${activeOsKey.slice(-3)}` : "None";
+        
+        // 🔥 Masked Key Debugger: Only shows last 3 digits in your logs
+        const maskedKey = `...${activeOsKey.slice(-3)}`;
         
         // 🔥 Pulled 'args.extra?.title' to ensure we never miss metadata
         const streamName    = args.extra?.filename ?? args.extra?.title ?? args.extra?.name ?? null;
@@ -556,6 +561,18 @@ builder.defineSubtitlesHandler(async (args) => {
         else if (streamTypeGroup === 'HDTV') detectedType = 'HDTV';
         else if (streamTypeGroup === 'DVD') detectedType = 'DVD';
         else if (streamTypeGroup === 'CAM') detectedType = 'CAM';
+
+        // 🔥 NEW: Intercept the request if we've already done the math!
+        const requestCacheKey = `${args.id}_${activeOsKey}_${detectedType}`;
+        if (responseCache.has(requestCacheKey)) {
+            const cachedResult = responseCache.get(requestCacheKey);
+            if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
+                console.log(`\n⚡ [CACHE HIT] Serving ${args.id} instantly! (Zero API credits used)`);
+                return { subtitles: cachedResult.subtitles };
+            } else {
+                responseCache.delete(requestCacheKey); // Delete if expired
+            }
+        }
 
         console.log(`\n===========================================`);
         console.log(`[${CONFIG.ADDON_NAME}] API: ${maskedKey} | IMDb: ${imdbId} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}`);
@@ -769,7 +786,7 @@ builder.defineSubtitlesHandler(async (args) => {
             }
         }
 
-        // =====================================================================
+// =====================================================================
         // FINAL DELIVERY & FALLBACK
         // =====================================================================
         finalOutput = finalOutput.filter(item => item !== null);
@@ -789,6 +806,8 @@ builder.defineSubtitlesHandler(async (args) => {
 
         if (finalOutput.length > 0) {
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
+            // 🔥 NEW: Save the hard work to the cache before delivering
+            responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
             return { subtitles: finalOutput };
         }
 
@@ -808,7 +827,11 @@ builder.defineSubtitlesHandler(async (args) => {
 
             const cacheId = `elite_fallback_${Date.now()}.srt`;
             subtitleCache.set(cacheId, bestFallback.text);
-            return { subtitles: [{ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `⚠️ Arabic (${CONFIG.RATINGS.UNVERIFIED.label})` }] };
+            
+            const fallbackOutput = [{ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `⚠️ Arabic (${CONFIG.RATINGS.UNVERIFIED.label})` }];
+            // 🔥 NEW: Cache the fallback too, so we don't spam the APIs on a lost cause
+            responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: fallbackOutput });
+            return { subtitles: fallbackOutput };
         }
 
         console.log(`\n[Done] No subtitles found.`);
