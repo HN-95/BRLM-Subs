@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.6",
+    ADDON_VERSION: "1.0.7",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -518,9 +518,9 @@ function processEnglishRuler(baselineObj, rulerName, detectedType) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN HANDLER
+// MAIN ENGINE (Detached for Background Tasks)
 // ─────────────────────────────────────────────────────────────────────────────
-builder.defineSubtitlesHandler(async (args) => {
+async function runSubtitleEngine(args) {
    try {
         // 🔥 Extract User's API Key strictly. NO SHARED FALLBACK.
         const activeOsKey = args.config?.userOsKey && args.config.userOsKey.trim() !== "" ? args.config.userOsKey.trim() : null;
@@ -630,9 +630,12 @@ builder.defineSubtitlesHandler(async (args) => {
                 }
             }
 
-            if (osRulers.length === 0) {
-                console.log(`❌ Could not lock any OS TV Rulers. Aborting sync.`);
-                return { subtitles: [] };
+           if (osRulers.length === 0) {
+                console.log(`❌ Could not lock any OS TV Rulers. Likely API limit reached.`);
+                const limitCacheId = `tv_limit_${Date.now()}.srt`;
+                const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ انتهى رصيد مفتاح الترجمه. توجه الى الموقع لمعرفه طريقه حل المشكلة</b></font>`;
+                subtitleCache.set(limitCacheId, limitText);
+                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: `⚠️ API Limit / Sync Failed` }] };
             }
 
             const allCandidates = [
@@ -720,9 +723,12 @@ builder.defineSubtitlesHandler(async (args) => {
                 if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked`); break; }
             }
 
-            if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
-                console.log(`❌ No Master Rulers could be locked. Aborting sync.`);
-                return { subtitles: [] };
+          if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
+                console.log(`❌ No Master Rulers could be locked. Likely API limit reached.`);
+                const limitCacheId = `movie_limit_${Date.now()}.srt`;
+                const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ انتهى رصيد مفتاح الترجمه. توجه الى الموقع لمعرفه طريقه حل المشكلة</b></font>`;
+                subtitleCache.set(limitCacheId, limitText);
+                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: `⚠️ API Limit / Sync Failed` }] };
             }
 
             const allArabicCandidates = [
@@ -837,10 +843,72 @@ builder.defineSubtitlesHandler(async (args) => {
         console.log(`\n[Done] No subtitles found.`);
         return { subtitles: [] };
 
-    } catch (error) {
+   } catch (error) {
         console.error("❌ Fatal:", error.message);
         return { subtitles: [] };
     }
+} // <--- The engine is now cleanly sealed with this bracket
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE TRAFFIC COP (Main Handler & Smart Background Pre-Cacher)
+// ─────────────────────────────────────────────────────────────────────────────
+builder.defineSubtitlesHandler(async (args) => {
+    // 1. Await the actual request so the user gets their subtitles instantly
+    const result = await runSubtitleEngine(args);
+
+    // 2. Smart Fire-and-Forget Pre-fetcher!
+    if (args.type === 'series' && args.id) {
+        // Run completely in the background so we don't block the user's video from loading
+        (async () => {
+            const parts = args.id.split(':');
+            if (parts.length === 3) {
+                const imdbId = parts[0];
+                const currentSeason = parseInt(parts[1]);
+                const currentEpisode = parseInt(parts[2]);
+
+                let nextId = `${imdbId}:${currentSeason}:${currentEpisode + 1}`; // Fallback
+
+                try {
+                    // Query Stremio's native Cinemeta API to read the season map
+                    const metaRes = await fetch(`https://v3-cinemeta.strem.io/meta/series/${imdbId}.json`);
+                    const metaData = await metaRes.json();
+                    
+                    if (metaData?.meta?.videos) {
+                        const videos = metaData.meta.videos;
+                        const nextInSeason = videos.find(v => v.season === currentSeason && v.episode === currentEpisode + 1);
+                        const nextSeasonFirst = videos.find(v => v.season === currentSeason + 1 && v.episode === 1);
+                        
+                        if (nextInSeason) {
+                            nextId = `${imdbId}:${currentSeason}:${currentEpisode + 1}`;
+                        } else if (nextSeasonFirst) {
+                            nextId = `${imdbId}:${currentSeason + 1}:1`;
+                            console.log(`\n📺 [Season Finale Detected] Jumping to Season ${currentSeason + 1}`);
+                        } else {
+                            console.log(`\n🛑 [Series Finale] No more episodes to pre-cache.`);
+                            return; // End of the line, stop wasting APIs!
+                        }
+                    }
+                } catch (e) {
+                    // If Cinemeta is down, just use the fallback +1 logic
+                }
+
+                const nextEpArgs = JSON.parse(JSON.stringify(args)); 
+                nextEpArgs.id = nextId;
+                
+                // 🔥 CRITICAL: Only delete the videoHash. Keep filename for strict WEB-DL/REMUX matching.
+                if (nextEpArgs.extra) {
+                    delete nextEpArgs.extra.videoHash;
+                }
+
+                console.log(`\n⏳ [Pre-Cache Daemon] Queuing background sync for next episode: ${nextEpArgs.id}...`);
+                await runSubtitleEngine(nextEpArgs);
+            }
+        })().catch(err => {
+            console.log(`[Pre-Cache] Background task aborted silently.`);
+        });
+    }
+
+    return result;
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
