@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.7",
+    ADDON_VERSION: "1.0.8",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -61,7 +61,6 @@ const CONFIG = {
 const PORT = process.env.PORT || 7000;
 const HOST = (process.env.HOST || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 const subtitleCache = new Map();
-let isApiLimitReached = false;
 
 // 🔥 NEW: Caches the final calculated subtitle list for 2 hours to prevent API burn
 const responseCache = new Map();
@@ -198,7 +197,6 @@ function formatTime(ms) {
 async function searchOS(url, apiKey) {
     try {
         const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey, 'User-Agent': 'StremioArabicElite' } });
-        if (res.status === 429 || res.status === 403 || res.status === 401) isApiLimitReached = true;
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
@@ -212,7 +210,7 @@ async function getOsSrt(fileId, apiKey) {
             headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite', 'Accept': 'application/json' },
             body: JSON.stringify({ file_id: parseInt(fileId) })
         });
-        if (req.status === 429 || req.status === 403 || req.status === 401) isApiLimitReached = true;
+      
         if (!req.ok) return null;
         const data = await req.json();
         if (!data.link) return null;
@@ -798,18 +796,7 @@ async function runSubtitleEngine(args) {
         finalOutput = finalOutput.filter(item => item !== null);
 
         // 🔥 Forces a warning subtitle into the player if the API is burned out
-        if (typeof isApiLimitReached !== 'undefined' && isApiLimitReached) {
-            const limitCacheId = `api_limit_${Date.now()}.srt`;
-            const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ أنتهت صلاحية الرخصة, جددها يا حلو</b></font>`;
-            subtitleCache.set(limitCacheId, limitText);
-            finalOutput.unshift({
-                id: limitCacheId,
-                url: `${HOST}/dl/${limitCacheId}`,
-                lang: "ara",
-                title: `⚠️ API Key Expired!`
-            });
-        }
-
+    
         if (finalOutput.length > 0) {
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
             // 🔥 NEW: Save the hard work to the cache before delivering
