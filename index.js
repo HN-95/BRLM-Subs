@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.0.8",
+    ADDON_VERSION: "1.0.9",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -21,8 +21,8 @@ const CONFIG = {
     ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
 
     // ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
-    ARABIC_CANDIDATE_LIMIT: 10,        // Max Arabic subtitles to fetch per provider
-    MOVIE_BASELINE_LIMIT: 3,           // Max English baselines to check per provider (Movies)
+    ARABIC_CANDIDATE_LIMIT: 20,        // Max Arabic subtitles to fetch per provider
+    MOVIE_BASELINE_LIMIT: 40,           // Max English baselines to check per provider (Movies)
     TV_BASELINE_FETCH_POOL: 60,        // How deep to dig into OS to find distinct TV cuts
     TV_DISTINCT_CUTS_LIMIT: 3,         // How many distinct TV baselines to lock and test against
 
@@ -116,15 +116,19 @@ const RELEASE_TOKENS = [
     '2160p','1080p','720p','480p',
     'hevc','x265','x264','h265','h264','av1',
     'hdr','dv','dolby','atmos',
-    'dts','aac','dd5','ac3'
+    'dts','aac','dd5','ac3',
+    // 🔥 NEW: Edition Tracking Tokens
+    'extended','director','directors','theatrical','unrated','cut','dc','final'
 ];
 
 function tokeniseRelease(name) {
     if (!name) return new Set();
    const lower = name.toLowerCase().replace(/[._\s]+/g, ' ');
     const found = new Set();
-    for (const token of RELEASE_TOKENS) {
-        if (new RegExp(`(?<![a-z])${token.replace('-', '-?')}(?![a-z])`, 'i').test(lower)) {
+  for (const token of RELEASE_TOKENS) {
+        // Strict word boundary check to prevent false positives on short words like 'dc' or 'cut'
+        const regex = new RegExp(`\\b${token.replace('-', '-?')}\\b`, 'i');
+        if (regex.test(lower)) {
             found.add(token.replace('-', ''));
         }
     }
@@ -689,11 +693,13 @@ async function runSubtitleEngine(args) {
         // =====================================================================
         else {
             console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Arabic Candidates...`);
-            let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                // 🔥 Injected activeOsKey
+        let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
+                // 🔥 Linked back to CONFIG so you can scale to 40 or 50 centrally!
                 fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
+                
+                // (Leave the Arabic fetches below this untouched...)
                 fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
@@ -721,12 +727,26 @@ async function runSubtitleEngine(args) {
                 if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked`); break; }
             }
 
-          if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
-                console.log(`❌ No Master Rulers could be locked. Likely API limit reached.`);
+      if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
+                // Calculate if the APIs actually gave us files before the filter killed them
+                const totalRawBaselines = engOs.length + engSubdl.length + engSubsource.length;
+                
+                let errorMsg = `⚠️ انتهى رصيد مفتاح الترجمه. توجه الى الموقع لمعرفه طريقه حل المشكلة`;
+                let errorTitle = `⚠️ API Limit / Sync Failed`;
+
+                if (totalRawBaselines > 0) {
+                    console.log(`❌ Strict filter starved all ${totalRawBaselines} candidates. Aborting to protect sync.`);
+                    // Custom error telling the user the strict filter did its job
+                    errorMsg = `⚠️ لم يتم العثور على توقيت مطابق لنسخة (${detectedType}). تم الإلغاء لحماية المزامنة.`;
+                    errorTitle = `⚠️ No Strict ${detectedType} Match Found`;
+                } else {
+                    console.log(`❌ No Master Rulers could be locked. Likely API limit reached.`);
+                }
+
                 const limitCacheId = `movie_limit_${Date.now()}.srt`;
-                const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ انتهى رصيد مفتاح الترجمه. توجه الى الموقع لمعرفه طريقه حل المشكلة</b></font>`;
+                const limitText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>${errorMsg}</b></font>`;
                 subtitleCache.set(limitCacheId, limitText);
-                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: `⚠️ API Limit / Sync Failed` }] };
+                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: errorTitle }] };
             }
 
             const allArabicCandidates = [
