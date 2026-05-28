@@ -29,7 +29,7 @@ const CONFIG = {
     // ─── MATH ENGINE TUNING ───────────────────────────────────────────────────
     MATH_CHUNKS: 5,                    // Test Points: Number of segments to split the movie into for drift calculation
     MIN_ACCEPTABLE_DELAY_MS: 50,       // Any delay smaller than this will NOT trigger an auto-shift
-    DISTINCT_CUT_THRESHOLD_SEC: 0.5,   // Minimum seconds of difference needed to treat a TV baseline as a "New Cut"
+    DISTINCT_CUT_THRESHOLD_SEC: 2.2,   // Minimum seconds of difference needed to treat a TV baseline as a "New Cut"
     MIN_PASSING_ALIGNMENT_PCT: 40,     // If a subtitle scores below this %, it is immediately trashed
 
     // ─── DRIFT PENALTIES (If drift > X ms, subtract Y %) ──────────────────────
