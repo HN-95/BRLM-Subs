@@ -856,26 +856,27 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
             }
 
             const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
-           const seenFingerprints = new Set(); // ← ADD before the loop
+            
+            // ── Clone Firewall: Declare ONCE above the loop ──
+            const seenFingerprints = new Set(); 
 
-             for (const ruler of ['OpenSubtitles', 'SubDL', 'SubSource']) {
-              if (rulerMatches[ruler].length > 0) {
-               rulerMatches[ruler].sort(sortFn);
+            for (const ruler of ['OpenSubtitles', 'SubDL', 'SubSource']) {
+                if (rulerMatches[ruler].length > 0) {
+                    rulerMatches[ruler].sort(sortFn);
 
-               // ── Clone Firewall: walk sorted list until a unique translation is found ──
-                const champ = rulerMatches[ruler].find(candidate => {
-            const fp = getTextFingerprint(candidate.fixedText);
-            if (seenFingerprints.has(fp)) return false;
-            seenFingerprints.add(fp);
-            return true;
-        });
-        if (!champ) continue; // all candidates for this ruler are clones of prior winners
-        // ─────────────────────────────────────────────────────────────────────────
+                    // Walk the sorted list until a unique translation is found
+                    const champ = rulerMatches[ruler].find(candidate => {
+                        const fp = getTextFingerprint(candidate.fixedText);
+                        if (seenFingerprints.has(fp)) return false;
+                        seenFingerprints.add(fp);
+                        return true;
+                    });
+                    
+                    if (!champ) continue; // Skip if all candidates for this ruler are clones
+                    
                     const cacheId = `elite_${ruler.toLowerCase()}_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                     subtitleCache.set(cacheId, champ.fixedText);
-					// ── Clone Firewall ──────────────────────────────────────────────
-                    const seenFingerprints = new Set(); // declare this ABOVE the 'for ruler of' loop
-// ────────────────────────────────────────────────────────────────
+
                     finalOutput.push({
                         id: cacheId,
                         url: `${HOST}/dl/${cacheId}`,
@@ -895,7 +896,6 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                     }
                 }
             }
-        }
 
 // =====================================================================
         // FINAL DELIVERY & FALLBACK
