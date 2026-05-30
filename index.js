@@ -855,7 +855,7 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (bestMatrixScore) rulerMatches[bestMatrixScore.rulerName].push(bestMatrixScore);
             }
 
-            const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
+const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
             
             // ── Clone Firewall: Declare ONCE above the loop ──
             const seenFingerprints = new Set(); 
@@ -896,7 +896,7 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                     }
                 }
             }
-
+		}
 // =====================================================================
         // FINAL DELIVERY & FALLBACK
         // =====================================================================
