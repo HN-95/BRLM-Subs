@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.1",
+    ADDON_VERSION: "1.1.2",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -117,8 +117,11 @@ const RELEASE_TOKENS = [
     'hevc','x265','x264','h265','h264','av1',
     'hdr','dv','dolby','atmos',
     'dts','aac','dd5','ac3',
-    // 🔥 NEW: Edition Tracking Tokens
-    'extended','director','directors','theatrical','unrated','cut','dc','final'
+    // 🔥 Edition Tracking Tokens
+    'extended','director','directors','theatrical','unrated','cut','dc','final',
+    // 🔥 NEW: Network & Streaming Service Tokens
+    'nf','netflix','amzn','amazon','atvp','apple','dsnp','disney',
+    'max','hbo','hmax','hulu','pmtp','paramount','peacock','pckg'
 ];
 
 function tokeniseRelease(name) {
@@ -450,12 +453,21 @@ function isDistinctCut(textA, textB) {
 
 function getTextFingerprint(srtText) {
     if (!srtText) return '';
-    // Extract every 10th dialogue line, strip tags/timing, join into one string.
-    const lines = srtText.split('\n').filter(l => l && !l.match(/^\d+$/) && !l.includes('-->'));
-    const sample = lines.filter((_, i) => i % 10 === 0).slice(0, 15).join('|').replace(/<[^>]+>/g, '').trim();
-    return sample;
+    
+    // 1. Extract pure dialogue lines, stripping ALL tags and timings
+    const cleanLines = srtText.split('\n')
+        .map(l => l.replace(/<[^>]+>/g, '').replace(/\{[^}]+\}/g, '').trim())
+        .filter(l => l && !l.match(/^\d+$/) && !l.includes('-->'));
+    
+    // 2. Find the 10 longest sentences in the movie (watermarks/ads are almost never the longest lines)
+    // 3. Sort them alphabetically so timestamp shifts/missing lines don't matter
+    // 4. Crush them into one dense string
+    return cleanLines.sort((a, b) => b.length - a.length)
+        .slice(0, 10)
+        .sort()
+        .join('')
+        .replace(/\s+/g, '');
 }
-
 function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
     
@@ -480,32 +492,67 @@ function computePrecisionShift(englishText, arabicText, label = '', sourceName =
 
     if (engParsedClean.length < 50 || arParsedClean.length < 50) return { passed: false, alignmentPct: 0 };
 
-    const engIndex   = buildEngIndex(engParsedClean);
+const engIndex   = buildEngIndex(engParsedClean);
     const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
     const chunkSizeMs = durationMs / CONFIG.MATH_CHUNKS; // Linked to CONFIG
-    
-    // Create chunk arrays dynamically based on CONFIG
-    const chunks = Array.from({ length: CONFIG.MATH_CHUNKS }, () => []);
 
-    arParsedClean.forEach(line => {
-        const arMs  = line.startSeconds * 1000;
-        const engMs = nearestValue(engIndex, arMs);
-        const delta = arMs - engMs;
-        let ci = Math.floor(arMs / chunkSizeMs);
-        if (ci >= CONFIG.MATH_CHUNKS) ci = CONFIG.MATH_CHUNKS - 1;
-        chunks[ci].push(delta);
-    });
+    // 🔥 THE SYNC MEASURE HELPER
+    const measureSync = (arLines) => {
+        const chunks = Array.from({ length: CONFIG.MATH_CHUNKS }, () => []);
+        arLines.forEach(line => {
+            const arMs  = line.startSeconds * 1000;
+            const engMs = nearestValue(engIndex, arMs);
+            let ci = Math.floor(arMs / chunkSizeMs);
+            if (ci >= CONFIG.MATH_CHUNKS) ci = CONFIG.MATH_CHUNKS - 1;
+            chunks[ci].push(arMs - engMs);
+        });
+        const chunkOffsets = chunks.map(deltas => deltas.length > 15 ? median(deltas) : null).filter(val => val !== null);
+        if (chunkOffsets.length < 3) return { passed: false, alignmentPct: 0 };
+        
+        const driftMs = Math.abs(Math.max(...chunkOffsets) - Math.min(...chunkOffsets));
+        const allDeltas = chunks.flat();
+        const globalMedian = median(allDeltas);
+        const consensus = allDeltas.filter(d => Math.abs(d - globalMedian) < 400).length;
+        
+        return { passed: true, alignmentPct: (consensus / arLines.length) * 100, driftMs, globalMedian };
+    };
 
-    const chunkOffsets = chunks.map(deltas => deltas.length > 15 ? median(deltas) : null).filter(val => val !== null);
-    if (chunkOffsets.length < 3) return { passed: false, alignmentPct: 0 };
+    let bestMetrics = measureSync(arParsedClean);
+    let bestParsed = originalArParsed;
 
-    const driftMs      = Math.abs(Math.max(...chunkOffsets) - Math.min(...chunkOffsets));
-    const allDeltas    = chunks.flat();
-    const globalMedian = median(allDeltas);
-    const consensusLines = allDeltas.filter(d => Math.abs(d - globalMedian) < 400).length;
-    let alignmentPct = (consensusLines / arParsedClean.length) * 100;
+    // 🔥 FPS AUTO-SCALER: Rescue files with bad framerates
+    // If it's a decent translation but tearing heavily, test common FPS conversions
+    if (bestMetrics.passed && bestMetrics.alignmentPct >= 50 && bestMetrics.driftMs > 250) {
+        const fpsRatios = [25/23.976, 23.976/25, 24/23.976, 23.976/24];
+        for (const ratio of fpsRatios) {
+            const testArClean = arParsedClean.map(l => ({ ...l, startSeconds: l.startSeconds * ratio }));
+            const testMetrics = measureSync(testArClean);
+            
+            // If scaling fixes the tear and bumps the alignment by at least 5%
+            if (testMetrics.passed && testMetrics.driftMs < bestMetrics.driftMs && testMetrics.alignmentPct > bestMetrics.alignmentPct + 5) {
+                bestMetrics = testMetrics;
+                
+                // Apply the winning ratio to the final output payload
+                bestParsed = originalArParsed.map(l => {
+                    const newStart = l.startSeconds * ratio;
+                    const newEnd = l.endSeconds * ratio;
+                    return {
+                        ...l,
+                        startSeconds: newStart,
+                        endSeconds: newEnd,
+                        startTime: formatTime(newStart * 1000),
+                        endTime: formatTime(newEnd * 1000)
+                    };
+                });
+            }
+        }
+    }
 
-    console.log(`    [Math] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms`);
+    let { passed, alignmentPct, driftMs, globalMedian } = bestMetrics;
+    if (!passed) return { passed: false, alignmentPct: 0 };
+
+    const scaleLog = bestParsed !== originalArParsed ? ' [FPS Scaled ⚙️]' : '';
+    console.log(`    [Math] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms${scaleLog}`);
 
     // Penalties linked to CONFIG
     if (driftMs > CONFIG.PENALTY_SEVERE_MS) alignmentPct -= CONFIG.PENALTY_SEVERE_PCT;
@@ -514,7 +561,7 @@ function computePrecisionShift(englishText, arabicText, label = '', sourceName =
     
     if (alignmentPct < CONFIG.MIN_PASSING_ALIGNMENT_PCT) return { passed: false, alignmentPct };
 
-    let finalParsed = originalArParsed;
+    let finalParsed = bestParsed;
     // Delay shift linked to CONFIG
     if (Math.abs(globalMedian) > CONFIG.MIN_ACCEPTABLE_DELAY_MS) {
         finalParsed = originalArParsed.map(line => ({
@@ -613,7 +660,7 @@ async function runSubtitleEngine(args) {
         else if (streamTypeGroup === 'DVD') detectedType = 'DVD';
         else if (streamTypeGroup === 'CAM') detectedType = 'CAM';
 
-        // 🔥 NEW: Intercept the request if we've already done the math!
+       // 🔥 NEW: Intercept the request if we've already done the math!
         const requestCacheKey = `${args.id}_${activeOsKey}`;
         if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
@@ -624,8 +671,22 @@ async function runSubtitleEngine(args) {
                 responseCache.delete(requestCacheKey); // Delete if expired
             }
         }
+
+        // 🔥 NEW: Streaming Service Detector
+        let streamingService = '';
+        if (releaseTokens.has('nf') || releaseTokens.has('netflix')) streamingService = 'Netflix';
+        else if (releaseTokens.has('amzn') || releaseTokens.has('amazon')) streamingService = 'Amazon';
+        else if (releaseTokens.has('atvp') || releaseTokens.has('apple')) streamingService = 'Apple TV+';
+        else if (releaseTokens.has('dsnp') || releaseTokens.has('disney')) streamingService = 'Disney+';
+        else if (releaseTokens.has('max') || releaseTokens.has('hbo') || releaseTokens.has('hmax')) streamingService = 'Max';
+        else if (releaseTokens.has('hulu')) streamingService = 'Hulu';
+        else if (releaseTokens.has('pmtp') || releaseTokens.has('paramount')) streamingService = 'Paramount+';
+        else if (releaseTokens.has('peacock') || releaseTokens.has('pckg')) streamingService = 'Peacock';
+        
+        const serviceLog = streamingService ? ` | Service: ${streamingService}` : '';
+
         console.log(`\n===========================================`);
-        console.log(`[${CONFIG.ADDON_NAME}] API: ${maskedKey} | IMDb: ${imdbId} | Title: ${streamName || 'Unknown'} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}`);
+        console.log(`[${CONFIG.ADDON_NAME}] API: ${maskedKey} | IMDb: ${imdbId} | Title: ${streamName || 'Unknown'} | S${season||'?'}E${episode||'?'} | Type: ${detectedType}${serviceLog}`);
 
         let finalOutput = [];
         let bestFallback = null;
@@ -689,7 +750,8 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
            if (osRulers.length === 0) {
                 console.log(`❌ Could not lock any OS TV Rulers. Likely API limit reached.`);
                 const limitCacheId = `tv_limit_${Date.now()}.srt`;
-                const limitText = `1\n00:00:01,000 --> 00:01:00,000\n{\\an8}<font color="#ff0000"><b>⚠️ انتهى رصيد مفتاح الترجمه. توجه الى الموقع لمعرفه طريقه حل المشكلة</b></font>`;
+               // 🔥 UPDATED: Multi-line error message
+                const limitText = `1\n00:00:01,000 --> 00:01:00,000\n{\\an8}<font color="#ff0000"><b>⚠️ حدث خطأ لاحد الاسباب:\n1: لقد وصلت الى الحد المسموح لمفتاح ال API الخاص بك\n2: لم يتم ايجاد ترجمة مطابقة لهذا المحتوى</b></font>`;
                 subtitleCache.set(limitCacheId, limitText);
                 return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: `⚠️ API Limit / Sync Failed` }] };
             }
@@ -733,61 +795,61 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (diagnosticRuler) finalOutput.push(diagnosticRuler);
             }
 
-            // 3. Sort all survivors and take the absolute Top 3 overall
+// 3. Sort all survivors and grab up to 3 unique files PER OS CUT
             const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
             allSurvivingTvArabic.sort(sortFn);
             
-           // NEW:
-             const seenFingerprintsTv = new Set();
-             const top3TvArabic = [];
-             for (const candidate of allSurvivingTvArabic) {
-                 const fp = getTextFingerprint(candidate.fixedText);
-                 if (seenFingerprintsTv.has(fp)) continue;
-                 seenFingerprintsTv.add(fp);
-                 top3TvArabic.push(candidate);
-                 if (top3TvArabic.length === 3) break;
-             }
-            
-            for (const champ of top3TvArabic) {
+            const seenFingerprintsTv = new Set();
+            const cutWinnerTracker = {}; // Tracks how many winners we have per TV Cut
+
+            for (const candidate of allSurvivingTvArabic) {
+                const cutName = candidate.matchedRuler;
+                
+                // Initialize the tracker for this specific cut if it doesn't exist
+                if (!cutWinnerTracker[cutName]) cutWinnerTracker[cutName] = 0;
+                
+                // If this specific cut already has 3 winners, skip to the next candidate
+                if (cutWinnerTracker[cutName] >= 3) continue;
+
+                const fp = getTextFingerprint(candidate.fixedText);
+                if (seenFingerprintsTv.has(fp)) continue; // Clone detected!
+                seenFingerprintsTv.add(fp);
+
+                cutWinnerTracker[cutName]++; // Log a win for this cut
+
                 const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                subtitleCache.set(cacheId, champ.fixedText);
+                subtitleCache.set(cacheId, candidate.fixedText);
                 
                 finalOutput.push({
                     id: cacheId,
                     url: `${HOST}/dl/${cacheId}`,
                     lang: "ara",
-                    title: `[Synced to ${champ.matchedRuler} | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
+                    title: `[Synced to ${candidate.matchedRuler} | ${candidate.alignmentPct.toFixed(0)}%] (${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms)\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
                 });
             }
         }
-        
-        // =====================================================================
+// =====================================================================
         // PATH B: THE MOVIE CROSS-MATRIX
         // =====================================================================
         else {
             console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Arabic Candidates...`);
-        let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                // 🔥 Linked back to CONFIG so you can scale to 40 or 50 centrally!
+            let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
                 fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
                 
-                // (Leave the Arabic fetches below this untouched...)
                 fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
             ]);
 
-            // --- ADD THIS FILTERING BLOCK ---
             engOs = filterBaselinesByType(engOs, streamTypeGroup);
             engSubdl = filterBaselinesByType(engSubdl, streamTypeGroup);
             engSubsource = filterBaselinesByType(engSubsource, streamTypeGroup);
-            // --------------------------------
 
             let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
             for (const c of engOs) {
-                // 🔥 Passed activeOsKey
                 osBaseline = await getOsSrt(c.fileId, activeOsKey);
                 if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked`); break; }
             }
@@ -800,16 +862,14 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked`); break; }
             }
 
-      if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
-                // Calculate if the APIs actually gave us files before the filter killed them
+            if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
                 const totalRawBaselines = engOs.length + engSubdl.length + engSubsource.length;
                 
-                let errorMsg = `⚠️ انتهى رصيد مفتاح الترجمه. توجه الى الموقع لمعرفه طريقه حل المشكلة`;
+                let errorMsg = `⚠️ حدث خطأ\n1: لقد وصلت الى الحد المسموح لمفتاح ال API الخاص بك\n2: لم يتم ايجاد ترجمة مطابقة لهذا المحتوى`;
                 let errorTitle = `⚠️ API Limit / Sync Failed`;
 
                 if (totalRawBaselines > 0) {
                     console.log(`❌ Strict filter starved all ${totalRawBaselines} candidates. Aborting to protect sync.`);
-                    // Custom error telling the user the strict filter did its job
                     errorMsg = `⚠️ لم يتم العثور على توقيت مطابق لنسخة (${detectedType}). تم الإلغاء لحماية المزامنة.`;
                     errorTitle = `⚠️ No Strict ${detectedType} Match Found`;
                 } else {
@@ -822,14 +882,16 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: errorTitle }] };
             }
 
-            const allArabicCandidates = [
-                // 🔥 Passed activeOsKey
-                ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
-                ...arSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl) })),
-                ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl) })),
+         const allArabicCandidates = [
+                // 🔥 Added the index and trackNum to each line
+                ...arOs.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
+                ...arSubdl.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getZipSrt(c.downloadUrl) })),
+                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getSubsourceSrt(c.downloadUrl) })),
             ];
 
-            let rulerMatches = { 'OpenSubtitles': [], 'SubDL': [], 'SubSource': [] };
+// 1. Single Master Pool and Log Trackers
+            let allSurvivingArabic = [];
+            let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
 
             console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
             for (let i = 0; i < allArabicCandidates.length; i++) {
@@ -838,13 +900,27 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
-                let bestMatrixScore = null;
+                sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
+                const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
+                
+                let bestScoreForCandidate = null;
 
                 const testAgainstRuler = (baseline, rulerName) => {
                     if (!baseline) return;
-                    const result = computePrecisionShift(baseline.text, arabicData.text, `${c.source} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false);
-                    if (result.passed && (!bestMatrixScore || result.alignmentPct > bestMatrixScore.alignmentPct)) {
-                        bestMatrixScore = { candidate: c, rulerName, ...result };
+                    const result = computePrecisionShift(baseline.text, arabicData.text, `${candidateLabel} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false);
+                    
+                    if (result.passed) {
+                        if (!bestScoreForCandidate) {
+                            bestScoreForCandidate = { candidate: c, rulerName, ...result };
+                        } else {
+                            // THE NATIVE MATCH LOGIC: 
+                            // If the new ruler has significantly lower drift (>40ms better), it's the native cut. Take it.
+                            // Otherwise, if drift is similar, take the higher alignment percentage.
+                            const driftImprovement = bestScoreForCandidate.driftMs - result.driftMs;
+                            if (driftImprovement > 40 || (Math.abs(driftImprovement) <= 40 && result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
+                                bestScoreForCandidate = { candidate: c, rulerName, ...result };
+                            }
+                        }
                     }
                 };
 
@@ -852,61 +928,102 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 testAgainstRuler(subdlBaseline, 'SubDL');
                 testAgainstRuler(subsourceBaseline, 'SubSource');
 
-                if (bestMatrixScore) rulerMatches[bestMatrixScore.rulerName].push(bestMatrixScore);
-            }
-
-const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
-            
-            // ── Clone Firewall: Declare ONCE above the loop ──
-            const seenFingerprints = new Set(); 
-
-            for (const ruler of ['OpenSubtitles', 'SubDL', 'SubSource']) {
-                if (rulerMatches[ruler].length > 0) {
-                    rulerMatches[ruler].sort(sortFn);
-
-                    // Walk the sorted list until a unique translation is found
-                    const champ = rulerMatches[ruler].find(candidate => {
-                        const fp = getTextFingerprint(candidate.fixedText);
-                        if (seenFingerprints.has(fp)) return false;
-                        seenFingerprints.add(fp);
-                        return true;
-                    });
-                    
-                    if (!champ) continue; // Skip if all candidates for this ruler are clones
-                    
-                    const cacheId = `elite_${ruler.toLowerCase()}_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                    subtitleCache.set(cacheId, champ.fixedText);
-
-                    finalOutput.push({
-                        id: cacheId,
-                        url: `${HOST}/dl/${cacheId}`,
-                        lang: "ara",
-                        title: `[Synced to ${ruler} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}] ${champ.candidate.releaseName}`
-                    });
-                    
-                    // Diagnostic Ruler tied properly inside the block
-                    let baselineObj = null;
-                    if (ruler === 'OpenSubtitles') baselineObj = osBaseline;
-                    if (ruler === 'SubDL') baselineObj = subdlBaseline;
-                    if (ruler === 'SubSource') baselineObj = subsourceBaseline;
-                    
-                    if (baselineObj) {
-                        const diagnosticRuler = processEnglishRuler(baselineObj, ruler, detectedType);
-                        if (diagnosticRuler) finalOutput.push(diagnosticRuler);
-                    }
+                if (bestScoreForCandidate) {
+                    allSurvivingArabic.push(bestScoreForCandidate);
                 }
             }
-		}
+
+            // 2. Sort by "True Sync Score" (Native 0ms matches float to the absolute top)
+            const sortFn = (a, b) => {
+                // Penalize drift heavily during sorting so 0ms native matches beat slightly drifty high-percentage matches
+                const scoreA = a.alignmentPct - (a.driftMs > 30 ? (a.driftMs / 20) : 0);
+                const scoreB = b.alignmentPct - (b.driftMs > 30 ? (b.driftMs / 20) : 0);
+                return scoreB === scoreA ? (a.driftMs - b.driftMs) : (scoreB - scoreA);
+            };
+            allSurvivingArabic.sort(sortFn);
+
+// 3. Clone Firewall: Pick the absolute Top 5 UNIQUE translations overall
+            const topArabic = [];
+            const usedRulers = new Set();
+
+            for (const champ of allSurvivingArabic) {
+                // 🔥 THE MATH SHIELD 🔥
+                // Compare this candidate against the winners we've already accepted.
+                const isClone = topArabic.some(existing => {
+                    const pctDiff = Math.abs(existing.alignmentPct - champ.alignmentPct);
+                    const offsetDiff = Math.abs(existing.offsetMs - champ.offsetMs);
+                    
+                    // If the percentage is within 0.2% and the offset is within 2ms, it is mathematically the same file.
+                    return pctDiff < 0.2 && offsetDiff <= 2; 
+                });
+
+                if (isClone) continue; // Clone detected! Kill it.
+                
+                topArabic.push(champ);
+                usedRulers.add(champ.rulerName); // Remember which English ruler it synced to
+                
+                if (topArabic.length >= 5) break; 
+            }
+
+            // 4. Push English Diagnostic Rulers ONLY if an Arabic file actually used them
+            if (usedRulers.has('OpenSubtitles') && osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType));
+            if (usedRulers.has('SubDL') && subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
+            if (usedRulers.has('SubSource') && subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType));
+
+            // 5. Push the Top Arabic Winners
+            for (const champ of topArabic) {
+                const cacheId = `elite_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                subtitleCache.set(cacheId, champ.fixedText);
+                
+                finalOutput.push({
+                    id: cacheId,
+                    url: `${HOST}/dl/${cacheId}`,
+                    lang: "ara",
+                    title: `[Synced to ${champ.rulerName} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
+                });
+            }
+        }
+
 // =====================================================================
         // FINAL DELIVERY & FALLBACK
         // =====================================================================
         finalOutput = finalOutput.filter(item => item !== null);
 
-        // 🔥 Forces a warning subtitle into the player if the API is burned out
-    
         if (finalOutput.length > 0) {
+            console.log(`\n👑 --- MASTER RULERS USED ---`);
+            // ... the rest of the code continues normally below this
+            finalOutput.filter(sub => sub.lang === 'eng').forEach(r => {
+                console.log(`   ${r.title.replace('\n', ' | ')}`);
+            });
+
+            console.log(`\n🏆 --- ARABIC WINNERS ---`);
+            finalOutput.filter(sub => sub.lang === 'ara').forEach(sub => {
+                console.log(`   ${sub.title.replace('\n', ' | ')}`);
+            });
+
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
-            // 🔥 NEW: Save the hard work to the cache before delivering
+            
+            // 🔥 NEW: Build & Inject "Stats for Nerds" AFTER terminal logging so it doesn't clutter your console
+            const engineMode = isTV ? 'TV Show/Series' : 'Movie';
+            const serviceTag = streamingService ? ` [${streamingService}]` : '';
+            const totalAra = finalOutput.filter(s => s.lang === 'ara').length;
+            const totalEng = finalOutput.filter(s => s.lang === 'eng').length;
+            
+            // \an7 aligns text to the Top-Left of the screen. Display time: 40 Minutes.
+            const statsText = `1\n00:00:01,000 --> 00:40:00,000\n{\\an7}<font color="#00ffcc"><b>[ 📊 BRLM Subs: Stats for Nerds ]</b></font>\n<font color="#cccccc"><b>Version:</b> ${CONFIG.ADDON_VERSION}\n<b>Engine:</b> ${engineMode}\n<b>Stream Type:</b> ${detectedType}${serviceTag}\n<b>File Name:</b> ${streamName || 'Unknown'}\n<b>Result:</b> ${totalAra} Arabic Syncs | ${totalEng} Master Rulers</font>`;
+            
+            const statsCacheId = `stats_nerds_${Date.now()}.srt`;
+            subtitleCache.set(statsCacheId, statsText);
+            
+            // unshift() forces it to the absolute top of the English subtitle list in Stremio
+            finalOutput.unshift({
+                id: statsCacheId,
+                url: `${HOST}/dl/${statsCacheId}`,
+                lang: "eng", 
+                title: `📊 Stats for Nerds (Debug Info)`
+            });
+
+            // Save the hard work to the cache before delivering
             responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
             return { subtitles: finalOutput };
         }
