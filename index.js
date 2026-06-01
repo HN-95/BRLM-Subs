@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.2",
+    ADDON_VERSION: "1.1.3",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -55,6 +55,8 @@ const CONFIG = {
 	// ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
     STRICT_TYPE_MATCHING: true,        // Force baselines to match stream type (WEB/BluRay/HDTV)
     ARABIC_CANDIDATE_LIMIT: 10,        // Max Arabic subtitles to fetch per provider
+	CLONE_SAMPLE_SIZE: 400,            // Number of pure Arabic characters to sample for shift-invariant clone detection
+
 };
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -84,6 +86,13 @@ const manifest = {
             type: "text",
             title: "OpenSubtitles API Key (Required)",
             description: "You MUST enter your own OpenSubtitles API Key for this addon to work."
+        },
+        {
+            key: "stripTags",
+            type: "boolean",
+            title: "Remove Formatting Tags",
+            description: "Check this if your TV shows raw code like {\\an8} or <i> on screen.",
+            default: false
         }
     ]
 };
@@ -451,22 +460,11 @@ function isDistinctCut(textA, textB) {
     } catch { return false; }
 }
 
-function getTextFingerprint(srtText) {
+function getPureArabicText(srtText) {
     if (!srtText) return '';
-    
-    // 1. Extract pure dialogue lines, stripping ALL tags and timings
-    const cleanLines = srtText.split('\n')
-        .map(l => l.replace(/<[^>]+>/g, '').replace(/\{[^}]+\}/g, '').trim())
-        .filter(l => l && !l.match(/^\d+$/) && !l.includes('-->'));
-    
-    // 2. Find the 10 longest sentences in the movie (watermarks/ads are almost never the longest lines)
-    // 3. Sort them alphabetically so timestamp shifts/missing lines don't matter
-    // 4. Crush them into one dense string
-    return cleanLines.sort((a, b) => b.length - a.length)
-        .slice(0, 10)
-        .sort()
-        .join('')
-        .replace(/\s+/g, '');
+    // Extracts strictly Arabic letters, vaporizing all punctuation and formatting
+    const match = srtText.match(/[\u0600-\u06FF]/g);
+    return match ? match.join('') : '';
 }
 function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
@@ -493,17 +491,23 @@ function computePrecisionShift(englishText, arabicText, label = '', sourceName =
     if (engParsedClean.length < 50 || arParsedClean.length < 50) return { passed: false, alignmentPct: 0 };
 
 const engIndex   = buildEngIndex(engParsedClean);
-    const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
-    const chunkSizeMs = durationMs / CONFIG.MATH_CHUNKS; // Linked to CONFIG
+   const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
+    
+    // 🔥 DYNAMIC CHUNKING: 1 chunk for every 10 minutes of runtime (Minimum of 3 chunks for short TV shows)
+    const durationMinutes = durationMs / 60000;
+    const dynamicChunks = Math.max(3, Math.floor(durationMinutes / 10)); 
+    const chunkSizeMs = durationMs / dynamicChunks;
 
-    // 🔥 THE SYNC MEASURE HELPER
+   // 🔥 THE SYNC MEASURE HELPER
     const measureSync = (arLines) => {
-        const chunks = Array.from({ length: CONFIG.MATH_CHUNKS }, () => []);
+        // Use dynamicChunks instead of CONFIG
+        const chunks = Array.from({ length: dynamicChunks }, () => []); 
         arLines.forEach(line => {
             const arMs  = line.startSeconds * 1000;
             const engMs = nearestValue(engIndex, arMs);
             let ci = Math.floor(arMs / chunkSizeMs);
-            if (ci >= CONFIG.MATH_CHUNKS) ci = CONFIG.MATH_CHUNKS - 1;
+            // Cap it using dynamicChunks
+            if (ci >= dynamicChunks) ci = dynamicChunks - 1; 
             chunks[ci].push(arMs - engMs);
         });
         const chunkOffsets = chunks.map(deltas => deltas.length > 15 ? median(deltas) : null).filter(val => val !== null);
@@ -621,6 +625,8 @@ async function runSubtitleEngine(args) {
    try {
         // 🔥 Extract User's API Key strictly. NO SHARED FALLBACK.
         const activeOsKey = args.config?.userOsKey && args.config.userOsKey.trim() !== "" ? args.config.userOsKey.trim() : null;
+		// 🔥 NEW: Extract the user's formatting preference
+        const stripTags = args.config?.stripTags === true || args.config?.stripTags === "true";
 
         // 🔥 KILL SWITCH: If they didn't provide a key, serve a warning subtitle instantly and abort.
         if (!activeOsKey) {
@@ -763,7 +769,8 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl, season, episode) }))
             ];
 
-            let allSurvivingTvArabic = [];
+           let allSurvivingTvArabic = [];
+            const seenArabicTvTexts = []; // 🔥 NEW: Pre-Gauntlet Memory
 
             console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
             for (let i = 0; i < allCandidates.length; i++) {
@@ -771,6 +778,24 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 const arabicData = await c.fetchFn();
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
+
+                // 🔥 NEW: Shift-Invariant Deduplicator (Dynamic Size)
+                const pureText = getPureArabicText(arabicData.text);
+                let isClone = false;
+                
+                if (pureText.length > CONFIG.CLONE_SAMPLE_SIZE) {
+                    const mid = Math.floor(pureText.length / 2);
+                    const offset = Math.floor(CONFIG.CLONE_SAMPLE_SIZE / 2);
+                    const sample = pureText.substring(mid - offset, mid + offset); // Dynamic core sample
+                    
+                    isClone = seenArabicTvTexts.some(seen => seen.includes(sample));
+                }
+                
+                if (isClone) {
+                    console.log(`    🗑️ [Clone Killed] Skipping duplicate: ${c.releaseName}`);
+                    continue; 
+                }
+                if (pureText) seenArabicTvTexts.push(pureText);
 
                 let bestScoreForCandidate = null;
 
@@ -811,14 +836,21 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 // If this specific cut already has 3 winners, skip to the next candidate
                 if (cutWinnerTracker[cutName] >= 3) continue;
 
-                const fp = getTextFingerprint(candidate.fixedText);
+                const fp = getPureArabicFingerprint(candidate.fixedText);
                 if (seenFingerprintsTv.has(fp)) continue; // Clone detected!
                 seenFingerprintsTv.add(fp);
 
                 cutWinnerTracker[cutName]++; // Log a win for this cut
 
-                const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                subtitleCache.set(cacheId, candidate.fixedText);
+               const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                
+                // 🔥 NEW: The Tag Vaporizer
+                let finalSrtText = candidate.fixedText;
+                if (stripTags) {
+                    finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                }
+                
+                subtitleCache.set(cacheId, finalSrtText);
                 
                 finalOutput.push({
                     id: cacheId,
@@ -892,6 +924,7 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
 // 1. Single Master Pool and Log Trackers
             let allSurvivingArabic = [];
             let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
+            const seenArabicMovieTexts = []; // 🔥 NEW: Pre-Gauntlet Memory
 
             console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
             for (let i = 0; i < allArabicCandidates.length; i++) {
@@ -900,6 +933,24 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
+                // 🔥 NEW: Shift-Invariant Deduplicator (Dynamic Size)
+                const pureText = getPureArabicText(arabicData.text);
+                let isClone = false;
+                
+                if (pureText.length > CONFIG.CLONE_SAMPLE_SIZE) {
+                    const mid = Math.floor(pureText.length / 2);
+                    const offset = Math.floor(CONFIG.CLONE_SAMPLE_SIZE / 2);
+                    const sample = pureText.substring(mid - offset, mid + offset); // Dynamic core sample
+                    
+                    isClone = seenArabicMovieTexts.some(seen => seen.includes(sample));
+                }
+                
+                if (isClone) {
+                    console.log(`    🗑️ [Clone Killed] Skipping duplicate: ${c.releaseName}`);
+                    continue; 
+                }
+                if (pureText) seenArabicMovieTexts.push(pureText);
+
                 sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
                 const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
                 
@@ -969,11 +1020,17 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
             if (usedRulers.has('OpenSubtitles') && osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType));
             if (usedRulers.has('SubDL') && subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
             if (usedRulers.has('SubSource') && subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType));
-
-            // 5. Push the Top Arabic Winners
+// 5. Push the Top Arabic Winners
             for (const champ of topArabic) {
                 const cacheId = `elite_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                subtitleCache.set(cacheId, champ.fixedText);
+                
+                // 🔥 NEW: The Tag Vaporizer
+                let finalSrtText = champ.fixedText;
+                if (stripTags) {
+                    finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                }
+                
+                subtitleCache.set(cacheId, finalSrtText);
                 
                 finalOutput.push({
                     id: cacheId,
@@ -1175,8 +1232,14 @@ app.get('/', (req, res) => {
             <h1>${CONFIG.ADDON_NAME}</h1>
             <p>V${CONFIG.ADDON_VERSION} | Configuration</p>
             
-            <div style="text-align: left;">
+           <div style="text-align: left;">
                 <input type="text" id="osKey" placeholder="Enter OpenSubtitles API Key (Required)">
+                
+                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; margin-bottom:15px; cursor:pointer;">
+                    <input type="checkbox" id="stripTags" style="width:auto; margin:0; transform: scale(1.2);">
+                    Strip Formatting Tags (Fixes {\an8} on Basic TVs)
+                </label>
+                
                 <div id="errorMsg" class="error">⚠️ You must enter your API key to continue.</div>
             </div>
 
@@ -1191,13 +1254,14 @@ app.get('/', (req, res) => {
             const osKeyInput = document.getElementById('osKey');
             const errorMsg = document.getElementById('errorMsg');
 
-            // Generates the dynamic URLs containing the user's API Key
-        function getUrls() {
+            // Generates the dynamic URLs containing the user's API Key and settings
+            function getUrls() {
                 const key = osKeyInput.value.trim();
-                // 🔥 Bulletproof Stremio JSON format for third-party apps
                 let configPath = '';
                 if (key) {
-                    const configObj = { userOsKey: key };
+                    // 🔥 NEW: Grab the checkbox state and inject it into the Stremio config URL
+                    const strip = document.getElementById('stripTags').checked;
+                    const configObj = { userOsKey: key, stripTags: strip };
                     configPath = encodeURIComponent(JSON.stringify(configObj)) + '/';
                 }
                 const httpsUrl = host + '/' + configPath + 'manifest.json';
