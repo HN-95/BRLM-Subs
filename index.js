@@ -824,7 +824,7 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
             const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
             allSurvivingTvArabic.sort(sortFn);
             
-            const seenFingerprintsTv = new Set();
+            const finalTvWinners = []; // 🔥 Tracks winners for the Math Shield
             const cutWinnerTracker = {}; // Tracks how many winners we have per TV Cut
 
             for (const candidate of allSurvivingTvArabic) {
@@ -836,15 +836,23 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 // If this specific cut already has 3 winners, skip to the next candidate
                 if (cutWinnerTracker[cutName] >= 3) continue;
 
-                const fp = getPureArabicFingerprint(candidate.fixedText);
-                if (seenFingerprintsTv.has(fp)) continue; // Clone detected!
-                seenFingerprintsTv.add(fp);
+                // 🔥 THE MATH SHIELD 🔥 (Brought over to TV Mode)
+                const isClone = finalTvWinners.some(existing => {
+                    const pctDiff = Math.abs(existing.alignmentPct - candidate.alignmentPct);
+                    const offsetDiff = Math.abs(existing.offsetMs - candidate.offsetMs);
+                    
+                    // If the percentage is within 0.2% and the offset is within 2ms, it is mathematically the same file.
+                    return pctDiff < 0.2 && offsetDiff <= 2; 
+                });
 
+                if (isClone) continue; // Clone detected by Math Shield! Kill it.
+
+                finalTvWinners.push(candidate);
                 cutWinnerTracker[cutName]++; // Log a win for this cut
 
-               const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                 
-                // 🔥 NEW: The Tag Vaporizer
+                // 🔥 THE TAG VAPORIZER
                 let finalSrtText = candidate.fixedText;
                 if (stripTags) {
                     finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
