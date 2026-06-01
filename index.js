@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.3",
+    ADDON_VERSION: "1.1.4",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -460,11 +460,25 @@ function isDistinctCut(textA, textB) {
     } catch { return false; }
 }
 
-function getPureArabicText(srtText) {
+function getArabicSignature(srtText) {
     if (!srtText) return '';
-    // Extracts strictly Arabic letters, vaporizing all punctuation and formatting
-    const match = srtText.match(/[\u0600-\u06FF]/g);
-    return match ? match.join('') : '';
+    
+    // 1. Strip all HTML/ASS tags and isolate raw lines
+    const cleanLines = srtText.split('\n')
+        .map(l => l.replace(/<[^>]+>/g, '').replace(/\{[^}]+\}/g, '').trim())
+        .filter(l => l && !l.match(/^\d+$/) && !l.includes('-->'));
+        
+    // 2. Extract strictly Arabic characters from each line
+    const arabicLines = cleanLines.map(l => {
+        const match = l.match(/[\u0600-\u06FF]/g);
+        return match ? match.join('') : '';
+    }).filter(l => l.length > 15); // Ignore short generic words (yes, no, hi)
+    
+    // 3. Find the 15 longest sentences, sort alphabetically, and crush them together
+    return arabicLines.sort((a, b) => b.length - a.length)
+        .slice(0, 15)
+        .sort()
+        .join('');
 }
 function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
@@ -769,8 +783,8 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl, season, episode) }))
             ];
 
-           let allSurvivingTvArabic = [];
-            const seenArabicTvTexts = []; // 🔥 NEW: Pre-Gauntlet Memory
+          let allSurvivingTvArabic = [];
+          
 
             console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
             for (let i = 0; i < allCandidates.length; i++) {
@@ -779,26 +793,10 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
 
-                // 🔥 NEW: Shift-Invariant Deduplicator (Dynamic Size)
-                const pureText = getPureArabicText(arabicData.text);
-                let isClone = false;
-                
-                if (pureText.length > CONFIG.CLONE_SAMPLE_SIZE) {
-                    const mid = Math.floor(pureText.length / 2);
-                    const offset = Math.floor(CONFIG.CLONE_SAMPLE_SIZE / 2);
-                    const sample = pureText.substring(mid - offset, mid + offset); // Dynamic core sample
-                    
-                    isClone = seenArabicTvTexts.some(seen => seen.includes(sample));
-                }
-                
-                if (isClone) {
-                    console.log(`    🗑️ [Clone Killed] Skipping duplicate: ${c.releaseName}`);
-                    continue; 
-                }
-                if (pureText) seenArabicTvTexts.push(pureText);
+                // 🔥 The Ultimate Hybrid Deduplicator
+      
 
                 let bestScoreForCandidate = null;
-
                 // Test the candidate against every available TV cut
                 for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
                     const ruler = osRulers[rIdx];
@@ -824,35 +822,41 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
             const sortFn = (a, b) => b.alignmentPct === a.alignmentPct ? (a.driftMs - b.driftMs) : (b.alignmentPct - a.alignmentPct);
             allSurvivingTvArabic.sort(sortFn);
             
-            const finalTvWinners = []; // 🔥 Tracks winners for the Math Shield
-            const cutWinnerTracker = {}; // Tracks how many winners we have per TV Cut
+            const finalTvWinners = []; 
+            const cutWinnerTracker = {}; 
 
-            for (const candidate of allSurvivingTvArabic) {
+          for (const candidate of allSurvivingTvArabic) {
                 const cutName = candidate.matchedRuler;
-                
-                // Initialize the tracker for this specific cut if it doesn't exist
                 if (!cutWinnerTracker[cutName]) cutWinnerTracker[cutName] = 0;
-                
-                // If this specific cut already has 3 winners, skip to the next candidate
                 if (cutWinnerTracker[cutName] >= 3) continue;
 
-                // 🔥 THE MATH SHIELD 🔥 (Brought over to TV Mode)
+      // 🔥 THE OPTIMIZED SHIELD (Text is King)
                 const isClone = finalTvWinners.some(existing => {
-                    const pctDiff = Math.abs(existing.alignmentPct - candidate.alignmentPct);
-                    const offsetDiff = Math.abs(existing.offsetMs - candidate.offsetMs);
-                    
-                    // If the percentage is within 0.2% and the offset is within 2ms, it is mathematically the same file.
-                    return pctDiff < 0.2 && offsetDiff <= 2; 
+                    const candidateSig = getArabicSignature(candidate.fixedText);
+                    const existingSig = getArabicSignature(existing.fixedText);
+                    const textMatches = candidateSig.length > 50 && candidateSig === existingSig;
+
+                    // Only fall back to Math if the text signature somehow failed to generate
+                    let mathMatches = false;
+                    if (candidateSig.length <= 50) {
+                        const pctDiff = Math.abs(existing.alignmentPct - candidate.alignmentPct);
+                        const offsetDiff = Math.abs(existing.offsetMs - candidate.offsetMs);
+                        mathMatches = pctDiff < 0.2 && offsetDiff <= 2;
+                    }
+
+                    return textMatches || mathMatches; 
                 });
 
-                if (isClone) continue; // Clone detected by Math Shield! Kill it.
+                if (isClone) {
+                    console.log(`    🗑️ [2FA Clone Killed] ${candidate.candidate.releaseName}`);
+                    continue; 
+                }
 
                 finalTvWinners.push(candidate);
-                cutWinnerTracker[cutName]++; // Log a win for this cut
+                cutWinnerTracker[cutName]++; 
 
                 const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                 
-                // 🔥 THE TAG VAPORIZER
                 let finalSrtText = candidate.fixedText;
                 if (stripTags) {
                     finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
@@ -932,7 +936,7 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
 // 1. Single Master Pool and Log Trackers
             let allSurvivingArabic = [];
             let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
-            const seenArabicMovieTexts = []; // 🔥 NEW: Pre-Gauntlet Memory
+         
 
             console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
             for (let i = 0; i < allArabicCandidates.length; i++) {
@@ -941,23 +945,8 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
-                // 🔥 NEW: Shift-Invariant Deduplicator (Dynamic Size)
-                const pureText = getPureArabicText(arabicData.text);
-                let isClone = false;
-                
-                if (pureText.length > CONFIG.CLONE_SAMPLE_SIZE) {
-                    const mid = Math.floor(pureText.length / 2);
-                    const offset = Math.floor(CONFIG.CLONE_SAMPLE_SIZE / 2);
-                    const sample = pureText.substring(mid - offset, mid + offset); // Dynamic core sample
-                    
-                    isClone = seenArabicMovieTexts.some(seen => seen.includes(sample));
-                }
-                
-                if (isClone) {
-                    console.log(`    🗑️ [Clone Killed] Skipping duplicate: ${c.releaseName}`);
-                    continue; 
-                }
-                if (pureText) seenArabicMovieTexts.push(pureText);
+                // 🔥 The Ultimate Hybrid Deduplicator
+              
 
                 sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
                 const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
@@ -1005,25 +994,34 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
             const topArabic = [];
             const usedRulers = new Set();
 
-            for (const champ of allSurvivingArabic) {
-                // 🔥 THE MATH SHIELD 🔥
-                // Compare this candidate against the winners we've already accepted.
+for (const champ of allSurvivingArabic) {
+           // 🔥 THE OPTIMIZED SHIELD (Text is King)
                 const isClone = topArabic.some(existing => {
-                    const pctDiff = Math.abs(existing.alignmentPct - champ.alignmentPct);
-                    const offsetDiff = Math.abs(existing.offsetMs - champ.offsetMs);
-                    
-                    // If the percentage is within 0.2% and the offset is within 2ms, it is mathematically the same file.
-                    return pctDiff < 0.2 && offsetDiff <= 2; 
+                    const candidateSig = getArabicSignature(champ.fixedText);
+                    const existingSig = getArabicSignature(existing.fixedText);
+                    const textMatches = candidateSig.length > 50 && candidateSig === existingSig;
+
+                    // Only fall back to Math if the text signature somehow failed to generate
+                    let mathMatches = false;
+                    if (candidateSig.length <= 50) {
+                        const pctDiff = Math.abs(existing.alignmentPct - champ.alignmentPct);
+                        const offsetDiff = Math.abs(existing.offsetMs - champ.offsetMs);
+                        mathMatches = pctDiff < 0.2 && offsetDiff <= 2;
+                    }
+
+                    return textMatches || mathMatches; 
                 });
 
-                if (isClone) continue; // Clone detected! Kill it.
+                if (isClone) {
+                    console.log(`    🗑️ [2FA Clone Killed] Skipping duplicate: ${champ.candidate.releaseName}`);
+                    continue; 
+                }
                 
                 topArabic.push(champ);
                 usedRulers.add(champ.rulerName); // Remember which English ruler it synced to
                 
                 if (topArabic.length >= 5) break; 
             }
-
             // 4. Push English Diagnostic Rulers ONLY if an Arabic file actually used them
             if (usedRulers.has('OpenSubtitles') && osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType));
             if (usedRulers.has('SubDL') && subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
