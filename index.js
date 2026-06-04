@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.4",
+    ADDON_VERSION: "1.1.5",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -173,13 +173,35 @@ function filterBaselinesByType(candidates, streamTypeGroup) {
     return candidates.filter(c => {
         const cTokens = tokeniseRelease(c.releaseName);
         const cGroup = getReleaseTypeGroup(cTokens);
-        
-        // Strict enforce: Only keep baselines that match the exact group
-        // Note: If cGroup is null (e.g., filename is just "The.Boys.S1E2.srt"), we discard it 
-        // to ensure 100% accuracy, as requested.
         return cGroup === streamTypeGroup;
     });
 }
+
+// 🔥 NEW: The API Bouncer (Kills wrong seasons/episodes before they download)
+function enforceEpisodeMatch(candidates, season, episode) {
+    if (!season || !episode) return candidates;
+    const s = parseInt(season, 10);
+    const e = parseInt(episode, 10);
+
+    return candidates.filter(c => {
+        const name = c.releaseName.toLowerCase();
+        
+        // 1. If it has a strict SxxEyy tag, kill it if it doesn't match perfectly
+        const anySEMatch = name.match(/s(\d{1,2})[ex](\d{1,2})\b/i);
+        if (anySEMatch) {
+            if (parseInt(anySEMatch[1], 10) !== s || parseInt(anySEMatch[2], 10) !== e) return false;
+        }
+        
+        // 2. If it is a Season Pack (S01, Season 1), kill it if it's the wrong season
+        const seasonPackMatch = name.match(/(?:^|\b)(?:s|season\s?)(\d{1,2})\b/i);
+        if (seasonPackMatch && !anySEMatch) {
+             if (parseInt(seasonPackMatch[1], 10) !== s) return false; 
+        }
+        
+        return true; // Keep ambiguous files, zip extractors will handle them
+    });
+}
+
 function decodeArabicFile(buffer) {
     const utf8 = buffer.toString('utf8');
     
@@ -318,12 +340,15 @@ function findEpisodeInZip(entries, season, episode) {
     match = entries.find(e => looseRegex.test(e.entryName));
     if (match) return match;
 
-    // 3. Fallback Match: just the number at the end (02.srt)
+ // 3. Fallback Match: just the number at the end (02.srt)
     const numRegex = new RegExp(`\\b0?${ep}\\.srt$`, 'i');
     match = entries.find(e => numRegex.test(e.entryName));
     if (match) return match;
 
-    return entries[0]; // Absolute fallback
+    // 🔥 FIX: Only fallback to guessing if there is exactly 1 subtitle in the zip
+    if (entries.length === 1) return entries[0];
+    
+    return null; // It's a multi-file zip and we couldn't find the episode. Abort!
 }
 
 async function getZipSrt(zipUrl, season = null, episode = null) {
@@ -681,7 +706,7 @@ async function runSubtitleEngine(args) {
         else if (streamTypeGroup === 'CAM') detectedType = 'CAM';
 
        // 🔥 NEW: Intercept the request if we've already done the math!
-        const requestCacheKey = `${args.id}_${activeOsKey}`;
+       const requestCacheKey = `${args.id}_${detectedType}_${activeOsKey}`;
         if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
@@ -714,9 +739,9 @@ async function runSubtitleEngine(args) {
         // =====================================================================
         // PATH A: THE TV MULTI-CUT SWEEP
         // =====================================================================
-        if (isTV) {
+if (isTV) {
             console.log(`\n[TV Mode] Fetching OS Rulers + Arabic Candidates...`);
-let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
+            let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
                 fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey }),
                 fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15 }),
                 fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15 }),
@@ -724,6 +749,14 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
                 fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
             ]);
+
+// 🔥 NEW: Intercept API garbage
+            engOs = enforceEpisodeMatch(engOs, season, episode);
+            engSubdl = enforceEpisodeMatch(engSubdl, season, episode);
+            engSubsource = enforceEpisodeMatch(engSubsource, season, episode);
+            arOs = enforceEpisodeMatch(arOs, season, episode);
+            arSubdl = enforceEpisodeMatch(arSubdl, season, episode);
+            arSubsource = enforceEpisodeMatch(arSubsource, season, episode);
 
             // 🔥 Combine all English candidates and attach their specific download functions
            // 🔥 Combine all English candidates and attach their specific download functions
@@ -855,7 +888,8 @@ let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.
                 finalTvWinners.push(candidate);
                 cutWinnerTracker[cutName]++; 
 
-                const cacheId = `elite_tv_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+               // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
+                const cacheId = `Brlm-subs-[${candidate.alignmentPct.toFixed(0)}]-[${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms]_${Math.floor(Math.random()*10000)}.srt`;
                 
                 let finalSrtText = candidate.fixedText;
                 if (stripTags) {
@@ -1027,8 +1061,9 @@ for (const champ of allSurvivingArabic) {
             if (usedRulers.has('SubDL') && subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
             if (usedRulers.has('SubSource') && subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType));
 // 5. Push the Top Arabic Winners
-            for (const champ of topArabic) {
-                const cacheId = `elite_ar_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+          for (const champ of topArabic) {
+                // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
+                const cacheId = `Brlm-subs-[${champ.alignmentPct.toFixed(0)}]-[${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms]_${Math.floor(Math.random()*10000)}.srt`;
                 
                 // 🔥 NEW: The Tag Vaporizer
                 let finalSrtText = champ.fixedText;
