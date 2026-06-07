@@ -13,7 +13,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.5",
+    ADDON_VERSION: "1.1.6",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -122,7 +122,7 @@ async function fetchWithTimeout(resource, options = {}) {
 const RELEASE_TOKENS = [
     'remux','bluray','blu-ray','bdrip','brrip','bdremux','web-dl','webdl','webrip','web',
     'hdtv','dvdrip','dvdscr','dvd','hdrip','hd','ts','cam',
-    '2160p','1080p','720p','480p',
+    '2160p','4k','1080p','720p','480p',
     'hevc','x265','x264','h265','h264','av1',
     'hdr','dv','dolby','atmos',
     'dts','aac','dd5','ac3',
@@ -155,15 +155,27 @@ function releaseScore(setA, setB) {
 }
 
 function getReleaseTypeGroup(tokens) {
-   if (tokens.has('webdl')) return 'WEBDL';
-   if (tokens.has('webrip')) return 'WEBRIP';
-   if (tokens.has('web')) return 'WEBDL'; // bare 'web' is a last resort fallback only
-    // 🔥 Added bdremux check here
-    if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) return 'BLURAY';
-    if (tokens.has('hdtv') || tokens.has('hdrip')) return 'HDTV';
-    if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) return 'DVD';
-    if (tokens.has('cam') || tokens.has('ts')) return 'CAM';
-    return null;
+    let group = null;
+    
+    if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) {
+        group = tokens.has('webrip') ? 'WEBRIP' : 'WEBDL';
+    } else if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) {
+        group = 'BLURAY';
+    } else if (tokens.has('hdtv') || tokens.has('hdrip')) {
+        group = 'HDTV';
+    } else if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) {
+        group = 'DVD';
+    } else if (tokens.has('cam') || tokens.has('ts')) {
+        group = 'CAM';
+    }
+
+    // 🔥 NEW: 4K Remaster Quarantine
+    // If the video is 4K, it gets appended with '_4K' so it never mixes with older 1080p/720p cuts
+    if (group && (tokens.has('2160p') || tokens.has('4k'))) {
+        return group + '_4K';
+    }
+    
+    return group;
 }
 
 function filterBaselinesByType(candidates, streamTypeGroup) {
@@ -696,14 +708,17 @@ async function runSubtitleEngine(args) {
         const releaseTokens = tokeniseRelease(streamName || '');
         const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
         const isTV          = !!(season && episode);
+        const is4K          = releaseTokens.has('2160p') || releaseTokens.has('4k'); // 🔥 Track 4K state
 
         let detectedType = 'Unknown';
-        if (streamTypeGroup === 'WEBDL') detectedType = 'WEB-DL';
-        else if (streamTypeGroup === 'WEBRIP') detectedType = 'WEBRip';
-        else if (streamTypeGroup === 'BLURAY') detectedType = releaseTokens.has('remux') ? 'REMUX' : 'BLURAY';
-        else if (streamTypeGroup === 'HDTV') detectedType = 'HDTV';
-        else if (streamTypeGroup === 'DVD') detectedType = 'DVD';
-        else if (streamTypeGroup === 'CAM') detectedType = 'CAM';
+        const resTag = is4K ? ' 4K' : '';
+
+        if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
+        else if (streamTypeGroup?.startsWith('WEBRIP')) detectedType = 'WEBRip' + resTag;
+        else if (streamTypeGroup?.startsWith('BLURAY')) detectedType = (releaseTokens.has('remux') ? 'REMUX' : 'BLURAY') + resTag;
+        else if (streamTypeGroup?.startsWith('HDTV')) detectedType = 'HDTV' + resTag;
+        else if (streamTypeGroup?.startsWith('DVD')) detectedType = 'DVD' + resTag;
+        else if (streamTypeGroup?.startsWith('CAM')) detectedType = 'CAM' + resTag; 
 
        // 🔥 NEW: Intercept the request if we've already done the math!
        const requestCacheKey = `${args.id}_${detectedType}_${activeOsKey}`;
@@ -803,10 +818,16 @@ if (isTV) {
            if (osRulers.length === 0) {
                 console.log(`❌ Could not lock any OS TV Rulers. Likely API limit reached.`);
                 const limitCacheId = `tv_limit_${Date.now()}.srt`;
-               // 🔥 UPDATED: Multi-line error message
-                const limitText = `1\n00:00:01,000 --> 00:01:00,000\n{\\an8}<font color="#ff0000"><b>⚠️ حدث خطأ لاحد الاسباب:\n1: لقد وصلت الى الحد المسموح لمفتاح ال API الخاص بك\n2: لم يتم ايجاد ترجمة مطابقة لهذا المحتوى</b></font>`;
+                
+                // 🔥 NEW: 4K Starvation Alert
+                let errorMsg = `⚠️ حدث خطأ لاحد الاسباب:\n1: لقد وصلت الى الحد المسموح لمفتاح ال API الخاص بك\n2: لم يتم ايجاد ترجمة مطابقة لهذا المحتوى`;
+                if (is4K) {
+                    errorMsg = `⚠️(4k) لا توجد ترجمات متاحه لنسخه ال.\nيرجى تجربة جودة مختلفة (1080p/720p).`;
+                }
+
+                const limitText = `1\n00:00:01,000 --> 00:01:00,000\n{\\an8}<font color="#ff0000"><b>${errorMsg}</b></font>`;
                 subtitleCache.set(limitCacheId, limitText);
-                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: `⚠️ API Limit / Sync Failed` }] };
+                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: is4K ? `⚠️ Try 1080p/720p Stream` : `⚠️ API Limit / Sync Failed` }] };
             }
 
            const allCandidates = [
@@ -940,7 +961,7 @@ if (isTV) {
                 if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked`); break; }
             }
 
-            if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
+           if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
                 const totalRawBaselines = engOs.length + engSubdl.length + engSubsource.length;
                 
                 let errorMsg = `⚠️ حدث خطأ\n1: لقد وصلت الى الحد المسموح لمفتاح ال API الخاص بك\n2: لم يتم ايجاد ترجمة مطابقة لهذا المحتوى`;
@@ -948,8 +969,15 @@ if (isTV) {
 
                 if (totalRawBaselines > 0) {
                     console.log(`❌ Strict filter starved all ${totalRawBaselines} candidates. Aborting to protect sync.`);
-                    errorMsg = `⚠️ لم يتم العثور على توقيت مطابق لنسخة (${detectedType}). تم الإلغاء لحماية المزامنة.`;
-                    errorTitle = `⚠️ No Strict ${detectedType} Match Found`;
+                    
+                    // 🔥 NEW: 4K Starvation Alert
+                    if (is4K) {
+                        errorMsg = `⚠️ لم نتمكن من العثور على توقيت لنسخة الـ 4K.\nيرجى تجربة جودة مختلفة (1080p/720p).`;
+                        errorTitle = `⚠️ No 4K Match - Try 1080p`;
+                    } else {
+                        errorMsg = `⚠️ لم يتم العثور على توقيت مطابق لنسخة (${detectedType}). تم الإلغاء لحماية المزامنة.`;
+                        errorTitle = `⚠️ No Strict ${detectedType} Match Found`;
+                    }
                 } else {
                     console.log(`❌ No Master Rulers could be locked. Likely API limit reached.`);
                 }
