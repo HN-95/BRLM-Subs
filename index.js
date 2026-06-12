@@ -5,6 +5,7 @@ const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 const parser = require("srt-parser-2").default;
 const srtParser = new parser();
 const AdmZip = require("adm-zip");
+const { createExtractorFromData } = require('node-unrar-js');
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
@@ -13,7 +14,7 @@ const AdmZip = require("adm-zip");
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.6",
+    ADDON_VERSION: "1.1.7",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -21,9 +22,9 @@ const CONFIG = {
     ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
 
     // ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
-    ARABIC_CANDIDATE_LIMIT: 20,        // Max Arabic subtitles to fetch per provider
-    MOVIE_BASELINE_LIMIT: 40,           // Max English baselines to check per provider (Movies)
-    TV_BASELINE_FETCH_POOL: 60,        // How deep to dig into OS to find distinct TV cuts
+    ARABIC_CANDIDATE_LIMIT: 30,        // Max Arabic subtitles to fetch per provider
+    MOVIE_BASELINE_LIMIT: 100,           // Max English baselines to check per provider (Movies)
+    TV_BASELINE_FETCH_POOL: 80,        // How deep to dig into OS to find distinct TV cuts
     TV_DISTINCT_CUTS_LIMIT: 3,         // How many distinct TV baselines to lock and test against
 
     // ─── MATH ENGINE TUNING ───────────────────────────────────────────────────
@@ -122,7 +123,7 @@ async function fetchWithTimeout(resource, options = {}) {
 const RELEASE_TOKENS = [
     'remux','bluray','blu-ray','bdrip','brrip','bdremux','web-dl','webdl','webrip','web',
     'hdtv','dvdrip','dvdscr','dvd','hdrip','hd','ts','cam',
-    '2160p','4k','1080p','720p','480p',
+    '2160p','2160','4k','uhd','1080p','1080','720p','720','480p','480',
     'hevc','x265','x264','h265','h264','av1',
     'hdr','dv','dolby','atmos',
     'dts','aac','dd5','ac3',
@@ -138,11 +139,8 @@ function tokeniseRelease(name) {
    const lower = name.toLowerCase().replace(/[._\+\s]+/g, ' ').replace(/\b(\w+)-(\w+)\b/g, '$1$2 $1-$2');
     const found = new Set();
   for (const token of RELEASE_TOKENS) {
-        // Strict word boundary check to prevent false positives on short words like 'dc' or 'cut'
         const regex = new RegExp(`\\b${token.replace('-', '-?')}\\b`, 'i');
-        if (regex.test(lower)) {
-            found.add(token.replace('-', ''));
-        }
+        if (regex.test(lower)) found.add(token.replace('-', ''));
     }
     return found;
 }
@@ -156,25 +154,16 @@ function releaseScore(setA, setB) {
 
 function getReleaseTypeGroup(tokens) {
     let group = null;
-    
-    if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) {
-        group = tokens.has('webrip') ? 'WEBRIP' : 'WEBDL';
-    } else if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) {
-        group = 'BLURAY';
-    } else if (tokens.has('hdtv') || tokens.has('hdrip')) {
-        group = 'HDTV';
-    } else if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) {
-        group = 'DVD';
-    } else if (tokens.has('cam') || tokens.has('ts')) {
-        group = 'CAM';
-    }
+    if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) group = tokens.has('webrip') ? 'WEBRIP' : 'WEBDL';
+    else if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) group = 'BLURAY';
+    else if (tokens.has('hdtv') || tokens.has('hdrip')) group = 'HDTV';
+    else if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) group = 'DVD';
+    else if (tokens.has('cam') || tokens.has('ts')) group = 'CAM';
 
-    // 🔥 NEW: 4K Remaster Quarantine
-    // If the video is 4K, it gets appended with '_4K' so it never mixes with older 1080p/720p cuts
-    if (group && (tokens.has('2160p') || tokens.has('4k'))) {
+    // 🔥 Catch all 4K variants
+    if (group && (tokens.has('2160p') || tokens.has('2160') || tokens.has('4k') || tokens.has('uhd'))) {
         return group + '_4K';
     }
-    
     return group;
 }
 
@@ -336,8 +325,8 @@ async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseToke
     } catch { return []; }
 }
 
-// 🔥 NEW HELPER: Bulletproof ZIP Scanner
-function findEpisodeInZip(entries, season, episode) {
+// 🔥 NEW HELPER: Bulletproof Archive Scanner (ZIP & RAR)
+function findEpisodeInArchive(entries, season, episode) {
     if (!season || !episode) return entries[0];
     const ep = parseInt(episode, 10);
     const s = parseInt(season, 10);
@@ -352,35 +341,68 @@ function findEpisodeInZip(entries, season, episode) {
     match = entries.find(e => looseRegex.test(e.entryName));
     if (match) return match;
 
- // 3. Fallback Match: just the number at the end (02.srt)
+    // 3. Fallback Match: just the number at the end (02.srt)
     const numRegex = new RegExp(`\\b0?${ep}\\.srt$`, 'i');
     match = entries.find(e => numRegex.test(e.entryName));
     if (match) return match;
 
-    // 🔥 FIX: Only fallback to guessing if there is exactly 1 subtitle in the zip
+    // 🔥 FIX: Only fallback to guessing if there is exactly 1 subtitle in the zip/rar
     if (entries.length === 1) return entries[0];
     
-    return null; // It's a multi-file zip and we couldn't find the episode. Abort!
+    return null; // It's a multi-file archive and we couldn't find the episode. Abort!
 }
 
-async function getZipSrt(zipUrl, season = null, episode = null) {
+
+// 🔥 THE UNIVERSAL EXTRACTOR (Handles Plain Text, ZIPs, and RARs seamlessly)
+async function getArchiveSrt(url, season = null, episode = null, extraHeaders = {}) {
     try {
-        const headers = { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' };
-        const res = await fetchWithTimeout(zipUrl, { headers, timeout: CONFIG.SRT_FETCH_TIMEOUT_MS });
+        const headers = { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*', ...extraHeaders };
+        const res = await fetchWithTimeout(url, { headers, timeout: CONFIG.SRT_FETCH_TIMEOUT_MS });
         if (!res.ok) return null;
         
         const buffer = await res.arrayBuffer();
-        const textPreview = Buffer.from(buffer).toString('utf8', 0, 100);
-        if (textPreview.includes('<html') || textPreview.includes('<!DOCTYPE')) return null;
+        const uint8 = new Uint8Array(buffer);
         
-        const zip = new AdmZip(Buffer.from(buffer));
-        const entries = zip.getEntries().filter(e => e.entryName.toLowerCase().endsWith('.srt'));
+        // 1. Plain Text Check (Some APIs return the raw .srt immediately)
+        const preview = Buffer.from(buffer).toString('utf8', 0, 100);
+        if (preview.includes('1\n') || preview.includes('1\r') || preview.includes('-->')) {
+            return { text: decodeArabicFile(Buffer.from(buffer)) };
+        }
+        if (preview.includes('<html') || preview.includes('<!DOCTYPE')) return null;
+
+        let entries = [];
+
+        // 2. MAGIC BYTES: ZIP (Starts with PK -> 50 4B)
+        if (uint8[0] === 0x50 && uint8[1] === 0x4B) {
+            const zip = new AdmZip(Buffer.from(buffer));
+            entries = zip.getEntries()
+                .filter(e => e.entryName.toLowerCase().endsWith('.srt'))
+                .map(e => ({ entryName: e.entryName, getData: () => e.getData() }));
+        } 
+        // 3. MAGIC BYTES: RAR (Starts with Rar! -> 52 61 72 21)
+        else if (uint8[0] === 0x52 && uint8[1] === 0x61 && uint8[2] === 0x72 && uint8[3] === 0x21) {
+            const extractor = await createExtractorFromData({ data: uint8 });
+            const extracted = extractor.extract();
+            for (const file of extracted.files) {
+                if (!file.fileHeader.flags.directory && file.fileHeader.name.toLowerCase().endsWith('.srt')) {
+                    entries.push({
+                        entryName: file.fileHeader.name,
+                        getData: () => Buffer.from(file.extraction) // Convert Wasm output back to standard Buffer
+                    });
+                }
+            }
+        } else {
+            return null; // Unknown file format
+        }
+
         if (entries.length === 0) return null;
-        
-        const srtEntry = findEpisodeInZip(entries, season, episode);
+        const srtEntry = findEpisodeInArchive(entries, season, episode);
+        if (!srtEntry) return null;
         return { text: decodeArabicFile(srtEntry.getData()) };
-    } catch { return null; }
+        
+    } catch(e) { return null; }
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 3: SUBSOURCE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -419,26 +441,7 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
     } catch { return []; }
 }
 
-async function getSubsourceSrt(zipUrl, season = null, episode = null) {
-    try {
-        const res = await fetchWithTimeout(zipUrl, { headers: { 'User-Agent': 'Mozilla/5.0', 'X-API-Key': CONFIG.SUBSOURCE_KEY }, timeout: CONFIG.SRT_FETCH_TIMEOUT_MS });
-        if (!res.ok) return null;
-        const buffer = await res.arrayBuffer();
-        const preview = Buffer.from(buffer).toString('utf8', 0, 50);
-        
-        if (preview.trim().startsWith('{') || preview.trim().startsWith('<')) return null;
-        if (preview.includes('1\n') || preview.includes('1\r') || preview.includes('-->')) {
-            return { text: decodeArabicFile(Buffer.from(buffer)) };
-        }
-        
-        const zip = new AdmZip(Buffer.from(buffer));
-        const entries = zip.getEntries().filter(e => e.entryName.toLowerCase().endsWith('.srt'));
-        if (entries.length === 0) return null;
 
-        const srtEntry = findEpisodeInZip(entries, season, episode);
-        return { text: decodeArabicFile(srtEntry.getData()) };
-    } catch { return null; }
-}
 // ─────────────────────────────────────────────────────────────────────────────
 // MATH ENGINE (SDH DE-NOISER, SCALING, & DISTINCT CUT CHECKER)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -775,66 +778,67 @@ if (isTV) {
 
             // 🔥 Combine all English candidates and attach their specific download functions
            // 🔥 Combine all English candidates and attach their specific download functions
-        let combinedEng = [
+       let combinedEng = [
                 ...engOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
-                ...engSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl, season, episode) })),
-                ...engSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl, season, episode) }))
+                ...engSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
+                ...engSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': CONFIG.SUBSOURCE_KEY }) }))
             ];
 
             const originalCount = combinedEng.length;
-            combinedEng = filterBaselinesByType(combinedEng, streamTypeGroup);
+        
             console.log(`  🔍 Strict Type Matching: Retained ${combinedEng.length}/${originalCount} TV baselines across all sources.`);
 
-            let osRulers = []; // Array kept as 'osRulers' so the brackets below don't break
-            let seenTextSnippets = new Set(); // The Clone Firewall
+   let osRulers = []; 
+            let seenTextSnippets = new Set(); 
 
-            for (const c of combinedEng) {
-                const srt = await c.fetchFn();
-                if (srt) {
-                    const textSnippet = srt.text.substring(0, 200).trim();
-                    if (seenTextSnippets.has(textSnippet)) continue;
-                    seenTextSnippets.add(textSnippet);
+            // 🔥 HELPER: Attempts to lock rulers for a specific group
+            const tryLockTvRulers = async (targetGroup) => {
+                const strictEng = filterBaselinesByType(combinedEng, targetGroup);
+                for (const c of strictEng) {
+                    if (osRulers.length >= CONFIG.TV_DISTINCT_CUTS_LIMIT) break;
+                    const srt = await c.fetchFn();
+                    if (srt) {
+                        const textSnippet = srt.text.substring(0, 200).trim();
+                        if (seenTextSnippets.has(textSnippet)) continue;
+                        seenTextSnippets.add(textSnippet);
 
-                    if (osRulers.length === 0) {
-                        osRulers.push({ text: srt.text, candidate: c });
-                        console.log(`  ✅ TV Ruler 1 locked [${c.source}]`);
-                    } else {
-                        let isDistinct = true;
-                        for (const r of osRulers) {
-                            if (!isDistinctCut(r.text, srt.text)) {
-                                isDistinct = false;
-                                break;
-                            }
-                        }
-                        if (isDistinct) {
+                        if (osRulers.length === 0) {
                             osRulers.push({ text: srt.text, candidate: c });
-                            console.log(`  ✅ TV Ruler ${osRulers.length} locked (Distinct Cut) [${c.source}]`);
-                            if (osRulers.length === CONFIG.TV_DISTINCT_CUTS_LIMIT) break; 
+                            console.log(`  ✅ TV Ruler 1 locked [${c.source} | ${targetGroup}]`);
+                        } else {
+                            let isDistinct = true;
+                            for (const r of osRulers) {
+                                if (!isDistinctCut(r.text, srt.text)) { isDistinct = false; break; }
+                            }
+                            if (isDistinct) {
+                                osRulers.push({ text: srt.text, candidate: c });
+                                console.log(`  ✅ TV Ruler ${osRulers.length} locked (Distinct Cut) [${c.source} | ${targetGroup}]`);
+                            }
                         }
                     }
                 }
+            };
+
+            await tryLockTvRulers(streamTypeGroup);
+
+            // 🔥 THE 4K FALLBACK PROTOCOL
+            let fallbackTriggered = false;
+            if (osRulers.length === 0 && is4K) {
+                const fallbackGroup = streamTypeGroup.replace('_4K', '');
+                console.log(`⚠️ 4K Starvation: No 4K Rulers found. Falling back to 1080p baselines (${fallbackGroup})...`);
+                await tryLockTvRulers(fallbackGroup);
+                fallbackTriggered = true;
             }
 
-           if (osRulers.length === 0) {
-                console.log(`❌ Could not lock any OS TV Rulers. Likely API limit reached.`);
-                const limitCacheId = `tv_limit_${Date.now()}.srt`;
-                
-                // 🔥 NEW: 4K Starvation Alert
-                let errorMsg = `⚠️ حدث خطأ لاحد الاسباب:\n1: لقد وصلت الى الحد المسموح لمفتاح ال API الخاص بك\n2: لم يتم ايجاد ترجمة مطابقة لهذا المحتوى`;
-                if (is4K) {
-                    errorMsg = `⚠️(4k) لا توجد ترجمات متاحه لنسخه ال.\nيرجى تجربة جودة مختلفة (1080p/720p).`;
-                }
-
-                const limitText = `1\n00:00:01,000 --> 00:01:00,000\n{\\an8}<font color="#ff0000"><b>${errorMsg}</b></font>`;
-                subtitleCache.set(limitCacheId, limitText);
-                return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: is4K ? `⚠️ Try 1080p/720p Stream` : `⚠️ API Limit / Sync Failed` }] };
+           const isTvPlanB = osRulers.length === 0;
+            if (isTvPlanB) {
+                console.log(`⚠️ No TV Rulers locked. Initiating PLAN B: Unsynced Raw Subtitles.`);
             }
 
-           const allCandidates = [
-                // 🔥 Passed activeOsKey and target season/episode for ZIPs
+          const allCandidates = [
                 ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
-                ...arSubdl.map(c => ({ ...c, fetchFn: () => getZipSrt(c.downloadUrl, season, episode) })),
-                ...arSubsource.map(c => ({ ...c, fetchFn: () => getSubsourceSrt(c.downloadUrl, season, episode) }))
+                ...arSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
+                ...arSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': CONFIG.SUBSOURCE_KEY }) }))
             ];
 
           let allSurvivingTvArabic = [];
@@ -847,16 +851,75 @@ if (isTV) {
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
 
+
+// 🔥 NEW: 4K Blind Trust Protocol
+                const cTokens = tokeniseRelease(c.releaseName);
+                const cGroup = getReleaseTypeGroup(cTokens);
+                
+                if (fallbackTriggered && cGroup === streamTypeGroup) {
+                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Arabic match: ${c.releaseName}`);
+                    let fallbackParsed;
+                    try {
+                        fallbackParsed = srtParser.fromSrt(arabicData.text);
+                        fallbackParsed.unshift({
+                            id: "0",
+                            startTime: "00:00:01,000",
+                            endTime: "00:00:06,000",
+                            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)`
+                        });
+                        let blindText = srtParser.toSrt(fallbackParsed);
+                        if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                        
+                        const cacheId = `elite_tv_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                        subtitleCache.set(cacheId, blindText);
+                        
+                        // Push directly to the absolute final output, skipping the entire Math Engine and Top 5 clone firewall
+                        finalOutput.push({
+                            id: cacheId,
+                            url: `${HOST}/dl/${cacheId}`,
+                            lang: "ara",
+                            title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}] ${c.releaseName}`
+                        });
+                    } catch(e) {}
+                    continue; // Skip the math engine for this file!
+                }
+
                 // 🔥 The Ultimate Hybrid Deduplicator
       
 
-                let bestScoreForCandidate = null;
-                // Test the candidate against every available TV cut
-                for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
-                    const ruler = osRulers[rIdx];
-                    const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true);
-                    if (result.passed && (!bestScoreForCandidate || result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
-                        bestScoreForCandidate = { candidate: c, matchedRuler: `OS Cut ${rIdx+1}`, ...result };
+               let bestScoreForCandidate = null;
+
+                // 🔥 PLAN B: Bypass math, validate Arabic text, and mock the score
+                if (isTvPlanB) {
+                    const arabicCharCount = (arabicData.text.match(/[\u0600-\u06FF]/g) || []).length;
+                    const latinCharCount = (arabicData.text.match(/[a-zA-Z]/g) || []).length;
+                    
+                    if (arabicCharCount >= CONFIG.Min_Arabic_Letters && latinCharCount <= arabicCharCount) {
+                        let fallbackParsed;
+                        try {
+                            fallbackParsed = srtParser.fromSrt(arabicData.text);
+                            fallbackParsed.unshift({
+                                id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000",
+                                text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Plan B)`
+                            });
+                            bestScoreForCandidate = { 
+                                candidate: c, matchedRuler: 'Plan B', passed: true, 
+                                fixedText: srtParser.toSrt(fallbackParsed), 
+                                offsetMs: 0, alignmentPct: 0, driftMs: 0 // Mock scores for the Clone Firewall
+                            };
+                        } catch(e) {}
+                    } else {
+                        console.log(`    ❌ [Blocked] Fake/Corrupted File Detected. Trashing.`);
+                    }
+                } 
+                // 🔥 STANDARD GAUNTLET: Test the candidate against every available TV cut
+                else {
+                    for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
+                        const ruler = osRulers[rIdx];
+                        const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true);
+                        if (result.passed && (!bestScoreForCandidate || result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
+                            bestScoreForCandidate = { candidate: c, matchedRuler: `OS Cut ${rIdx+1}`, ...result };
+                        }
                     }
                 }
 
@@ -923,7 +986,9 @@ if (isTV) {
                     id: cacheId,
                     url: `${HOST}/dl/${cacheId}`,
                     lang: "ara",
-                    title: `[Synced to ${candidate.matchedRuler} | ${candidate.alignmentPct.toFixed(0)}%] (${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms)\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
+                    title: isTvPlanB 
+                        ? `[⚠️ Plan B | Unverified]\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
+                        : `[Synced to ${candidate.matchedRuler} | ${candidate.alignmentPct.toFixed(0)}%] (${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms)\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
                 });
             }
         }
@@ -942,23 +1007,40 @@ if (isTV) {
                 fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
             ]);
 
-            engOs = filterBaselinesByType(engOs, streamTypeGroup);
-            engSubdl = filterBaselinesByType(engSubdl, streamTypeGroup);
-            engSubsource = filterBaselinesByType(engSubsource, streamTypeGroup);
+           
+let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
-            let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
+            // 🔥 HELPER: Attempts to lock rulers for a specific group
+            const tryLockMovieRulers = async (targetGroup) => {
+                const fOs = filterBaselinesByType(engOs, targetGroup);
+                const fSubdl = filterBaselinesByType(engSubdl, targetGroup);
+                const fSubsource = filterBaselinesByType(engSubsource, targetGroup);
+                
+                for (const c of fOs) {
+                    if (osBaseline) break;
+                    osBaseline = await getOsSrt(c.fileId, activeOsKey);
+                    if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked [${targetGroup}]`); }
+                }
+                for (const c of fSubdl) {
+                    if (subdlBaseline) break;
+                    subdlBaseline = await getArchiveSrt(c.downloadUrl);
+                    if (subdlBaseline) { subdlBaseline.candidate = c; console.log(`  ✅ SubDL Ruler locked [${targetGroup}]`); }
+                }
+                for (const c of fSubsource) {
+                    if (subsourceBaseline) break;
+                    subsourceBaseline = await getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': CONFIG.SUBSOURCE_KEY });
+                    if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked [${targetGroup}]`); }
+                }
+            };
 
-            for (const c of engOs) {
-                osBaseline = await getOsSrt(c.fileId, activeOsKey);
-                if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked`); break; }
-            }
-            for (const c of engSubdl) {
-                subdlBaseline = await getZipSrt(c.downloadUrl);
-                if (subdlBaseline) { subdlBaseline.candidate = c; console.log(`  ✅ SubDL Ruler locked`); break; }
-            }
-            for (const c of engSubsource) {
-                subsourceBaseline = await getSubsourceSrt(c.downloadUrl);
-                if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked`); break; }
+            await tryLockMovieRulers(streamTypeGroup);
+
+            // 🔥 THE 4K FALLBACK PROTOCOL
+            let fallbackTriggered = false;
+          let isMoviePlanB = false;
+            if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
+                console.log(`⚠️ No Movie Rulers locked. Initiating PLAN B: Unsynced Raw Subtitles.`);
+                isMoviePlanB = true;
             }
 
            if(!osBaseline && !subdlBaseline && !subsourceBaseline) {
@@ -988,11 +1070,10 @@ if (isTV) {
                 return { subtitles: [{ id: limitCacheId, url: `${HOST}/dl/${limitCacheId}`, lang: "ara", title: errorTitle }] };
             }
 
-         const allArabicCandidates = [
-                // 🔥 Added the index and trackNum to each line
+        const allArabicCandidates = [
                 ...arOs.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
-                ...arSubdl.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getZipSrt(c.downloadUrl) })),
-                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getSubsourceSrt(c.downloadUrl) })),
+                ...arSubdl.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl) })),
+                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': CONFIG.SUBSOURCE_KEY }) })),
             ];
 
 // 1. Single Master Pool and Log Trackers
@@ -1007,37 +1088,91 @@ if (isTV) {
                 if (!arabicData) continue;
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
+				
+				// 🔥 NEW: 4K Blind Trust Protocol
+                const cTokens = tokeniseRelease(c.releaseName);
+                const cGroup = getReleaseTypeGroup(cTokens);
+                
+                if (fallbackTriggered && cGroup === streamTypeGroup) {
+                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Arabic match: ${c.releaseName}`);
+                    let fallbackParsed;
+                    try {
+                        fallbackParsed = srtParser.fromSrt(arabicData.text);
+                        fallbackParsed.unshift({
+                            id: "0",
+                            startTime: "00:00:01,000",
+                            endTime: "00:00:06,000",
+                            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)`
+                        });
+                        let blindText = srtParser.toSrt(fallbackParsed);
+                        if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                        
+                        const cacheId = `elite_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                        subtitleCache.set(cacheId, blindText);
+                        
+                        // Push directly to the absolute final output, skipping the entire Math Engine and Top 5 clone firewall
+                        finalOutput.push({
+                            id: cacheId,
+                            url: `${HOST}/dl/${cacheId}`,
+                            lang: "ara",
+                            title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}[${c.trackNum}]] ${c.releaseName}`
+                        });
+                    } catch(e) {}
+                    continue; // Skip the math engine for this file!
+                }
+				
                 // 🔥 The Ultimate Hybrid Deduplicator
               
 
                 sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
                 const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
-                
-                let bestScoreForCandidate = null;
+let bestScoreForCandidate = null;
 
-                const testAgainstRuler = (baseline, rulerName) => {
-                    if (!baseline) return;
-                    const result = computePrecisionShift(baseline.text, arabicData.text, `${candidateLabel} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false);
+                // 🔥 PLAN B: Bypass math, validate Arabic text, and mock the score
+                if (isMoviePlanB) {
+                    const arabicCharCount = (arabicData.text.match(/[\u0600-\u06FF]/g) || []).length;
+                    const latinCharCount = (arabicData.text.match(/[a-zA-Z]/g) || []).length;
                     
-                    if (result.passed) {
-                        if (!bestScoreForCandidate) {
-                            bestScoreForCandidate = { candidate: c, rulerName, ...result };
-                        } else {
-                            // THE NATIVE MATCH LOGIC: 
-                            // If the new ruler has significantly lower drift (>40ms better), it's the native cut. Take it.
-                            // Otherwise, if drift is similar, take the higher alignment percentage.
-                            const driftImprovement = bestScoreForCandidate.driftMs - result.driftMs;
-                            if (driftImprovement > 40 || (Math.abs(driftImprovement) <= 40 && result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
+                    if (arabicCharCount >= CONFIG.Min_Arabic_Letters && latinCharCount <= arabicCharCount) {
+                        let fallbackParsed;
+                        try {
+                            fallbackParsed = srtParser.fromSrt(arabicData.text);
+                            fallbackParsed.unshift({
+                                id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000",
+                                text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Plan B)`
+                            });
+                            bestScoreForCandidate = { 
+                                candidate: c, rulerName: 'Plan B', passed: true, 
+                                fixedText: srtParser.toSrt(fallbackParsed), 
+                                offsetMs: 0, alignmentPct: 0, driftMs: 0 // Mock scores for the Clone Firewall
+                            };
+                        } catch(e) {}
+                    } else {
+                        console.log(`    ❌ [Blocked] Fake/Corrupted File Detected. Trashing.`);
+                    }
+                } 
+                // 🔥 STANDARD GAUNTLET: Test against available rulers
+                else {
+                    const testAgainstRuler = (baseline, rulerName) => {
+                        if (!baseline) return;
+                        const result = computePrecisionShift(baseline.text, arabicData.text, `${candidateLabel} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false);
+                        
+                        if (result.passed) {
+                            if (!bestScoreForCandidate) {
                                 bestScoreForCandidate = { candidate: c, rulerName, ...result };
+                            } else {
+                                const driftImprovement = bestScoreForCandidate.driftMs - result.driftMs;
+                                if (driftImprovement > 40 || (Math.abs(driftImprovement) <= 40 && result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
+                                    bestScoreForCandidate = { candidate: c, rulerName, ...result };
+                                }
                             }
                         }
-                    }
-                };
+                    };
 
-                testAgainstRuler(osBaseline, 'OpenSubtitles');
-                testAgainstRuler(subdlBaseline, 'SubDL');
-                testAgainstRuler(subsourceBaseline, 'SubSource');
-
+                    testAgainstRuler(osBaseline, 'OpenSubtitles');
+                    testAgainstRuler(subdlBaseline, 'SubDL');
+                    testAgainstRuler(subsourceBaseline, 'SubSource');
+                }
                 if (bestScoreForCandidate) {
                     allSurvivingArabic.push(bestScoreForCandidate);
                 }
@@ -1105,7 +1240,9 @@ for (const champ of allSurvivingArabic) {
                     id: cacheId,
                     url: `${HOST}/dl/${cacheId}`,
                     lang: "ara",
-                    title: `[Synced to ${champ.rulerName} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
+title: isMoviePlanB
+                        ? `[⚠️ Plan B | Unverified]\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
+                        : `[Synced to ${champ.rulerName} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
                 });
             }
         }
