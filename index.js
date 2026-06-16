@@ -14,7 +14,7 @@ const { createExtractorFromData } = require('node-unrar-js');
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.8",
+    ADDON_VERSION: "1.1.9",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -1222,9 +1222,15 @@ for (const champ of allSurvivingArabic) {
             const statsCacheId = `stats_nerds_${Date.now()}.srt`;
             subtitleCache.set(statsCacheId, statsText);
             
-            finalOutput.unshift({ id: statsCacheId, url: `${HOST}/dl/${statsCacheId}`, lang: "eng", title: `📊 Stats for Nerds (Debug Info)` });
+          finalOutput.unshift({ id: statsCacheId, url: `${HOST}/dl/${statsCacheId}`, lang: "eng", title: `📊 Stats for Nerds (Debug Info)` });
 
-            responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
+            // 🔥 BUG FIX: Only save to cache if we actually found Arabic subtitles.
+            if (totalAra > 0) {
+                responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
+            } else {
+                console.log(`⚠️ Zero Arabic subs generated. Skipping cache to allow immediate retries.`);
+            }
+            
             return { subtitles: finalOutput };
         }
 
