@@ -14,7 +14,7 @@ const { createExtractorFromData } = require('node-unrar-js');
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.1.9",
+    ADDON_VERSION: "1.2.0",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -648,18 +648,59 @@ const engIndex   = buildEngIndex(engParsedClean);
 // ─────────────────────────────────────────────────────────────────────────────
 // ENGLISH DIAGNOSTIC HELPER
 // ─────────────────────────────────────────────────────────────────────────────
-function processEnglishRuler(baselineObj, rulerName, detectedType) {
+// ─────────────────────────────────────────────────────────────────────────────
+// ENGLISH DIAGNOSTIC HELPER
+// ─────────────────────────────────────────────────────────────────────────────
+function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false, releaseTokens = new Set()) {
     if (!baselineObj || !baselineObj.text || !baselineObj.candidate) return null;
     try {
         let parsed = srtParser.fromSrt(baselineObj.text);
-        parsed.unshift({
+        let cleanParsed = [];
+
+        // 🔥 Remove SDH (Tags and All-Caps Lines)
+        for (let i = 0; i < parsed.length; i++) {
+            let rawLines = parsed[i].text.split('\n');
+            let cleanLines = [];
+            
+            for (let line of rawLines) {
+                // Strip [Text] and (Text)
+                let cleanL = line.replace(/\[.*?\]/gs, '').replace(/\(.*?\)/gs, '').trim();
+                
+                // If the line has letters and is entirely uppercase, it's an SDH label. Skip it.
+                const hasLetters = /[a-zA-Z]/.test(cleanL);
+                if (hasLetters && cleanL === cleanL.toUpperCase()) continue;
+                
+                if (cleanL.length > 0) cleanLines.push(cleanL);
+            }
+            
+            if (cleanLines.length > 0) {
+                cleanParsed.push({ ...parsed[i], text: cleanLines.join('\n') });
+            }
+        }
+
+        // 🔥 Dynamic Cut Detection (Movies Only)
+        let cutText = "";
+        if (!isTV && releaseTokens) {
+            const cuts = [];
+            if (releaseTokens.has('director') || releaseTokens.has('directors') || releaseTokens.has('dc')) cuts.push("Director's");
+            if (releaseTokens.has('extended')) cuts.push("Extended");
+            if (releaseTokens.has('theatrical')) cuts.push("Theatrical");
+            if (releaseTokens.has('unrated')) cuts.push("Unrated");
+            if (releaseTokens.has('final')) cuts.push("Final");
+            
+            if (cuts.length > 0) {
+                cutText = `\nCurrent Cut: ${cuts.join(', ')}`;
+            }
+        }
+
+        cleanParsed.unshift({
             id: "0",
             startTime: "00:00:01,000",
             endTime: "00:00:06,000",
-            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ]</b></font>\nSource: ${baselineObj.candidate.source} | Type: ${detectedType} | Accuracy: ${CONFIG.RATINGS.DIAGNOSTIC.label}\nMatch: 100% | Delay: 0ms\nFile: ${baselineObj.candidate.releaseName}`
+            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>${cutText}`
         });
         
-        const fixedText = srtParser.toSrt(parsed);
+        const fixedText = srtParser.toSrt(cleanParsed);
         const cacheId = `elite_eng_ruler_${rulerName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}.srt`;
         subtitleCache.set(cacheId, fixedText);
         
@@ -667,7 +708,7 @@ function processEnglishRuler(baselineObj, rulerName, detectedType) {
             id: cacheId,
             url: `${HOST}/dl/${cacheId}`,
             lang: "eng", 
-            title: `[👑 ${rulerName} Ruler]\n[${baselineObj.candidate.source}] ${baselineObj.candidate.releaseName}`
+            title: `[👑 English | ${rulerName}]\n[${baselineObj.candidate.source}] ${baselineObj.candidate.releaseName}`
         };
     } catch(e) { return null; }
 }
@@ -881,10 +922,10 @@ if (osRulers.length === 0) {
                 }
             }
 
-            // 2. ALWAYS push the English Diagnostic Rulers first
+           // 2. ALWAYS push the Clean English Rulers unconditionally
             for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
-                const diagnosticRuler = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType);
-                if (diagnosticRuler) finalOutput.push(diagnosticRuler);
+                const cleanEnglish = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType, isTV, releaseTokens);
+                if (cleanEnglish) finalOutput.push(cleanEnglish);
             }
 
 // 3. Sort all survivors and grab up to 3 unique files PER OS CUT
@@ -1125,10 +1166,10 @@ for (const champ of allSurvivingArabic) {
                 
                 if (topArabic.length >= 5) break; 
             }
-            // 4. Push English Diagnostic Rulers ONLY if an Arabic file actually used them
-            if (usedRulers.has('OpenSubtitles') && osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType));
-            if (usedRulers.has('SubDL') && subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType));
-            if (usedRulers.has('SubSource') && subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType));
+           // 4. Push Clean English Rulers Unconditionally
+            if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens));
+            if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens));
+            if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens));
 // 5. Push the Top Arabic Winners
           for (const champ of topArabic) {
                 // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
