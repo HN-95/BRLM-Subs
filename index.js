@@ -14,7 +14,7 @@ const { createExtractorFromData } = require('node-unrar-js');
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.2.0",
+    ADDON_VERSION: "1.2.1",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -757,15 +757,24 @@ async function runSubtitleEngine(args) {
         let detectedType = 'Unknown';
         const resTag = is4K ? ' 4K' : '';
 
-        if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
+if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
         else if (streamTypeGroup?.startsWith('WEBRIP')) detectedType = 'WEBRip' + resTag;
         else if (streamTypeGroup?.startsWith('BLURAY')) detectedType = (releaseTokens.has('remux') ? 'REMUX' : 'BLURAY') + resTag;
         else if (streamTypeGroup?.startsWith('HDTV')) detectedType = 'HDTV' + resTag;
         else if (streamTypeGroup?.startsWith('DVD')) detectedType = 'DVD' + resTag;
         else if (streamTypeGroup?.startsWith('CAM')) detectedType = 'CAM' + resTag; 
 
+        // 🔥 CACHE COLLISION SHIELD: Isolate different movie cuts
+        let cutTag = [];
+        if (releaseTokens.has('director') || releaseTokens.has('directors') || releaseTokens.has('dc')) cutTag.push('DC');
+        if (releaseTokens.has('extended')) cutTag.push('EXT');
+        if (releaseTokens.has('theatrical')) cutTag.push('THEATRICAL');
+        if (releaseTokens.has('unrated')) cutTag.push('UNRATED');
+        if (releaseTokens.has('final')) cutTag.push('FINAL');
+        const editionKey = cutTag.length > 0 ? `_${cutTag.join('-')}` : '';
+
        // 🔥 NEW: Intercept the request if we've already done the math!
-       const requestCacheKey = `${args.id}_${detectedType}_${activeOsKey}`;
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}`;
         if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
