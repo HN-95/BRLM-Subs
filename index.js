@@ -20,30 +20,25 @@ db.exec(`
     includeStats INTEGER DEFAULT 1,
     removeSdh INTEGER DEFAULT 1,
     maxSubs INTEGER DEFAULT 5,
-    engineStrength INTEGER DEFAULT 3
+    engineStrength INTEGER DEFAULT 3,
+    useOs INTEGER DEFAULT 1,
+    useSubdl INTEGER DEFAULT 1,
+    useSubsource INTEGER DEFAULT 1,
+    allowRouteA INTEGER DEFAULT 1,
+    allowRouteB INTEGER DEFAULT 1,
+    allowRouteC INTEGER DEFAULT 1,
+    strict4k INTEGER DEFAULT 0,
+    autoFetchNext INTEGER DEFAULT 1
   )
 `);
 
-// 🔥 AUTO-MIGRATOR: Automatically rebuilds the table if it's stuck on the old schema
+// 🔥 AUTO-MIGRATOR: Smartly updates the table without deleting existing users
 try {
-    db.prepare('SELECT username FROM users LIMIT 1').get();
+    db.prepare('SELECT autoFetchNext FROM users LIMIT 1').get();
 } catch (e) {
-    console.log("⚠️ Old database schema detected. Rebuilding table automatically...");
-    db.exec('DROP TABLE users');
-    db.exec(`
-      CREATE TABLE users (
-        username TEXT PRIMARY KEY,
-        password TEXT NOT NULL,
-        osKey TEXT,
-        stripTags INTEGER DEFAULT 0,
-        includeStats INTEGER DEFAULT 1,
-        removeSdh INTEGER DEFAULT 1,
-        maxSubs INTEGER DEFAULT 5,
-        engineStrength INTEGER DEFAULT 3
-      )
-    `);
+    console.log("⚠️ Updating database schema to include autoFetchNext...");
+    try { db.exec('ALTER TABLE users ADD COLUMN autoFetchNext INTEGER DEFAULT 1'); } catch(err) {}
 }
-
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
@@ -52,7 +47,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.0",
+    ADDON_VERSION: "1.3.2",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -771,16 +766,22 @@ async function runSubtitleEngine(args) {
             return { subtitles: [{ id: missingKeyCacheId, url: `${HOST}/dl/${missingKeyCacheId}`, lang: "ara", title: `⚠️ Account Not Found! Visit Dashboard.` }] };
         }
 
-        // 🔥 4. Apply their live settings from the database
+       // 🔥 4. Apply their live settings from the database
         const userConfig = {
             osKey: userRow.osKey && userRow.osKey.trim() !== "" ? userRow.osKey.trim() : null,
             stripTags: userRow.stripTags === 1,
             includeStats: userRow.includeStats === 1,
             removeSdh: userRow.removeSdh === 1,
             maxSubs: userRow.maxSubs || 5,
-            engineStrength: userRow.engineStrength || 3
+            engineStrength: userRow.engineStrength || 3,
+            useOs: userRow.useOs !== 0, // Defaults to true
+            useSubdl: userRow.useSubdl !== 0,
+            useSubsource: userRow.useSubsource !== 0,
+            allowRouteA: userRow.allowRouteA !== 0,
+            allowRouteB: userRow.allowRouteB !== 0,
+            allowRouteC: userRow.allowRouteC !== 0,
+            strict4k: userRow.strict4k === 1
         };
-
         if (!userConfig.osKey) {
             console.log(`❌ Blocked request: User ${username} has no OpenSubtitles Key in DB.`);
             const nokeyId = `nokey2_${Date.now()}.srt`;
@@ -823,9 +824,10 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
         if (releaseTokens.has('unrated')) cutTag.push('UNRATED');
         if (releaseTokens.has('final')) cutTag.push('FINAL');
        const editionKey = cutTag.length > 0 ? `_${cutTag.join('-')}` : '';
-
-     // 🔥 Cache Key now tracks all active configurations to avoid crossover
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}`;
+// 🔥 Cache Key now tracks all active configurations to avoid crossover
+       const providerKey = `${userConfig.useOs?1:0}${userConfig.useSubdl?1:0}${userConfig.useSubsource?1:0}`;
+       const routeKey = `${userConfig.allowRouteA?1:0}${userConfig.allowRouteB?1:0}${userConfig.allowRouteC?1:0}`;
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}`;
        if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
@@ -861,12 +863,12 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 if (isTV) {
             console.log(`\n[TV Mode] Fetching OS Rulers + Arabic Candidates...`);
             let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey }),
-                fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15 }),
-                fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15 }),
-                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }),
-                fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
-                fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
+                userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15 }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15 }) : [],
+                userConfig.useOs ? fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }) : []
             ]);
 
 // 🔥 NEW: Intercept API garbage
@@ -922,13 +924,17 @@ if (isTV) {
 
             await tryLockTvRulers(streamTypeGroup);
 
-            // 🔥 THE 4K FALLBACK PROTOCOL
+          // 🔥 THE 4K FALLBACK PROTOCOL
             let fallbackTriggered = false;
             if (osRulers.length === 0 && is4K) {
-                const fallbackGroup = streamTypeGroup.replace('_4K', '');
-                console.log(`⚠️ 4K Starvation: No 4K Rulers found. Falling back to 1080p baselines (${fallbackGroup})...`);
-                await tryLockTvRulers(fallbackGroup);
-                fallbackTriggered = true;
+                if (!userConfig.strict4k) {
+                    const fallbackGroup = streamTypeGroup.replace('_4K', '');
+                    console.log(`⚠️ 4K Starvation: No 4K Rulers found. Falling back to 1080p baselines (${fallbackGroup})...`);
+                    await tryLockTvRulers(fallbackGroup);
+                    fallbackTriggered = true;
+                } else {
+                    console.log(`🛡️ 4K Strictness Shield Active: Refusing to fall back to 1080p baselines.`);
+                }
             }
 
 if (osRulers.length === 0) {
@@ -968,8 +974,8 @@ if (osRulers.length === 0) {
                     continue; 
                 }
 
-                // ─── ROUTE A: The Math Gauntlet ───
-                if (osRulers.length > 0) {
+              // ─── ROUTE A: The Math Gauntlet ───
+                if (userConfig.allowRouteA && osRulers.length > 0) {
                     let bestScoreForCandidate = null;
                     for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
                        const ruler = osRulers[rIdx];
@@ -982,10 +988,12 @@ if (osRulers.length === 0) {
                 }
             }
 
-           // 2. ALWAYS push the Clean English Rulers unconditionally
-           for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
-                const cleanEnglish = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType, isTV, releaseTokens, userConfig);
-                if (cleanEnglish) finalOutput.push(cleanEnglish);
+     // 2. ALWAYS push the Clean English Rulers conditionally based on Route A
+            if (userConfig.allowRouteA) {
+                for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
+                    const cleanEnglish = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType, isTV, releaseTokens, userConfig);
+                    if (cleanEnglish) finalOutput.push(cleanEnglish);
+                }
             }
 
 // 3. Sort all survivors and grab up to 3 unique files PER OS CUT
@@ -1041,9 +1049,10 @@ if (osRulers.length === 0) {
                 });
             }
 
-            // ─── ROUTE B: The Top 2 Raw Token Matches ───
-            console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
-            const routeBCandidates = allCandidates.filter(c => c.fetchedText).sort((a, b) => b.score - a.score);
+          // ─── ROUTE B: The Top 2 Raw Token Matches ───
+            if (userConfig.allowRouteB) {
+                console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
+                const routeBCandidates = allCandidates.filter(c => c.fetchedText).sort((a, b) => b.score - a.score);
             let routeBCount = 0;
             for (const c of routeBCandidates) {
                 if (routeBCount >= 2) break;
@@ -1073,6 +1082,7 @@ if (osRulers.length === 0) {
                 } catch(e) {}
             }
         }
+		}
 // =====================================================================
         // PATH B: THE MOVIE CROSS-MATRIX
         // =====================================================================
@@ -1289,8 +1299,8 @@ for (const champ of allSurvivingArabic) {
         finalOutput = finalOutput.filter(item => item !== null);
         const arabicWinnersCount = finalOutput.filter(sub => sub.lang === 'ara').length;
 
-        // 🔥 ROUTE C: If Route A and Route B both failed entirely, serve the absolute fallback
-        if (arabicWinnersCount === 0 && bestFallback) {
+      // 🔥 ROUTE C: If Route A and Route B both failed entirely, serve the absolute fallback
+        if (userConfig.allowRouteC && arabicWinnersCount === 0 && bestFallback) {
             console.log(`⚠️ Route A & B failed. Serving Route C (Fallback) from ${bestFallback.candidate.source}.`);
             let fallbackParsed;
             try {
@@ -1358,7 +1368,15 @@ builder.defineSubtitlesHandler(async (args) => {
     const result = await runSubtitleEngine(args);
 
     // 2. Smart Fire-and-Forget Pre-fetcher!
-    if (args.type === 'series' && args.id) {
+    let autoFetchNext = true; // Default to ON
+    if (args.config?.username) {
+        try {
+            const userRow = db.prepare('SELECT autoFetchNext FROM users WHERE LOWER(username) = LOWER(?)').get(args.config.username);
+            if (userRow && userRow.autoFetchNext === 0) autoFetchNext = false;
+        } catch (e) {}
+    }
+
+    if (autoFetchNext && args.type === 'series' && args.id) {
         // Run completely in the background so we don't block the user's video from loading
         (async () => {
             const parts = args.id.split(':');
@@ -1468,18 +1486,28 @@ app.post('/api/login', (req, res) => {
 });
 
 app.post('/api/update', (req, res) => {
-    const { username, password, osKey, stripTags, includeStats, removeSdh, maxSubs, engineStrength } = req.body;
+    const { 
+        username, password, osKey, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
+        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext
+    } = req.body;
+    
     const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
     if (!user) return res.status(401).json({ error: "Authentication failed." });
     
     try {
-        db.prepare(`UPDATE users SET osKey = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ? WHERE LOWER(username) = LOWER(?)`).run(
-            osKey.trim(), stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength), username
+        db.prepare(`
+            UPDATE users 
+            SET osKey = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
+                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?
+            WHERE LOWER(username) = LOWER(?)
+        `).run(
+            osKey.trim(), stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
+            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0,
+            username
         );
         
         const configStr = encodeURIComponent(JSON.stringify({ username: username }));
         const installLink = `stremio://${HOST.replace(/^https?:\/\//, '')}/${configStr}/manifest.json`;
-        
         res.json({ success: true, message: "Settings saved!", installLink });
     } catch (e) {
         res.status(500).json({ error: "Failed to update settings." });
@@ -1501,13 +1529,13 @@ app.get('/', (req, res) => {
         <title>${CONFIG.ADDON_NAME} | Dashboard</title>
         <style>
             body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; margin:0; text-align:center; padding: 20px;}
-            .container { background-color:#202020; padding:30px; border-radius:12px; border:1px solid #333; max-width:500px; width: 100%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; }
+            .container { background-color:#202020; padding:30px; border-radius:12px; border:1px solid #333; max-width:550px; width: 100%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; margin: auto; }
             h1 { color:#8A5A99; font-size:2rem; margin-top:0; margin-bottom: 5px; }
             p { color:#a0a0a0; font-size:1rem; margin-bottom:20px; }
             .tabs { display: flex; margin-bottom: 20px; border-bottom: 1px solid #333; }
             .tab { flex: 1; padding: 10px; cursor: pointer; color: #888; font-weight: bold; transition: 0.2s; }
             .tab.active { color: #8A5A99; border-bottom: 2px solid #8A5A99; }
-            input { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
+            input[type=text], input[type=password] { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
             input:focus { border-color: #8A5A99; }
             .btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.1rem; font-weight:bold; cursor:pointer; text-decoration:none; display:block; margin-top:10px; box-sizing: border-box; transition: 0.2s; }
             .btn:hover { background-color:#6c4777; }
@@ -1518,6 +1546,8 @@ app.get('/', (req, res) => {
             .slider-container { display: flex; justify-content: space-between; align-items: center; margin-top: 5px;}
             input[type=range] { width: 75%; cursor: pointer; }
             .slider-val { font-weight: bold; color: #8A5A99; width: 20%; text-align: right; }
+            .grid-labels { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+            .check-label { color:#a0a0a0; display:flex; align-items:center; gap:10px; cursor:pointer; font-size: 0.9rem;}
         </style>
     </head>
     <body>
@@ -1539,10 +1569,10 @@ app.get('/', (req, res) => {
             <button id="authBtn" class="btn" onclick="submitAuth()">Login</button>
         </div>
 
-        <div class="container" id="dashBox" style="display:none; max-width: 600px;">
+        <div class="container" id="dashBox" style="display:none;">
             <h1>Dashboard</h1>
             <p>Welcome, <b id="lblUser" style="color:#8A5A99;"></b></p>
-           <div id="dashMsg" class="msg"></div>
+            <div id="dashMsg" class="msg"></div>
 
             <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold;">OpenSubtitles API Key</label>
@@ -1553,24 +1583,28 @@ app.get('/', (req, res) => {
             </div>
 
             <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;">Providers & Routes</label>
+                <div class="grid-labels">
+                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles</label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteA"> <b>Route A</b> (Math Sync)</label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL</label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteB"> <b>Route B</b> (Raw Token)</label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource</label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteC"> <b>Route C</b> (Fallback)</label>
+                </div>
+            </div>
+
+            <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;">Subtitle Processing</label>
-                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; margin-bottom:10px; cursor:pointer;">
-                    <input type="checkbox" id="cfgStripTags" style="width:auto; margin:0; transform: scale(1.2);">
-                    Strip Formatting Tags (Fixes HTML code on Basic TVs)
-                </label>
-                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; margin-bottom:10px; cursor:pointer;">
-                    <input type="checkbox" id="cfgRemoveSdh" style="width:auto; margin:0; transform: scale(1.2);">
-                    Remove SDH Elements (e.g., [Music Playing], SPEAKER:)
-                </label>
-                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; cursor:pointer;">
-                    <input type="checkbox" id="cfgIncludeStats" style="width:auto; margin:0; transform: scale(1.2);">
-                    Include "Stats for Nerds" Diagnostic Subtitle
-                </label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> Strip Formatting Tags (Fixes HTML code)</label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> Remove SDH Elements (e.g., [Music])</label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> Include "Stats for Nerds" Diagnostic</label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <b>Auto-Download Next Episode</b> (Pre-caching)</label>
+                <label class="check-label"><input type="checkbox" id="cfgStrict4k"> <b>Strict 4K Shield</b> (No 1080p fallback)</label>
             </div>
 
             <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold; display:block;">Max Returned Subtitles</label>
-                <p style="color:#a0a0a0; font-size:0.85rem; margin-bottom: 5px;">Limits the number of Arabic results.</p>
                 <div class="slider-container">
                     <input type="range" id="cfgMaxSubs" min="1" max="20" value="5" oninput="document.getElementById('valMaxSubs').innerText = this.value">
                     <div class="slider-val" id="valMaxSubs">5</div>
@@ -1579,12 +1613,11 @@ app.get('/', (req, res) => {
 
             <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold; display:block;">Engine Strictness</label>
-                <p style="color:#a0a0a0; font-size:0.85rem; margin-bottom: 5px;">1 = Forgiving | 3 = Balanced | 5 = Highly Strict</p>
                 <div class="slider-container">
                     <input type="range" id="cfgEngine" min="1" max="5" value="3" oninput="document.getElementById('valEngine').innerText = this.value">
                     <div class="slider-val" id="valEngine">3</div>
                 </div>
-           </div>
+            </div>
 
             <button class="btn" onclick="saveSettings()">Save Settings</button>
             <div id="installWrapper" style="display:none; margin-top:15px;">
@@ -1594,12 +1627,11 @@ app.get('/', (req, res) => {
             <button class="btn" style="background:#333; margin-top:15px;" onclick="logout()">Logout</button>
         </div>
 
-    
-
-        <script>
+      <script>
             let isRegister = false;
             let loggedUser = null;
             let loggedPass = null;
+            let msgTimeout = null; // 🔥 ADDED: Tracks the active popup timer
 
            const ui = {
                 authBox: document.getElementById('authBox'),
@@ -1612,9 +1644,15 @@ app.get('/', (req, res) => {
             };
 
             function showMsg(box, text, isError) {
+                clearTimeout(msgTimeout); // Clear existing timer if user clicks quickly
                 box.className = 'msg ' + (isError ? 'error' : 'success');
                 box.innerText = text;
                 box.style.display = 'block';
+                
+                // 🔥 ADDED: Hide the message automatically after 3 seconds
+                msgTimeout = setTimeout(() => {
+                    box.style.display = 'none';
+                }, 3000);
             }
 
             function switchAuthTab(mode) {
@@ -1660,7 +1698,7 @@ app.get('/', (req, res) => {
                 } catch (e) { showMsg(ui.authMsg, "Network Error.", true); }
             }
 
-          function loadDashboard(user) {
+         function loadDashboard(user) {
                 ui.authBox.style.display = 'none';
                 ui.dashBox.style.display = 'block';
                 ui.dashMsg.style.display = 'none';
@@ -1668,9 +1706,18 @@ app.get('/', (req, res) => {
 
                 document.getElementById('lblUser').innerText = user.username;
                 document.getElementById('cfgOsKey').value = user.osKey || "";
-                document.getElementById('cfgStripTags').checked = user.stripTags === 1;
+                
+                document.getElementById('cfgUseOs').checked = user.useOs !== 0;
+                document.getElementById('cfgUseSubdl').checked = user.useSubdl !== 0;
+                document.getElementById('cfgUseSubsource').checked = user.useSubsource !== 0;
+                document.getElementById('cfgAllowRouteA').checked = user.allowRouteA !== 0;
+                document.getElementById('cfgAllowRouteB').checked = user.allowRouteB !== 0;
+                document.getElementById('cfgAllowRouteC').checked = user.allowRouteC !== 0;
+               document.getElementById('cfgStripTags').checked = user.stripTags === 1;
                 document.getElementById('cfgIncludeStats').checked = user.includeStats === 1;
                 document.getElementById('cfgRemoveSdh').checked = user.removeSdh === 1;
+                document.getElementById('cfgAutoFetchNext').checked = user.autoFetchNext === 1; // 🔥 ADDED
+                document.getElementById('cfgStrict4k').checked = user.strict4k === 1;
                 
                 document.getElementById('cfgMaxSubs').value = user.maxSubs || 5;
                 document.getElementById('valMaxSubs').innerText = user.maxSubs || 5;
@@ -1684,9 +1731,17 @@ app.get('/', (req, res) => {
                     username: loggedUser,
                     password: loggedPass,
                     osKey: document.getElementById('cfgOsKey').value,
-                    stripTags: document.getElementById('cfgStripTags').checked,
+                    useOs: document.getElementById('cfgUseOs').checked,
+                    useSubdl: document.getElementById('cfgUseSubdl').checked,
+                    useSubsource: document.getElementById('cfgUseSubsource').checked,
+                    allowRouteA: document.getElementById('cfgAllowRouteA').checked,
+                    allowRouteB: document.getElementById('cfgAllowRouteB').checked,
+                    allowRouteC: document.getElementById('cfgAllowRouteC').checked,
+                   stripTags: document.getElementById('cfgStripTags').checked,
                     includeStats: document.getElementById('cfgIncludeStats').checked,
                     removeSdh: document.getElementById('cfgRemoveSdh').checked,
+                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, // 🔥 ADDED
+                    strict4k: document.getElementById('cfgStrict4k').checked,
                     maxSubs: document.getElementById('cfgMaxSubs').value,
                     engineStrength: document.getElementById('cfgEngine').value
                 };
