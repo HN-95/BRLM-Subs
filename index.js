@@ -6,7 +6,45 @@ const parser = require("srt-parser-2").default;
 const srtParser = new parser();
 const AdmZip = require("adm-zip");
 const { createExtractorFromData } = require('node-unrar-js');
+const Database = require('better-sqlite3');
+const crypto = require('crypto');
 
+// 🔥 INITIALIZE SQLITE DATABASE
+const db = new Database('brlm_users.sqlite');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password TEXT NOT NULL,
+    osKey TEXT,
+    stripTags INTEGER DEFAULT 0,
+    includeStats INTEGER DEFAULT 1,
+    removeSdh INTEGER DEFAULT 1,
+    maxSubs INTEGER DEFAULT 5,
+    engineStrength INTEGER DEFAULT 3
+  )
+`);
+
+// 🔥 AUTO-MIGRATOR: Automatically rebuilds the table if it's stuck on the old schema
+try {
+    db.prepare('SELECT username FROM users LIMIT 1').get();
+} catch (e) {
+    console.log("⚠️ Old database schema detected. Rebuilding table automatically...");
+    db.exec('DROP TABLE users');
+    db.exec(`
+      CREATE TABLE users (
+        username TEXT PRIMARY KEY,
+        password TEXT NOT NULL,
+        osKey TEXT,
+        stripTags INTEGER DEFAULT 0,
+        includeStats INTEGER DEFAULT 1,
+        removeSdh INTEGER DEFAULT 1,
+        maxSubs INTEGER DEFAULT 5,
+        engineStrength INTEGER DEFAULT 3
+      )
+    `);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
 // Change these variables to tune the entire engine.
@@ -14,7 +52,7 @@ const { createExtractorFromData } = require('node-unrar-js');
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.2.1",
+    ADDON_VERSION: "1.3.0",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -79,27 +117,19 @@ const manifest = {
     types: ["movie", "series"],
     catalogs: [],
     resources: ["subtitles"],
-   // 🔥 ADDED CONFIGURATION SUPPORT:
-    behaviorHints: { configurable: true, configurationRequired: true },
-    config: [
+// 🔥 ADDED CONFIGURATION SUPPORT:
+   behaviorHints: { configurable: true, configurationRequired: true },
+   config: [
         {
-            key: "userOsKey",
+            key: "username",
             type: "text",
-            title: "OpenSubtitles API Key (Required)",
-            description: "You MUST enter your own OpenSubtitles API Key for this addon to work."
-        },
-        {
-            key: "stripTags",
-            type: "boolean",
-            title: "Remove Formatting Tags",
-            description: "Check this if your TV shows raw code like {\\an8} or <i> on screen.",
-            default: false
+            title: "BRLM Username",
+            description: "Enter your username registered on the BRLM Dashboard."
         }
     ]
 };
 
 const builder = new addonBuilder(manifest);
-
 // ─────────────────────────────────────────────────────────────────────────────
 // UNIVERSAL TIMEOUT FETCHER
 // ─────────────────────────────────────────────────────────────────────────────
@@ -520,7 +550,7 @@ function getArabicSignature(srtText) {
         .sort()
         .join('');
 }
-function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false) {
+function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false, userConfig = {}) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
     
     // 🔥 THE ULTIMATE CONTENT FIREWALL: The Ratio Check
@@ -612,14 +642,27 @@ const engIndex   = buildEngIndex(engParsedClean);
     const scaleLog = bestParsed !== originalArParsed ? ' [FPS Scaled ⚙️]' : '';
     console.log(`    [Math] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms${scaleLog}`);
 
-    // Penalties linked to CONFIG
+// Penalties linked to CONFIG
     if (driftMs > CONFIG.PENALTY_SEVERE_MS) alignmentPct -= CONFIG.PENALTY_SEVERE_PCT;
     else if (driftMs > CONFIG.PENALTY_MODERATE_MS) alignmentPct -= CONFIG.PENALTY_MODERATE_PCT;
     else if (driftMs > CONFIG.PENALTY_LIGHT_MS) alignmentPct -= CONFIG.PENALTY_LIGHT_PCT;
     
-    if (alignmentPct < CONFIG.MIN_PASSING_ALIGNMENT_PCT) return { passed: false, alignmentPct };
+    // 🔥 Dynamic Engine Strength (1 to 5)
+    let dynamicMinPct = 40; // Default
+    if (userConfig.engineStrength === 1) dynamicMinPct = 20; // Forgiving
+    else if (userConfig.engineStrength === 2) dynamicMinPct = 30;
+    else if (userConfig.engineStrength === 4) dynamicMinPct = 60;
+    else if (userConfig.engineStrength === 5) dynamicMinPct = 80; // Highly Strict
+
+    if (alignmentPct < dynamicMinPct) return { passed: false, alignmentPct };
 
     let finalParsed = bestParsed;
+    
+    // 🔥 Remove SDH from Arabic text if requested
+    if (userConfig.removeSdh) {
+        finalParsed = stripSdhAndClean(finalParsed);
+    }
+
     // Delay shift linked to CONFIG
     if (Math.abs(globalMedian) > CONFIG.MIN_ACCEPTABLE_DELAY_MS) {
         finalParsed = originalArParsed.map(line => ({
@@ -648,35 +691,30 @@ const engIndex   = buildEngIndex(engParsedClean);
 // ─────────────────────────────────────────────────────────────────────────────
 // ENGLISH DIAGNOSTIC HELPER
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-// ENGLISH DIAGNOSTIC HELPER
-// ─────────────────────────────────────────────────────────────────────────────
-function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false, releaseTokens = new Set()) {
+function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false, releaseTokens = new Set(), userConfig = {}) {
     if (!baselineObj || !baselineObj.text || !baselineObj.candidate) return null;
     try {
         let parsed = srtParser.fromSrt(baselineObj.text);
         let cleanParsed = [];
 
-        // 🔥 Remove SDH (Tags and All-Caps Lines)
-        for (let i = 0; i < parsed.length; i++) {
-            let rawLines = parsed[i].text.split('\n');
-            let cleanLines = [];
-            
-            for (let line of rawLines) {
-                // Strip [Text] and (Text)
-                let cleanL = line.replace(/\[.*?\]/gs, '').replace(/\(.*?\)/gs, '').trim();
-                
-                // If the line has letters and is entirely uppercase, it's an SDH label. Skip it.
-                const hasLetters = /[a-zA-Z]/.test(cleanL);
-                if (hasLetters && cleanL === cleanL.toUpperCase()) continue;
-                
-                if (cleanL.length > 0) cleanLines.push(cleanL);
+        // 🔥 Conditionally Remove SDH
+        if (userConfig.removeSdh) {
+            for (let i = 0; i < parsed.length; i++) {
+                let rawLines = parsed[i].text.split('\n');
+                let cleanLines = [];
+                for (let line of rawLines) {
+                    let cleanL = line.replace(/\[.*?\]/gs, '').replace(/\(.*?\)/gs, '').trim();
+                    const hasLetters = /[a-zA-Z]/.test(cleanL);
+                    if (hasLetters && cleanL === cleanL.toUpperCase()) continue;
+                    if (cleanL.length > 0) cleanLines.push(cleanL);
+                }
+                if (cleanLines.length > 0) cleanParsed.push({ ...parsed[i], text: cleanLines.join('\n') });
             }
-            
-            if (cleanLines.length > 0) {
-                cleanParsed.push({ ...parsed[i], text: cleanLines.join('\n') });
-            }
+        } else {
+            cleanParsed = parsed; // Keep original if stripping is off
         }
+
+        // 🔥 Dynamic Cut Detection (Movies Only)
 
         // 🔥 Dynamic Cut Detection (Movies Only)
         let cutText = "";
@@ -718,28 +756,41 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
 // ─────────────────────────────────────────────────────────────────────────────
 async function runSubtitleEngine(args) {
    try {
-        // 🔥 Extract User's API Key strictly. NO SHARED FALLBACK.
-        const activeOsKey = args.config?.userOsKey && args.config.userOsKey.trim() !== "" ? args.config.userOsKey.trim() : null;
-		// 🔥 NEW: Extract the user's formatting preference
-        const stripTags = args.config?.stripTags === true || args.config?.stripTags === "true";
+        // 🔥 1. Get the Username from Stremio
+        const username = args.config?.username;
+        
+        // 🔥 2. Query the SQLite Database for their live settings (Case-Insensitive)
+        const userRow = username ? db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username) : null;
 
-        // 🔥 KILL SWITCH: If they didn't provide a key, serve a warning subtitle instantly and abort.
-        if (!activeOsKey) {
-            console.log(`❌ Blocked request: User did not provide an API Key.`);
+        // 🔥 3. KILL SWITCH: If the user doesn't exist
+        if (!userRow) {
+            console.log(`❌ Blocked request: Invalid or missing Username (${username || 'None'}).`);
             const missingKeyCacheId = `nokey_${Date.now()}.srt`;
-            const missingKeyText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ الإضافة تفتقد مفتاح API. يرجى إعادة التثبيت وإدخال المفتاح الخاص بك.</b></font>`;
+            const missingKeyText = `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ الحساب غير مسجل. يرجى إنشاء حساب عبر لوحة التحكم.</b></font>`;
             subtitleCache.set(missingKeyCacheId, missingKeyText);
-            return {
-                subtitles: [{
-                    id: missingKeyCacheId,
-                    url: `${HOST}/dl/${missingKeyCacheId}`,
-                    lang: "ara",
-                    title: `⚠️ Missing API Key! Reinstall Addon.`
-                }]
-            };
+            return { subtitles: [{ id: missingKeyCacheId, url: `${HOST}/dl/${missingKeyCacheId}`, lang: "ara", title: `⚠️ Account Not Found! Visit Dashboard.` }] };
+        }
+
+        // 🔥 4. Apply their live settings from the database
+        const userConfig = {
+            osKey: userRow.osKey && userRow.osKey.trim() !== "" ? userRow.osKey.trim() : null,
+            stripTags: userRow.stripTags === 1,
+            includeStats: userRow.includeStats === 1,
+            removeSdh: userRow.removeSdh === 1,
+            maxSubs: userRow.maxSubs || 5,
+            engineStrength: userRow.engineStrength || 3
+        };
+
+        if (!userConfig.osKey) {
+            console.log(`❌ Blocked request: User ${username} has no OpenSubtitles Key in DB.`);
+            const nokeyId = `nokey2_${Date.now()}.srt`;
+            subtitleCache.set(nokeyId, `1\n00:00:01,000 --> 00:00:10,000\n{\\an8}<font color="#ff0000"><b>⚠️ الرجاء إدخال مفتاح OpenSubtitles الخاص بك في لوحة التحكم.</b></font>`);
+            return { subtitles: [{ id: nokeyId, url: `${HOST}/dl/${nokeyId}`, lang: "ara", title: `⚠️ Missing OS Key! Update Profile.` }] };
         }
         
-        // 🔥 Masked Key Debugger: Only shows last 3 digits in your logs
+        // Extract required legacy vars for downstream logic
+        const activeOsKey = userConfig.osKey;
+        const stripTags = userConfig.stripTags;
         const maskedKey = `...${activeOsKey.slice(-3)}`;
         
         // 🔥 Pulled 'args.extra?.title' to ensure we never miss metadata
@@ -771,11 +822,11 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
         if (releaseTokens.has('theatrical')) cutTag.push('THEATRICAL');
         if (releaseTokens.has('unrated')) cutTag.push('UNRATED');
         if (releaseTokens.has('final')) cutTag.push('FINAL');
-        const editionKey = cutTag.length > 0 ? `_${cutTag.join('-')}` : '';
+       const editionKey = cutTag.length > 0 ? `_${cutTag.join('-')}` : '';
 
-       // 🔥 NEW: Intercept the request if we've already done the math!
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}`;
-        if (responseCache.has(requestCacheKey)) {
+     // 🔥 Cache Key now tracks all active configurations to avoid crossover
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}`;
+       if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
                 console.log(`\n⚡ [CACHE HIT] Serving ${args.id} instantly! (Zero API credits used)`);
@@ -921,8 +972,8 @@ if (osRulers.length === 0) {
                 if (osRulers.length > 0) {
                     let bestScoreForCandidate = null;
                     for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
-                        const ruler = osRulers[rIdx];
-                        const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true);
+                       const ruler = osRulers[rIdx];
+                        const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true, userConfig);
                         if (result.passed && (!bestScoreForCandidate || result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
                             bestScoreForCandidate = { candidate: c, matchedRuler: `OS Cut ${rIdx+1}`, ...result };
                         }
@@ -932,8 +983,8 @@ if (osRulers.length === 0) {
             }
 
            // 2. ALWAYS push the Clean English Rulers unconditionally
-            for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
-                const cleanEnglish = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType, isTV, releaseTokens);
+           for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
+                const cleanEnglish = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType, isTV, releaseTokens, userConfig);
                 if (cleanEnglish) finalOutput.push(cleanEnglish);
             }
 
@@ -1114,7 +1165,7 @@ let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
                     const testAgainstRuler = (baseline, rulerName) => {
                         if (!baseline) return;
-                        const result = computePrecisionShift(baseline.text, arabicData.text, `${candidateLabel} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false);
+                        const result = computePrecisionShift(baseline.text, arabicData.text, `${candidateLabel} vs ${rulerName} Ruler`, c.source, detectedType, c.releaseName, false, userConfig);
                         if (result.passed) {
                             if (!bestScoreForCandidate) {
                                 bestScoreForCandidate = { candidate: c, rulerName, ...result };
@@ -1176,9 +1227,9 @@ for (const champ of allSurvivingArabic) {
                 if (topArabic.length >= 5) break; 
             }
            // 4. Push Clean English Rulers Unconditionally
-            if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens));
-            if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens));
-            if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens));
+           if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens, userConfig));
+            if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens, userConfig));
+            if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens, userConfig));
 // 5. Push the Top Arabic Winners
           for (const champ of topArabic) {
                 // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
@@ -1255,27 +1306,33 @@ for (const champ of allSurvivingArabic) {
             finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[🔴 Route C | Fallback]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
         }
 
-        if (finalOutput.length > 0) {
+       if (finalOutput.length > 0) {
+            // 🔥 Enforce the Max Returned Subtitles config
+            const engSubs = finalOutput.filter(sub => sub.lang === 'eng');
+            const araSubs = finalOutput.filter(sub => sub.lang === 'ara').slice(0, userConfig.maxSubs);
+            finalOutput = [...engSubs, ...araSubs];
+
             console.log(`\n👑 --- MASTER RULERS USED ---`);
-            finalOutput.filter(sub => sub.lang === 'eng').forEach(r => console.log(`   ${r.title.replace('\n', ' | ')}`));
+            engSubs.forEach(r => console.log(`   ${r.title.replace('\n', ' | ')}`));
 
             console.log(`\n🏆 --- ARABIC WINNERS ---`);
-            finalOutput.filter(sub => sub.lang === 'ara').forEach(sub => console.log(`   ${sub.title.replace('\n', ' | ')}`));
+            araSubs.forEach(sub => console.log(`   ${sub.title.replace('\n', ' | ')}`));
 
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
             
-            const engineMode = isTV ? 'TV Show/Series' : 'Movie';
-            const serviceTag = streamingService ? ` [${streamingService}]` : '';
-            const totalAra = finalOutput.filter(s => s.lang === 'ara').length;
-            const totalEng = finalOutput.filter(s => s.lang === 'eng').length;
-            const statsText = `1\n00:00:01,000 --> 00:40:00,000\n{\\an7}<font color="#00ffcc"><b>[ 📊 BRLM Subs: Stats for Nerds ]</b></font>\n<font color="#cccccc"><b>Version:</b> ${CONFIG.ADDON_VERSION}\n<b>Engine:</b> ${engineMode}\n<b>Stream Type:</b> ${detectedType}${serviceTag}\n<b>File Name:</b> ${streamName || 'Unknown'}\n<b>Result:</b> ${totalAra} Arabic Syncs | ${totalEng} Master Rulers</font>`;
-            const statsCacheId = `stats_nerds_${Date.now()}.srt`;
-            subtitleCache.set(statsCacheId, statsText);
-            
-          finalOutput.unshift({ id: statsCacheId, url: `${HOST}/dl/${statsCacheId}`, lang: "eng", title: `📊 Stats for Nerds (Debug Info)` });
+            if (userConfig.includeStats) {
+                const engineMode = isTV ? 'TV Show/Series' : 'Movie';
+                const serviceTag = streamingService ? ` [${streamingService}]` : '';
+                const totalAra = araSubs.length;
+                const totalEng = engSubs.length;
+                const statsText = `1\n00:00:01,000 --> 00:40:00,000\n{\\an7}<font color="#00ffcc"><b>[ 📊 BRLM Subs: Stats for Nerds ]</b></font>\n<font color="#cccccc"><b>Version:</b> ${CONFIG.ADDON_VERSION}\n<b>Engine:</b> ${engineMode}\n<b>Stream Type:</b> ${detectedType}${serviceTag}\n<b>File Name:</b> ${streamName || 'Unknown'}\n<b>Result:</b> ${totalAra} Arabic Syncs | ${totalEng} Master Rulers</font>`;
+                const statsCacheId = `stats_nerds_${Date.now()}.srt`;
+                subtitleCache.set(statsCacheId, statsText);
+                finalOutput.unshift({ id: statsCacheId, url: `${HOST}/dl/${statsCacheId}`, lang: "eng", title: `📊 Stats for Nerds (Debug Info)` });
+            }
 
             // 🔥 BUG FIX: Only save to cache if we actually found Arabic subtitles.
-            if (totalAra > 0) {
+            if (araSubs.length > 0) {
                 responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
             } else {
                 console.log(`⚠️ Zero Arabic subs generated. Skipping cache to allow immediate retries.`);
@@ -1367,19 +1424,72 @@ builder.defineSubtitlesHandler(async (args) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EXPRESS SERVER
+// EXPRESS SERVER & DASHBOARD API
 // ─────────────────────────────────────────────────────────────────────────────
 const app = express();
 app.use(cors());
+app.use(express.json()); 
+
+app.post('/api/register', (req, res) => {
+    try {
+        const { username, password, confirmPassword } = req.body;
+        
+        // Standard Username Rule: 3-20 chars, letters, numbers, hyphens, and underscores ONLY. No spaces.
+        const userRegex = /^[a-zA-Z0-9_-]{3,20}$/;
+        if (!username || !userRegex.test(username)) return res.status(400).json({ error: "Username must be 3-20 characters (letters, numbers, _ , - only)." });
+        
+        // Standard Password Rule: Min 4 chars, strictly NO spaces.
+        if (!password || password.length < 4 || /\s/.test(password)) return res.status(400).json({ error: "Password must be at least 4 characters with NO spaces." });
+        
+        if (password !== confirmPassword) return res.status(400).json({ error: "Passwords do not match." });
+        
+        const existing = db.prepare('SELECT username FROM users WHERE LOWER(username) = LOWER(?)').get(username);
+        if (existing) return res.status(400).json({ error: "Username already exists." });
+
+        db.prepare('INSERT INTO users (username, password) VALUES (?, ?)').run(username.trim(), password);
+        res.json({ success: true, message: "Account created! Please log in." });
+    } catch (e) {
+        console.error("Register Error:", e.message);
+        res.status(500).json({ error: "Server failed to create account." });
+    }
+});
+
+app.post('/api/login', (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
+        
+        if (!user) return res.status(401).json({ error: "Invalid Username or Password." });
+        res.json({ success: true, user });
+    } catch (e) {
+        console.error("Login Error:", e.message);
+        res.status(500).json({ error: "Server failed to process login." });
+    }
+});
+
+app.post('/api/update', (req, res) => {
+    const { username, password, osKey, stripTags, includeStats, removeSdh, maxSubs, engineStrength } = req.body;
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
+    if (!user) return res.status(401).json({ error: "Authentication failed." });
+    
+    try {
+        db.prepare(`UPDATE users SET osKey = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ? WHERE LOWER(username) = LOWER(?)`).run(
+            osKey.trim(), stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength), username
+        );
+        
+        const configStr = encodeURIComponent(JSON.stringify({ username: username }));
+        const installLink = `stremio://${HOST.replace(/^https?:\/\//, '')}/${configStr}/manifest.json`;
+        
+        res.json({ success: true, message: "Settings saved!", installLink });
+    } catch (e) {
+        res.status(500).json({ error: "Failed to update settings." });
+    }
+});
 
 app.get('/dl/:cacheId', (req, res) => {
     const subText = subtitleCache.get(req.params.cacheId);
-    if (subText) {
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.send(subText);
-    } else {
-        res.status(404).send('Subtitle expired or not found.');
-    }
+    if (subText) { res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.send(subText); } 
+    else { res.status(404).send('Subtitle expired or not found.'); }
 });
 
 app.get('/', (req, res) => {
@@ -1388,100 +1498,247 @@ app.get('/', (req, res) => {
     <html lang="en">
     <head>
         <meta charset="UTF-8">
-        <title>${CONFIG.ADDON_NAME} | Setup</title>
+        <title>${CONFIG.ADDON_NAME} | Dashboard</title>
         <style>
-            body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; margin:0; text-align:center; }
-            .container { background-color:#202020; padding:40px; border-radius:12px; border:1px solid #333; max-width:500px; width: 90%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; }
-            h1 { color:#8A5A99; font-size:2.2rem; margin-top:0; margin-bottom: 5px; }
-            p { color:#a0a0a0; font-size:1rem; margin-bottom:25px; }
-            input { width: 100%; padding: 14px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
+            body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; margin:0; text-align:center; padding: 20px;}
+            .container { background-color:#202020; padding:30px; border-radius:12px; border:1px solid #333; max-width:500px; width: 100%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; }
+            h1 { color:#8A5A99; font-size:2rem; margin-top:0; margin-bottom: 5px; }
+            p { color:#a0a0a0; font-size:1rem; margin-bottom:20px; }
+            .tabs { display: flex; margin-bottom: 20px; border-bottom: 1px solid #333; }
+            .tab { flex: 1; padding: 10px; cursor: pointer; color: #888; font-weight: bold; transition: 0.2s; }
+            .tab.active { color: #8A5A99; border-bottom: 2px solid #8A5A99; }
+            input { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
             input:focus { border-color: #8A5A99; }
             .btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.1rem; font-weight:bold; cursor:pointer; text-decoration:none; display:block; margin-top:10px; box-sizing: border-box; transition: 0.2s; }
             .btn:hover { background-color:#6c4777; }
-            .btn-secondary { background-color: #333; margin-top: 15px; }
-            .btn-secondary:hover { background-color: #444; }
-            .error { color: #ff4c4c; font-size: 0.9rem; display: none; margin-bottom: 15px; text-align: left; padding-left: 5px; }
+            .msg { font-size: 0.95rem; display: none; margin-bottom: 15px; padding: 10px; border-radius: 5px; }
+            .error { background: rgba(255, 76, 76, 0.1); color: #ff4c4c; border: 1px solid #ff4c4c; }
+            .success { background: rgba(76, 175, 80, 0.1); color: #4caf50; border: 1px solid #4caf50; }
+            .control-group { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 15px; text-align: left; border: 1px solid #333;}
+            .slider-container { display: flex; justify-content: space-between; align-items: center; margin-top: 5px;}
+            input[type=range] { width: 75%; cursor: pointer; }
+            .slider-val { font-weight: bold; color: #8A5A99; width: 20%; text-align: right; }
         </style>
     </head>
     <body>
-        <div class="container">
+        <div class="container" id="authBox">
             <h1>${CONFIG.ADDON_NAME}</h1>
-            <p>V${CONFIG.ADDON_VERSION} | Configuration</p>
+            <p>Welcome. Please authenticate.</p>
             
-           <div style="text-align: left;">
-                <input type="text" id="osKey" placeholder="Enter OpenSubtitles API Key (Required)">
-                
-                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; margin-bottom:15px; cursor:pointer;">
-                    <input type="checkbox" id="stripTags" style="width:auto; margin:0; transform: scale(1.2);">
-                    Strip Formatting Tags (Fixes {\an8} on Basic TVs)
-                </label>
-                
-                <div id="errorMsg" class="error">⚠️ You must enter your API key to continue.</div>
+            <div class="tabs">
+                <div class="tab active" id="tab-login" onclick="switchAuthTab('login')">Login</div>
+                <div class="tab" id="tab-register" onclick="switchAuthTab('register')">Register</div>
             </div>
 
-            <a href="#" id="installBtn" class="btn">1. Install to Stremio</a>
-            <button id="copyBtn" class="btn btn-secondary">2. Copy Manifest Link (For Nuvio)</button>
+            <div id="authMsg" class="msg"></div>
+
+            <input type="text" id="authUsername" placeholder="Username">
+            <input type="password" id="authPassword" placeholder="Password">
+            <input type="password" id="authConfirm" placeholder="Re-enter Password" style="display:none;">
+            
+            <button id="authBtn" class="btn" onclick="submitAuth()">Login</button>
         </div>
 
-        <script>
-            const host = "${HOST}";
-            const installBtn = document.getElementById('installBtn');
-            const copyBtn = document.getElementById('copyBtn');
-            const osKeyInput = document.getElementById('osKey');
-            const errorMsg = document.getElementById('errorMsg');
+        <div class="container" id="dashBox" style="display:none; max-width: 600px;">
+            <h1>Dashboard</h1>
+            <p>Welcome, <b id="lblUser" style="color:#8A5A99;"></b></p>
+           <div id="dashMsg" class="msg"></div>
 
-            // Generates the dynamic URLs containing the user's API Key and settings
-            function getUrls() {
-                const key = osKeyInput.value.trim();
-                let configPath = '';
-                if (key) {
-                    // 🔥 NEW: Grab the checkbox state and inject it into the Stremio config URL
-                    const strip = document.getElementById('stripTags').checked;
-                    const configObj = { userOsKey: key, stripTags: strip };
-                    configPath = encodeURIComponent(JSON.stringify(configObj)) + '/';
-                }
-                const httpsUrl = host + '/' + configPath + 'manifest.json';
-                const stremioUrl = httpsUrl.replace(/^https?:/, 'stremio:');
-                return { httpsUrl, stremioUrl, key };
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold;">OpenSubtitles API Key</label>
+                <div style="display:flex; align-items:center; margin-top:10px; gap: 10px;">
+                    <input type="password" id="cfgOsKey" placeholder="Required for addon to work" style="margin:0; flex:1;">
+                    <button class="btn" style="width:auto; margin:0; padding:12px 20px;" onclick="toggleOsKey()" id="btnToggleKey">Show</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;">Subtitle Processing</label>
+                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; margin-bottom:10px; cursor:pointer;">
+                    <input type="checkbox" id="cfgStripTags" style="width:auto; margin:0; transform: scale(1.2);">
+                    Strip Formatting Tags (Fixes HTML code on Basic TVs)
+                </label>
+                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; margin-bottom:10px; cursor:pointer;">
+                    <input type="checkbox" id="cfgRemoveSdh" style="width:auto; margin:0; transform: scale(1.2);">
+                    Remove SDH Elements (e.g., [Music Playing], SPEAKER:)
+                </label>
+                <label style="color:#a0a0a0; display:flex; align-items:center; gap:10px; cursor:pointer;">
+                    <input type="checkbox" id="cfgIncludeStats" style="width:auto; margin:0; transform: scale(1.2);">
+                    Include "Stats for Nerds" Diagnostic Subtitle
+                </label>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block;">Max Returned Subtitles</label>
+                <p style="color:#a0a0a0; font-size:0.85rem; margin-bottom: 5px;">Limits the number of Arabic results.</p>
+                <div class="slider-container">
+                    <input type="range" id="cfgMaxSubs" min="1" max="20" value="5" oninput="document.getElementById('valMaxSubs').innerText = this.value">
+                    <div class="slider-val" id="valMaxSubs">5</div>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block;">Engine Strictness</label>
+                <p style="color:#a0a0a0; font-size:0.85rem; margin-bottom: 5px;">1 = Forgiving | 3 = Balanced | 5 = Highly Strict</p>
+                <div class="slider-container">
+                    <input type="range" id="cfgEngine" min="1" max="5" value="3" oninput="document.getElementById('valEngine').innerText = this.value">
+                    <div class="slider-val" id="valEngine">3</div>
+                </div>
+           </div>
+
+            <button class="btn" onclick="saveSettings()">Save Settings</button>
+            <div id="installWrapper" style="display:none; margin-top:15px;">
+                <a href="#" id="stremioBtn" class="btn" style="background:#4caf50;">Install to Stremio</a>
+                <button id="copyBtn" class="btn" style="background:#444;" onclick="copyManifest()">Copy Manifest Link (For Nuvio)</button>
+            </div>
+            <button class="btn" style="background:#333; margin-top:15px;" onclick="logout()">Logout</button>
+        </div>
+
+    
+
+        <script>
+            let isRegister = false;
+            let loggedUser = null;
+            let loggedPass = null;
+
+           const ui = {
+                authBox: document.getElementById('authBox'),
+                dashBox: document.getElementById('dashBox'),
+                authMsg: document.getElementById('authMsg'),
+                dashMsg: document.getElementById('dashMsg'),
+                stremioBtn: document.getElementById('stremioBtn'),
+                copyBtn: document.getElementById('copyBtn'),
+                installWrapper: document.getElementById('installWrapper')
+            };
+
+            function showMsg(box, text, isError) {
+                box.className = 'msg ' + (isError ? 'error' : 'success');
+                box.innerText = text;
+                box.style.display = 'block';
             }
 
-            installBtn.addEventListener('click', (e) => {
-                const urls = getUrls();
-                if (!urls.key) {
-                    e.preventDefault(); // Stop the click if empty
-                    errorMsg.style.display = 'block';
-                } else {
-                    errorMsg.style.display = 'none';
-                    installBtn.href = urls.stremioUrl; // Route to Stremio app
-                }
-            });
+            function switchAuthTab(mode) {
+                isRegister = mode === 'register';
+                ui.authMsg.style.display = 'none';
+                document.getElementById('tab-login').className = isRegister ? 'tab' : 'tab active';
+                document.getElementById('tab-register').className = isRegister ? 'tab active' : 'tab';
+                document.getElementById('authConfirm').style.display = isRegister ? 'block' : 'none';
+                document.getElementById('authBtn').innerText = isRegister ? 'Register' : 'Login';
+            }
 
-            copyBtn.addEventListener('click', () => {
-                const urls = getUrls();
-                if (!urls.key) {
-                    errorMsg.style.display = 'block';
-                    return;
-                }
-                errorMsg.style.display = 'none';
+           async function submitAuth() {
+                const username = document.getElementById('authUsername').value.trim();
+                const password = document.getElementById('authPassword').value;
+                const confirmPassword = document.getElementById('authConfirm').value;
+
+                if (!username || !password) return showMsg(ui.authMsg, "Fill all fields.", true);
                 
-                // Copy the HTTPS manifest link directly to clipboard
-                navigator.clipboard.writeText(urls.httpsUrl).then(() => {
-                    const originalText = copyBtn.innerText;
-                    copyBtn.innerText = '✅ Copied to Clipboard!';
-                    copyBtn.style.backgroundColor = '#4caf50';
+                if (isRegister) {
+                    const userRegex = /^[a-zA-Z0-9_-]{3,20}$/;
+                    if (!userRegex.test(username)) return showMsg(ui.authMsg, "Username must be 3-20 chars (letters, numbers, _ , - only).", true);
+                    if (password.length < 4 || /\s/.test(password)) return showMsg(ui.authMsg, "Password must be at least 4 chars with NO spaces.", true);
+                }
+
+                const endpoint = isRegister ? '/api/register' : '/api/login';
+                const payload = isRegister ? { username, password, confirmPassword } : { username, password };
+
+                try {
+                    const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    
+                    if (!res.ok) return showMsg(ui.authMsg, data.error, true);
+                    
+                    if (isRegister) {
+                        showMsg(ui.authMsg, data.message, false);
+                        switchAuthTab('login');
+                    } else {
+                        // Login Success
+                        loggedUser = username;
+                        loggedPass = password;
+                        loadDashboard(data.user);
+                    }
+                } catch (e) { showMsg(ui.authMsg, "Network Error.", true); }
+            }
+
+          function loadDashboard(user) {
+                ui.authBox.style.display = 'none';
+                ui.dashBox.style.display = 'block';
+                ui.dashMsg.style.display = 'none';
+                ui.installWrapper.style.display = 'none';
+
+                document.getElementById('lblUser').innerText = user.username;
+                document.getElementById('cfgOsKey').value = user.osKey || "";
+                document.getElementById('cfgStripTags').checked = user.stripTags === 1;
+                document.getElementById('cfgIncludeStats').checked = user.includeStats === 1;
+                document.getElementById('cfgRemoveSdh').checked = user.removeSdh === 1;
+                
+                document.getElementById('cfgMaxSubs').value = user.maxSubs || 5;
+                document.getElementById('valMaxSubs').innerText = user.maxSubs || 5;
+                
+                document.getElementById('cfgEngine').value = user.engineStrength || 3;
+                document.getElementById('valEngine').innerText = user.engineStrength || 3;
+            }
+
+            async function saveSettings() {
+                const payload = {
+                    username: loggedUser,
+                    password: loggedPass,
+                    osKey: document.getElementById('cfgOsKey').value,
+                    stripTags: document.getElementById('cfgStripTags').checked,
+                    includeStats: document.getElementById('cfgIncludeStats').checked,
+                    removeSdh: document.getElementById('cfgRemoveSdh').checked,
+                    maxSubs: document.getElementById('cfgMaxSubs').value,
+                    engineStrength: document.getElementById('cfgEngine').value
+                };
+
+                try {
+                    const res = await fetch('/api/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    
+                  if (!res.ok) return showMsg(ui.dashMsg, data.error, true);
+                    
+                    showMsg(ui.dashMsg, data.message, false);
+                    ui.stremioBtn.href = data.installLink;
+                    ui.installWrapper.style.display = 'block';
+                } catch (e) { showMsg(ui.dashMsg, "Network Error.", true); }
+            }
+
+            function copyManifest() {
+                const link = ui.stremioBtn.href.replace('stremio:', 'https:');
+                navigator.clipboard.writeText(link).then(() => {
+                    const originalText = ui.copyBtn.innerText;
+                    ui.copyBtn.innerText = '✅ Copied to Clipboard!';
+                    ui.copyBtn.style.backgroundColor = '#4caf50';
                     setTimeout(() => {
-                        copyBtn.innerText = originalText;
-                        copyBtn.style.backgroundColor = '#333';
+                        ui.copyBtn.innerText = originalText;
+                        ui.copyBtn.style.backgroundColor = '#444';
                     }, 2000);
                 });
-            });
+            }
 
-            // Hide error message when they start typing
-            osKeyInput.addEventListener('input', () => {
-                if (osKeyInput.value.trim() !== '') {
-                    errorMsg.style.display = 'none';
+           function toggleOsKey() {
+                const input = document.getElementById('cfgOsKey');
+                const btn = document.getElementById('btnToggleKey');
+                if (input.type === 'password') {
+                    input.type = 'text';
+                    btn.innerText = 'Hide';
+                } else {
+                    input.type = 'password';
+                    btn.innerText = 'Show';
                 }
-            });
+            }
+
+            function logout() {
+                loggedUser = null; loggedPass = null;
+                document.getElementById('authPassword').value = '';
+                
+                // Reset API Key field to hidden for the next user
+                document.getElementById('cfgOsKey').type = 'password';
+                document.getElementById('btnToggleKey').innerText = 'Show';
+                
+                ui.dashBox.style.display = 'none';
+                ui.authBox.style.display = 'block';
+            }
         </script>
     </body>
     </html>
@@ -1489,15 +1746,12 @@ app.get('/', (req, res) => {
 });
 
 const router = getRouter(builder.getInterface());
-
-// Force the manifest to be served with the correct headers for Nuvio
 app.get('/manifest.json', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Content-Type', 'application/json');
     res.send(manifest);
 });
 
-// Explicitly bind the router so it captures the config from the URL parameters
 app.use(router);
 
 app.listen(PORT, () => {
