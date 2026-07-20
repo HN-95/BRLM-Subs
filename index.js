@@ -8,6 +8,8 @@ const AdmZip = require("adm-zip");
 const { createExtractorFromData } = require('node-unrar-js');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 // 🔥 INITIALIZE SQLITE DATABASE
 const db = new Database('brlm_users.sqlite');
@@ -16,6 +18,10 @@ db.exec(`
     username TEXT PRIMARY KEY,
     password TEXT NOT NULL,
     osKey TEXT,
+    subdlKey TEXT,
+    subsourceKey TEXT,
+    targetLang TEXT DEFAULT 'ar',
+    panelLang TEXT DEFAULT 'en',
     stripTags INTEGER DEFAULT 0,
     includeStats INTEGER DEFAULT 1,
     removeSdh INTEGER DEFAULT 1,
@@ -34,10 +40,15 @@ db.exec(`
 
 // 🔥 AUTO-MIGRATOR: Smartly updates the table without deleting existing users
 try {
-    db.prepare('SELECT autoFetchNext FROM users LIMIT 1').get();
+    db.prepare('SELECT targetLang FROM users LIMIT 1').get();
 } catch (e) {
-    console.log("⚠️ Updating database schema to include autoFetchNext...");
-    try { db.exec('ALTER TABLE users ADD COLUMN autoFetchNext INTEGER DEFAULT 1'); } catch(err) {}
+    console.log("⚠️ Updating database schema to include Multi-Language & Custom Keys...");
+    try { 
+        db.exec('ALTER TABLE users ADD COLUMN subdlKey TEXT');
+        db.exec('ALTER TABLE users ADD COLUMN subsourceKey TEXT');
+        db.exec('ALTER TABLE users ADD COLUMN targetLang TEXT DEFAULT "ar"');
+        db.exec('ALTER TABLE users ADD COLUMN panelLang TEXT DEFAULT "en"');
+    } catch(err) {}
 }
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
@@ -47,7 +58,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.2",
+    ADDON_VERSION: "1.3.3",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -71,6 +82,16 @@ const CONFIG = {
     PENALTY_MODERATE_MS: 1200, PENALTY_MODERATE_PCT: 20,
     PENALTY_LIGHT_MS: 750,     PENALTY_LIGHT_PCT: 10,
 
+   // ─── ENGINE STRICTNESS LEVELS (Minimum Alignment % required to pass) ──────
+    STRICTNESS_LEVELS: {
+        0: 0,   // Level 0: Raw Bypass (No math, passes everything)
+        1: 20,  // Level 1: Very Forgiving
+        2: 30,  // Level 2: Forgiving
+        3: 40,  // Level 3: Balanced (Default)
+        4: 60,  // Level 4: Strict
+        5: 80   // Level 5: Highly Strict (Also enforces Director's Cut matching)
+    },
+
     // ─── ONSCREEN RATINGS & LABELS ────────────────────────────────────────────
     RATINGS: {
         ACCURATE:   { minPct: 90, maxDriftMs: 500,  label: "Accurate 💎" },
@@ -87,8 +108,7 @@ const CONFIG = {
 	
 	
 	// ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
-    STRICT_TYPE_MATCHING: true,        // Force baselines to match stream type (WEB/BluRay/HDTV)
-    ARABIC_CANDIDATE_LIMIT: 10,        // Max Arabic subtitles to fetch per provider
+    STRICT_TYPE_MATCHING: true,        // Force baselines to match stream type (WEB/BluRay/HDTV) 
 	CLONE_SAMPLE_SIZE: 400,            // Number of pure Arabic characters to sample for shift-invariant clone detection
 
 };
@@ -327,10 +347,10 @@ async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, rel
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 2: SUBDL
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10 }) {
+async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10, apiKey }) {
     try {
-        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${CONFIG.SUBDL_API_KEY}&imdb_id=tt${imdbId}&languages=${lang.toLowerCase()}`;
-        url += season && episode ? `&type=tv&season_number=${season}&episode_number=${episode}` : `&type=movie`;
+        const key = apiKey || CONFIG.SUBDL_API_KEY;
+        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${key}&imdb_id=tt${imdbId}&languages=${lang.toLowerCase()}`;
         
         const res = await fetchWithTimeout(url);
         if (!res.ok) return [];
@@ -431,17 +451,19 @@ async function getArchiveSrt(url, season = null, episode = null, extraHeaders = 
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 3: SUBSOURCE
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, releaseTokens, limit = 10 }) {
+async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, releaseTokens, limit = 10, apiKey }) {
     try {
+        const key = apiKey || CONFIG.SUBSOURCE_KEY;
         const searchUrl = `https://api.subsource.net/api/v1/movies/search?searchType=imdb&imdb=tt${imdbId}`;
-        const sRes = await fetchWithTimeout(searchUrl, { headers: { 'X-API-Key': CONFIG.SUBSOURCE_KEY } });
+        const sRes = await fetchWithTimeout(searchUrl, { headers: { 'X-API-Key': key } });
         if (!sRes.ok) return [];
         
         const sData = await sRes.json();
         const movie = sData.data?.[0];
         if (!movie) return [];
 
-        const targetLang = langCode.toLowerCase() === 'ar' ? 'arabic' : 'english';
+        const langNames = { ar:'arabic', en:'english', fr:'french', es:'spanish', pt:'portuguese', de:'german', it:'italian', ru:'russian', tr:'turkish', hi:'hindi' };
+        const targetLang = langNames[langCode.toLowerCase()] || 'english';
         let url = `https://api.subsource.net/api/v1/subtitles?movieId=${movie.movieId}&language=${targetLang}`;
         if (season && episode) url += `&season=${season}&episode=${episode}`;
 
@@ -525,38 +547,45 @@ function isDistinctCut(textA, textB) {
     } catch { return false; }
 }
 
-function getArabicSignature(srtText) {
+function getTextSignature(srtText, isArabic = true) {
     if (!srtText) return '';
-    
-    // 1. Strip all HTML/ASS tags and isolate raw lines
     const cleanLines = srtText.split('\n')
         .map(l => l.replace(/<[^>]+>/g, '').replace(/\{[^}]+\}/g, '').trim())
         .filter(l => l && !l.match(/^\d+$/) && !l.includes('-->'));
         
-    // 2. Extract strictly Arabic characters from each line
-    const arabicLines = cleanLines.map(l => {
-        const match = l.match(/[\u0600-\u06FF]/g);
-        return match ? match.join('') : '';
-    }).filter(l => l.length > 15); // Ignore short generic words (yes, no, hi)
-    
-    // 3. Find the 15 longest sentences, sort alphabetically, and crush them together
-    return arabicLines.sort((a, b) => b.length - a.length)
-        .slice(0, 15)
-        .sort()
-        .join('');
+    let validLines = cleanLines;
+    if (isArabic) {
+        validLines = cleanLines.map(l => {
+            const match = l.match(/[\u0600-\u06FF]/g);
+            return match ? match.join('') : '';
+        }).filter(l => l.length > 15);
+    } else {
+        validLines = cleanLines.filter(l => l.length > 15);
+    }
+    return validLines.sort((a, b) => b.length - a.length).slice(0, 15).sort().join('');
 }
 function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false, userConfig = {}) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
+
+    // 🔥 LEVEL 0: RAW BYPASS (No math, no syncing, just raw pass-through)
+    if (userConfig.engineStrength === 0) {
+        let parsed = [];
+        try { parsed = srtParser.fromSrt(arabicText); } catch(e){ return { passed: false, alignmentPct: 0 }; }
+        if (userConfig.removeSdh) parsed = stripSdhAndClean(parsed);
+        parsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${mediaType} (Level 0 Bypass)` });
+        return { passed: true, fixedText: srtParser.toSrt(parsed), offsetMs: 0, alignmentPct: 100, driftMs: 0 };
+    }
+
+    const isArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
     
-    // 🔥 THE ULTIMATE CONTENT FIREWALL: The Ratio Check
-    // Corrupted files bypass volume checks by repeating a fake Arabic letter on every line.
-    // By comparing Arabic counts to Latin counts, we instantly catch French/English fakes.
-    const arabicCharCount = (arabicText.match(/[\u0600-\u06FF]/g) || []).length;
-    const latinCharCount = (arabicText.match(/[a-zA-Z]/g) || []).length;
-    
-    if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) {
-        console.log(`    ❌ [Blocked] Fake/Corrupted File Detected (Ar: ${arabicCharCount} | Latin: ${latinCharCount}). Trashing.`);
-        return { passed: false, alignmentPct: 0 };
+    // 🔥 THE ULTIMATE CONTENT FIREWALL: The Ratio Check (Only runs for Arabic)
+    if (isArabic) {
+        const arabicCharCount = (arabicText.match(/[\u0600-\u06FF]/g) || []).length;
+        const latinCharCount = (arabicText.match(/[a-zA-Z]/g) || []).length;
+        if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) {
+            console.log(`    ❌ [Blocked] Fake/Corrupted File Detected (Ar: ${arabicCharCount} | Latin: ${latinCharCount}). Trashing.`);
+            return { passed: false, alignmentPct: 0 };
+        }
     }
 
     let originalArParsed, engParsedClean, arParsedClean;
@@ -642,12 +671,8 @@ const engIndex   = buildEngIndex(engParsedClean);
     else if (driftMs > CONFIG.PENALTY_MODERATE_MS) alignmentPct -= CONFIG.PENALTY_MODERATE_PCT;
     else if (driftMs > CONFIG.PENALTY_LIGHT_MS) alignmentPct -= CONFIG.PENALTY_LIGHT_PCT;
     
-    // 🔥 Dynamic Engine Strength (1 to 5)
-    let dynamicMinPct = 40; // Default
-    if (userConfig.engineStrength === 1) dynamicMinPct = 20; // Forgiving
-    else if (userConfig.engineStrength === 2) dynamicMinPct = 30;
-    else if (userConfig.engineStrength === 4) dynamicMinPct = 60;
-    else if (userConfig.engineStrength === 5) dynamicMinPct = 80; // Highly Strict
+    // 🔥 Dynamic Engine Strength mapped directly from CONFIG
+    let dynamicMinPct = CONFIG.STRICTNESS_LEVELS[userConfig.engineStrength] ?? CONFIG.STRICTNESS_LEVELS[3];
 
     if (alignmentPct < dynamicMinPct) return { passed: false, alignmentPct };
 
@@ -769,12 +794,16 @@ async function runSubtitleEngine(args) {
        // 🔥 4. Apply their live settings from the database
         const userConfig = {
             osKey: userRow.osKey && userRow.osKey.trim() !== "" ? userRow.osKey.trim() : null,
+            subdlKey: userRow.subdlKey && userRow.subdlKey.trim() !== "" ? userRow.subdlKey.trim() : null,
+            subsourceKey: userRow.subsourceKey && userRow.subsourceKey.trim() !== "" ? userRow.subsourceKey.trim() : null,
+            targetLang: userRow.targetLang || 'ar',
+            panelLang: userRow.panelLang || 'en',
             stripTags: userRow.stripTags === 1,
             includeStats: userRow.includeStats === 1,
             removeSdh: userRow.removeSdh === 1,
             maxSubs: userRow.maxSubs || 5,
-            engineStrength: userRow.engineStrength || 3,
-            useOs: userRow.useOs !== 0, // Defaults to true
+            engineStrength: userRow.engineStrength ?? 3,
+            useOs: userRow.useOs !== 0,
             useSubdl: userRow.useSubdl !== 0,
             useSubsource: userRow.useSubsource !== 0,
             allowRouteA: userRow.allowRouteA !== 0,
@@ -782,6 +811,7 @@ async function runSubtitleEngine(args) {
             allowRouteC: userRow.allowRouteC !== 0,
             strict4k: userRow.strict4k === 1
         };
+        const isTargetArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
         if (!userConfig.osKey) {
             console.log(`❌ Blocked request: User ${username} has no OpenSubtitles Key in DB.`);
             const nokeyId = `nokey2_${Date.now()}.srt`;
@@ -827,7 +857,7 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 // 🔥 Cache Key now tracks all active configurations to avoid crossover
        const providerKey = `${userConfig.useOs?1:0}${userConfig.useSubdl?1:0}${userConfig.useSubsource?1:0}`;
        const routeKey = `${userConfig.allowRouteA?1:0}${userConfig.allowRouteB?1:0}${userConfig.allowRouteC?1:0}`;
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}`;
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
        if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
@@ -864,11 +894,11 @@ if (isTV) {
             console.log(`\n[TV Mode] Fetching OS Rulers + Arabic Candidates...`);
             let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
                 userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey }) : [],
-                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15 }) : [],
-                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15 }) : [],
-                userConfig.useOs ? fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }) : [],
-                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }) : [],
-                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }) : []
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15, apiKey: userConfig.subdlKey }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15, apiKey: userConfig.subsourceKey }) : [],
+                userConfig.useOs ? fetchOsCandidates({ lang: userConfig.targetLang, imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subdlKey }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subsourceKey }) : []
             ]);
 
 // 🔥 NEW: Intercept API garbage
@@ -949,9 +979,22 @@ if (osRulers.length === 0) {
 
             let allSurvivingTvArabic = [];
 
+          // 🔥 Strictness Level 5 (Identify User Video Cut)
+            const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
+            const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
+
             console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
             for (let i = 0; i < allCandidates.length; i++) {
                 const c = allCandidates[i];
+
+                if (userConfig.engineStrength === 5 && userCuts.length > 0) {
+                    const cTokens = tokeniseRelease(c.releaseName);
+                    const hasMatchingCut = userCuts.some(cut => cTokens.has(cut) || (cut === 'dc' && cTokens.has('director')) || (cut === 'director' && cTokens.has('dc')));
+                    if (!hasMatchingCut) {
+                        console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
+                        continue;
+                    }
+                }
                 const arabicData = await c.fetchFn();
                 if (!arabicData) continue;
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
@@ -1010,8 +1053,8 @@ if (osRulers.length === 0) {
 
       // 🔥 THE OPTIMIZED SHIELD (Text is King)
                 const isClone = finalTvWinners.some(existing => {
-                    const candidateSig = getArabicSignature(candidate.fixedText);
-                    const existingSig = getArabicSignature(existing.fixedText);
+                    const candidateSig = getTextSignature(candidate.fixedText, isTargetArabic);
+                    const existingSig = getTextSignature(existing.fixedText, isTargetArabic);
                     const textMatches = candidateSig.length > 50 && candidateSig === existingSig;
 
                     // Only fall back to Math if the text signature somehow failed to generate
@@ -1049,22 +1092,24 @@ if (osRulers.length === 0) {
                 });
             }
 
-          // ─── ROUTE B: The Top 2 Raw Token Matches ───
+  // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
-                const routeBCandidates = allCandidates.filter(c => c.fetchedText).sort((a, b) => b.score - a.score);
-            let routeBCount = 0;
+                const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), streamTypeGroup).sort((a, b) => b.score - a.score);
+let routeBCount = 0;
             for (const c of routeBCandidates) {
                 if (routeBCount >= 2) break;
                 
-                const arabicCharCount = (c.fetchedText.match(/[\u0600-\u06FF]/g) || []).length;
-                const latinCharCount = (c.fetchedText.match(/[a-zA-Z]/g) || []).length;
-                if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
+                if (isTargetArabic) {
+                    const arabicCharCount = (c.fetchedText.match(/[\u0600-\u06FF]/g) || []).length;
+                    const latinCharCount = (c.fetchedText.match(/[a-zA-Z]/g) || []).length;
+                    if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
+                }
 
-                const cSig = getArabicSignature(c.fetchedText);
+                const cSig = getTextSignature(c.fetchedText, isTargetArabic);
                 const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
                     const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
-                    return existingSubText && getArabicSignature(existingSubText) === cSig;
+                    return existingSubText && getTextSignature(existingSubText, isTargetArabic) === cSig;
                 });
 
                 if (isAlreadyInRouteA) continue;
@@ -1087,19 +1132,18 @@ if (osRulers.length === 0) {
         // PATH B: THE MOVIE CROSS-MATRIX
         // =====================================================================
         else {
-            console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Arabic Candidates...`);
+            console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Candidates...`);
             let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey }),
-                fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
-                fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT }),
+                userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: userConfig.subdlKey }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: userConfig.subsourceKey }) : [],
                 
-                fetchOsCandidates({ lang: 'ar', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }),
-                fetchSubdlCandidates({ lang: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT }),
-                fetchSubsourceCandidates({ langCode: 'ar', imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT })
+                userConfig.useOs ? fetchOsCandidates({ lang: userConfig.targetLang, imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subdlKey }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subsourceKey }) : []
             ]);
 
-           
-let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
+            let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
             // 🔥 HELPER: Attempts to lock rulers for a specific group
             const tryLockMovieRulers = async (targetGroup) => {
@@ -1119,7 +1163,8 @@ let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
                 }
                 for (const c of fSubsource) {
                     if (subsourceBaseline) break;
-                    subsourceBaseline = await getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': CONFIG.SUBSOURCE_KEY });
+                    const key = userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY;
+                    subsourceBaseline = await getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': key });
                     if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked [${targetGroup}]`); }
                 }
             };
@@ -1128,23 +1173,46 @@ let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
             // 🔥 THE 4K FALLBACK PROTOCOL
             let fallbackTriggered = false;
-     const hasMovieRulers = osBaseline || subdlBaseline || subsourceBaseline;
-            if (!hasMovieRulers) {
+            const hasMovieRulers = osBaseline || subdlBaseline || subsourceBaseline;
+            if (!hasMovieRulers && is4K) {
+                if (!userConfig.strict4k) {
+                    const fallbackGroup = streamTypeGroup.replace('_4K', '');
+                    console.log(`⚠️ 4K Starvation: No 4K Rulers found. Falling back to 1080p baselines (${fallbackGroup})...`);
+                    await tryLockMovieRulers(fallbackGroup);
+                    fallbackTriggered = true;
+                } else {
+                    console.log(`🛡️ 4K Strictness Shield Active: Refusing to fall back to 1080p baselines.`);
+                }
+            } else if (!hasMovieRulers) {
                 console.log(`⚠️ No Movie Rulers locked. Skipping Route A.`);
             }
 
             const allArabicCandidates = [
                 ...arOs.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl) })),
-                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': CONFIG.SUBSOURCE_KEY }) })),
+                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY }) })),
             ];
 
             let allSurvivingArabic = [];
-            let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
+let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
+
+            // 🔥 Strictness Level 5 (Identify User Video Cut)
+            const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
+            const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
 
             console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
             for (let i = 0; i < allArabicCandidates.length; i++) {
                 const c = allArabicCandidates[i];
+
+                if (userConfig.engineStrength === 5 && userCuts.length > 0) {
+                    const cTokens = tokeniseRelease(c.releaseName);
+                    const hasMatchingCut = userCuts.some(cut => cTokens.has(cut) || (cut === 'dc' && cTokens.has('director')) || (cut === 'director' && cTokens.has('dc')));
+                    if (!hasMatchingCut) {
+                        console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
+                        continue;
+                    }
+                }
+
                 const arabicData = await c.fetchFn();
                 if (!arabicData) continue;
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
@@ -1154,7 +1222,7 @@ let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
                 const cTokens = tokeniseRelease(c.releaseName);
                 const cGroup = getReleaseTypeGroup(cTokens);
                 if (fallbackTriggered && cGroup === streamTypeGroup) {
-                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Arabic match: ${c.releaseName}`);
+                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Match: ${c.releaseName}`);
                     try {
                         let fallbackParsed = srtParser.fromSrt(arabicData.text);
                         fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)` });
@@ -1168,7 +1236,7 @@ let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
                 }
 
                 // ─── ROUTE A: The Math Gauntlet ───
-                if (hasMovieRulers) {
+                if (userConfig.allowRouteA && hasMovieRulers) {
                     sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
                     const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
                     let bestScoreForCandidate = null;
@@ -1211,8 +1279,8 @@ let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 for (const champ of allSurvivingArabic) {
            // 🔥 THE OPTIMIZED SHIELD (Text is King)
                 const isClone = topArabic.some(existing => {
-                    const candidateSig = getArabicSignature(champ.fixedText);
-                    const existingSig = getArabicSignature(existing.fixedText);
+                    const candidateSig = getTextSignature(champ.fixedText, isTargetArabic);
+                    const existingSig = getTextSignature(existing.fixedText, isTargetArabic);
                     const textMatches = candidateSig.length > 50 && candidateSig === existingSig;
 
                     // Only fall back to Math if the text signature somehow failed to generate
@@ -1236,10 +1304,12 @@ for (const champ of allSurvivingArabic) {
                 
                 if (topArabic.length >= 5) break; 
             }
-           // 4. Push Clean English Rulers Unconditionally
-           if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens, userConfig));
-            if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens, userConfig));
-            if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens, userConfig));
+           // 4. Push Clean English Rulers conditionally
+           if (userConfig.allowRouteA) {
+               if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens, userConfig));
+               if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens, userConfig));
+               if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens, userConfig));
+           }
 // 5. Push the Top Arabic Winners
           for (const champ of topArabic) {
                 // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
@@ -1259,40 +1329,46 @@ for (const champ of allSurvivingArabic) {
                 });
             }
 
-            // ─── ROUTE B: The Top 2 Raw Token Matches ───
-            console.log(`\n[Movie Mode] Extracting Route B (Top 2 Raw Matches)...`);
-            const routeBCandidates = allArabicCandidates.filter(c => c.fetchedText).sort((a, b) => b.score - a.score);
-            let routeBCount = 0;
-            
-            for (const c of routeBCandidates) {
-                if (routeBCount >= 2) break;
+        // ─── ROUTE B: The Top 2 Raw Token Matches ───
+            if (userConfig.allowRouteB) {
+                console.log(`\n[Movie Mode] Extracting Route B (Top 2 Raw Matches)...`);
+                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), streamTypeGroup).sort((a, b) => b.score - a.score);
+                let routeBCount = 0;
                 
-                const arabicCharCount = (c.fetchedText.match(/[\u0600-\u06FF]/g) || []).length;
-                const latinCharCount = (c.fetchedText.match(/[a-zA-Z]/g) || []).length;
-                if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
-
-                const cSig = getArabicSignature(c.fetchedText);
-                const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
-                    const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
-                    return existingSubText && getArabicSignature(existingSubText) === cSig;
-                });
-
-                if (isAlreadyInRouteA) continue;
-
-                console.log(`  🚀 [Route B] Pushing top match: ${c.releaseName}`);
-                try {
-                    let routeBParsed = srtParser.fromSrt(c.fetchedText);
-                    routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
-                    let finalRouteBText = srtParser.toSrt(routeBParsed);
-                    if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-                    const cacheId = `elite_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                    subtitleCache.set(cacheId, finalRouteBText);
+                for (const c of routeBCandidates) {
+                    if (routeBCount >= 2) break;
                     
-                    finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[⚠️ Route B | Raw Match]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
-                    routeBCount++;
-                } catch(e) {}
+                    if (isTargetArabic) {
+                        const arabicCharCount = (c.fetchedText.match(/[\u0600-\u06FF]/g) || []).length;
+                        const latinCharCount = (c.fetchedText.match(/[a-zA-Z]/g) || []).length;
+                        if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
+                    }
+
+                    const cSig = getTextSignature(c.fetchedText, isTargetArabic);
+                    const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
+                        const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
+                        return existingSubText && getTextSignature(existingSubText, isTargetArabic) === cSig;
+                    });
+
+                    if (isAlreadyInRouteA) continue;
+
+                    console.log(`  🚀 [Route B] Pushing top match: ${c.releaseName}`);
+                    try {
+                        let routeBParsed = srtParser.fromSrt(c.fetchedText);
+                        routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
+                        let finalRouteBText = srtParser.toSrt(routeBParsed);
+                        if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                        const cacheId = `elite_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                        subtitleCache.set(cacheId, finalRouteBText);
+                        
+                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[⚠️ Route B | Raw Match]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
+                        routeBCount++;
+                    } catch(e) {}
+                }
             }
         }
+// =====================================================================
+// FINAL DELIVERY & FALLBACK (ROUTE C)
 // =====================================================================
 // FINAL DELIVERY & FALLBACK (ROUTE C)
         // =====================================================================
@@ -1448,6 +1524,11 @@ const app = express();
 app.use(cors());
 app.use(express.json()); 
 
+// 🛠️ API: Expose Config to Standalone Frontend
+app.get('/api/config', (req, res) => {
+    res.json({ name: CONFIG.ADDON_NAME, version: CONFIG.ADDON_VERSION });
+});
+
 app.post('/api/register', (req, res) => {
     try {
         const { username, password, confirmPassword } = req.body;
@@ -1487,7 +1568,7 @@ app.post('/api/login', (req, res) => {
 
 app.post('/api/update', (req, res) => {
     const { 
-        username, password, osKey, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
+        username, password, osKey, subdlKey, subsourceKey, targetLang, panelLang, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
         useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext
     } = req.body;
     
@@ -1497,11 +1578,11 @@ app.post('/api/update', (req, res) => {
     try {
         db.prepare(`
             UPDATE users 
-            SET osKey = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
+            SET osKey = ?, subdlKey = ?, subsourceKey = ?, targetLang = ?, panelLang = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
                 useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?
             WHERE LOWER(username) = LOWER(?)
         `).run(
-            osKey.trim(), stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
+            osKey.trim(), subdlKey ? subdlKey.trim() : "", subsourceKey ? subsourceKey.trim() : "", targetLang || "ar", panelLang || "en", stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
             useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0,
             username
         );
@@ -1519,287 +1600,23 @@ app.get('/dl/:cacheId', (req, res) => {
     if (subText) { res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.send(subText); } 
     else { res.status(404).send('Subtitle expired or not found.'); }
 });
-
 app.get('/', (req, res) => {
-    res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>${CONFIG.ADDON_NAME} | Dashboard</title>
-        <style>
-            body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; margin:0; text-align:center; padding: 20px;}
-            .container { background-color:#202020; padding:30px; border-radius:12px; border:1px solid #333; max-width:550px; width: 100%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; margin: auto; }
-            h1 { color:#8A5A99; font-size:2rem; margin-top:0; margin-bottom: 5px; }
-            p { color:#a0a0a0; font-size:1rem; margin-bottom:20px; }
-            .tabs { display: flex; margin-bottom: 20px; border-bottom: 1px solid #333; }
-            .tab { flex: 1; padding: 10px; cursor: pointer; color: #888; font-weight: bold; transition: 0.2s; }
-            .tab.active { color: #8A5A99; border-bottom: 2px solid #8A5A99; }
-            input[type=text], input[type=password] { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
-            input:focus { border-color: #8A5A99; }
-            .btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.1rem; font-weight:bold; cursor:pointer; text-decoration:none; display:block; margin-top:10px; box-sizing: border-box; transition: 0.2s; }
-            .btn:hover { background-color:#6c4777; }
-            .msg { font-size: 0.95rem; display: none; margin-bottom: 15px; padding: 10px; border-radius: 5px; }
-            .error { background: rgba(255, 76, 76, 0.1); color: #ff4c4c; border: 1px solid #ff4c4c; }
-            .success { background: rgba(76, 175, 80, 0.1); color: #4caf50; border: 1px solid #4caf50; }
-            .control-group { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 15px; text-align: left; border: 1px solid #333;}
-            .slider-container { display: flex; justify-content: space-between; align-items: center; margin-top: 5px;}
-            input[type=range] { width: 75%; cursor: pointer; }
-            .slider-val { font-weight: bold; color: #8A5A99; width: 20%; text-align: right; }
-            .grid-labels { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-            .check-label { color:#a0a0a0; display:flex; align-items:center; gap:10px; cursor:pointer; font-size: 0.9rem;}
-        </style>
-    </head>
-    <body>
-        <div class="container" id="authBox">
-            <h1>${CONFIG.ADDON_NAME}</h1>
-            <p>Welcome. Please authenticate.</p>
-            
-            <div class="tabs">
-                <div class="tab active" id="tab-login" onclick="switchAuthTab('login')">Login</div>
-                <div class="tab" id="tab-register" onclick="switchAuthTab('register')">Register</div>
-            </div>
-
-            <div id="authMsg" class="msg"></div>
-
-            <input type="text" id="authUsername" placeholder="Username">
-            <input type="password" id="authPassword" placeholder="Password">
-            <input type="password" id="authConfirm" placeholder="Re-enter Password" style="display:none;">
-            
-            <button id="authBtn" class="btn" onclick="submitAuth()">Login</button>
-        </div>
-
-        <div class="container" id="dashBox" style="display:none;">
-            <h1>Dashboard</h1>
-            <p>Welcome, <b id="lblUser" style="color:#8A5A99;"></b></p>
-            <div id="dashMsg" class="msg"></div>
-
-            <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold;">OpenSubtitles API Key</label>
-                <div style="display:flex; align-items:center; margin-top:10px; gap: 10px;">
-                    <input type="password" id="cfgOsKey" placeholder="Required for addon to work" style="margin:0; flex:1;">
-                    <button class="btn" style="width:auto; margin:0; padding:12px 20px;" onclick="toggleOsKey()" id="btnToggleKey">Show</button>
-                </div>
-            </div>
-
-            <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;">Providers & Routes</label>
-                <div class="grid-labels">
-                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles</label>
-                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteA"> <b>Route A</b> (Math Sync)</label>
-                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL</label>
-                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteB"> <b>Route B</b> (Raw Token)</label>
-                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource</label>
-                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteC"> <b>Route C</b> (Fallback)</label>
-                </div>
-            </div>
-
-            <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;">Subtitle Processing</label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> Strip Formatting Tags (Fixes HTML code)</label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> Remove SDH Elements (e.g., [Music])</label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> Include "Stats for Nerds" Diagnostic</label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <b>Auto-Download Next Episode</b> (Pre-caching)</label>
-                <label class="check-label"><input type="checkbox" id="cfgStrict4k"> <b>Strict 4K Shield</b> (No 1080p fallback)</label>
-            </div>
-
-            <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block;">Max Returned Subtitles</label>
-                <div class="slider-container">
-                    <input type="range" id="cfgMaxSubs" min="1" max="20" value="5" oninput="document.getElementById('valMaxSubs').innerText = this.value">
-                    <div class="slider-val" id="valMaxSubs">5</div>
-                </div>
-            </div>
-
-            <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block;">Engine Strictness</label>
-                <div class="slider-container">
-                    <input type="range" id="cfgEngine" min="1" max="5" value="3" oninput="document.getElementById('valEngine').innerText = this.value">
-                    <div class="slider-val" id="valEngine">3</div>
-                </div>
-            </div>
-
-            <button class="btn" onclick="saveSettings()">Save Settings</button>
-            <div id="installWrapper" style="display:none; margin-top:15px;">
-                <a href="#" id="stremioBtn" class="btn" style="background:#4caf50;">Install to Stremio</a>
-                <button id="copyBtn" class="btn" style="background:#444;" onclick="copyManifest()">Copy Manifest Link (For Nuvio)</button>
-            </div>
-            <button class="btn" style="background:#333; margin-top:15px;" onclick="logout()">Logout</button>
-        </div>
-
-      <script>
-            let isRegister = false;
-            let loggedUser = null;
-            let loggedPass = null;
-            let msgTimeout = null; // 🔥 ADDED: Tracks the active popup timer
-
-           const ui = {
-                authBox: document.getElementById('authBox'),
-                dashBox: document.getElementById('dashBox'),
-                authMsg: document.getElementById('authMsg'),
-                dashMsg: document.getElementById('dashMsg'),
-                stremioBtn: document.getElementById('stremioBtn'),
-                copyBtn: document.getElementById('copyBtn'),
-                installWrapper: document.getElementById('installWrapper')
-            };
-
-            function showMsg(box, text, isError) {
-                clearTimeout(msgTimeout); // Clear existing timer if user clicks quickly
-                box.className = 'msg ' + (isError ? 'error' : 'success');
-                box.innerText = text;
-                box.style.display = 'block';
-                
-                // 🔥 ADDED: Hide the message automatically after 3 seconds
-                msgTimeout = setTimeout(() => {
-                    box.style.display = 'none';
-                }, 3000);
-            }
-
-            function switchAuthTab(mode) {
-                isRegister = mode === 'register';
-                ui.authMsg.style.display = 'none';
-                document.getElementById('tab-login').className = isRegister ? 'tab' : 'tab active';
-                document.getElementById('tab-register').className = isRegister ? 'tab active' : 'tab';
-                document.getElementById('authConfirm').style.display = isRegister ? 'block' : 'none';
-                document.getElementById('authBtn').innerText = isRegister ? 'Register' : 'Login';
-            }
-
-           async function submitAuth() {
-                const username = document.getElementById('authUsername').value.trim();
-                const password = document.getElementById('authPassword').value;
-                const confirmPassword = document.getElementById('authConfirm').value;
-
-                if (!username || !password) return showMsg(ui.authMsg, "Fill all fields.", true);
-                
-                if (isRegister) {
-                    const userRegex = /^[a-zA-Z0-9_-]{3,20}$/;
-                    if (!userRegex.test(username)) return showMsg(ui.authMsg, "Username must be 3-20 chars (letters, numbers, _ , - only).", true);
-                    if (password.length < 4 || /\s/.test(password)) return showMsg(ui.authMsg, "Password must be at least 4 chars with NO spaces.", true);
-                }
-
-                const endpoint = isRegister ? '/api/register' : '/api/login';
-                const payload = isRegister ? { username, password, confirmPassword } : { username, password };
-
-                try {
-                    const res = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                    const data = await res.json();
-                    
-                    if (!res.ok) return showMsg(ui.authMsg, data.error, true);
-                    
-                    if (isRegister) {
-                        showMsg(ui.authMsg, data.message, false);
-                        switchAuthTab('login');
-                    } else {
-                        // Login Success
-                        loggedUser = username;
-                        loggedPass = password;
-                        loadDashboard(data.user);
-                    }
-                } catch (e) { showMsg(ui.authMsg, "Network Error.", true); }
-            }
-
-         function loadDashboard(user) {
-                ui.authBox.style.display = 'none';
-                ui.dashBox.style.display = 'block';
-                ui.dashMsg.style.display = 'none';
-                ui.installWrapper.style.display = 'none';
-
-                document.getElementById('lblUser').innerText = user.username;
-                document.getElementById('cfgOsKey').value = user.osKey || "";
-                
-                document.getElementById('cfgUseOs').checked = user.useOs !== 0;
-                document.getElementById('cfgUseSubdl').checked = user.useSubdl !== 0;
-                document.getElementById('cfgUseSubsource').checked = user.useSubsource !== 0;
-                document.getElementById('cfgAllowRouteA').checked = user.allowRouteA !== 0;
-                document.getElementById('cfgAllowRouteB').checked = user.allowRouteB !== 0;
-                document.getElementById('cfgAllowRouteC').checked = user.allowRouteC !== 0;
-               document.getElementById('cfgStripTags').checked = user.stripTags === 1;
-                document.getElementById('cfgIncludeStats').checked = user.includeStats === 1;
-                document.getElementById('cfgRemoveSdh').checked = user.removeSdh === 1;
-                document.getElementById('cfgAutoFetchNext').checked = user.autoFetchNext === 1; // 🔥 ADDED
-                document.getElementById('cfgStrict4k').checked = user.strict4k === 1;
-                
-                document.getElementById('cfgMaxSubs').value = user.maxSubs || 5;
-                document.getElementById('valMaxSubs').innerText = user.maxSubs || 5;
-                
-                document.getElementById('cfgEngine').value = user.engineStrength || 3;
-                document.getElementById('valEngine').innerText = user.engineStrength || 3;
-            }
-
-            async function saveSettings() {
-                const payload = {
-                    username: loggedUser,
-                    password: loggedPass,
-                    osKey: document.getElementById('cfgOsKey').value,
-                    useOs: document.getElementById('cfgUseOs').checked,
-                    useSubdl: document.getElementById('cfgUseSubdl').checked,
-                    useSubsource: document.getElementById('cfgUseSubsource').checked,
-                    allowRouteA: document.getElementById('cfgAllowRouteA').checked,
-                    allowRouteB: document.getElementById('cfgAllowRouteB').checked,
-                    allowRouteC: document.getElementById('cfgAllowRouteC').checked,
-                   stripTags: document.getElementById('cfgStripTags').checked,
-                    includeStats: document.getElementById('cfgIncludeStats').checked,
-                    removeSdh: document.getElementById('cfgRemoveSdh').checked,
-                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, // 🔥 ADDED
-                    strict4k: document.getElementById('cfgStrict4k').checked,
-                    maxSubs: document.getElementById('cfgMaxSubs').value,
-                    engineStrength: document.getElementById('cfgEngine').value
-                };
-
-                try {
-                    const res = await fetch('/api/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-                    const data = await res.json();
-                    
-                  if (!res.ok) return showMsg(ui.dashMsg, data.error, true);
-                    
-                    showMsg(ui.dashMsg, data.message, false);
-                    ui.stremioBtn.href = data.installLink;
-                    ui.installWrapper.style.display = 'block';
-                } catch (e) { showMsg(ui.dashMsg, "Network Error.", true); }
-            }
-
-            function copyManifest() {
-                const link = ui.stremioBtn.href.replace('stremio:', 'https:');
-                navigator.clipboard.writeText(link).then(() => {
-                    const originalText = ui.copyBtn.innerText;
-                    ui.copyBtn.innerText = '✅ Copied to Clipboard!';
-                    ui.copyBtn.style.backgroundColor = '#4caf50';
-                    setTimeout(() => {
-                        ui.copyBtn.innerText = originalText;
-                        ui.copyBtn.style.backgroundColor = '#444';
-                    }, 2000);
-                });
-            }
-
-           function toggleOsKey() {
-                const input = document.getElementById('cfgOsKey');
-                const btn = document.getElementById('btnToggleKey');
-                if (input.type === 'password') {
-                    input.type = 'text';
-                    btn.innerText = 'Hide';
-                } else {
-                    input.type = 'password';
-                    btn.innerText = 'Show';
-                }
-            }
-
-            function logout() {
-                loggedUser = null; loggedPass = null;
-                document.getElementById('authPassword').value = '';
-                
-                // Reset API Key field to hidden for the next user
-                document.getElementById('cfgOsKey').type = 'password';
-                document.getElementById('btnToggleKey').innerText = 'Show';
-                
-                ui.dashBox.style.display = 'none';
-                ui.authBox.style.display = 'block';
-            }
-        </script>
-    </body>
-    </html>
-    `);
+    try {
+        // Read the external index.html file
+        let html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+        
+        // Dynamically inject backend variables into the HTML string
+        html = html.replace(/__ADDON_NAME__/g, CONFIG.ADDON_NAME)
+                   .replace(/__ADDON_VERSION__/g, CONFIG.ADDON_VERSION)
+                   .replace(/__HOST__/g, HOST);
+                   
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.send(html);
+    } catch (err) {
+        console.error("Dashboard Load Error:", err.message);
+        res.status(500).send("Error loading dashboard interface.");
+    }
 });
-
 const router = getRouter(builder.getInterface());
 app.get('/manifest.json', (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
