@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+    <html lang="en" dir="ltr">
+    <head>
+        <meta charset="UTF-8">
+        <!-- 🔥 Mobile Viewport (Makes the page responsive on phones) -->
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>BRLM Subtitles | Dashboard</title>
+        <style>
+            body { background-color:#141414; color:#e5e5e5; font-family:'Segoe UI',sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; margin:0; text-align:center; padding: 20px;}
+            .container { background-color:#202020; padding:30px; border-radius:12px; border:1px solid #333; max-width:600px; width: 100%; box-shadow:0 10px 30px rgba(0,0,0,.5); box-sizing: border-box; margin: auto; position: relative;}
+            .lang-switch { position: absolute; top: 15px; right: 20px; background: #333; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; outline:none; font-weight: bold; transition: 0.2s; font-family: inherit;}
+            .lang-switch:hover { background: #8A5A99; }
+            h1 { color:#8A5A99; font-size:2rem; margin-top:0; margin-bottom: 5px; }
+            p { color:#a0a0a0; font-size:1rem; margin-bottom:20px; }
+            .tabs { display: flex; margin-bottom: 20px; border-bottom: 1px solid #333; }
+            .tab { flex: 1; padding: 10px; cursor: pointer; color: #888; font-weight: bold; transition: 0.2s; }
+            .tab.active { color: #8A5A99; border-bottom: 2px solid #8A5A99; }
+            input[type=text], input[type=password], select { width: 100%; padding: 12px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #444; background: #111; color: white; font-size: 1rem; box-sizing: border-box; outline: none; transition: 0.2s; }
+            input:focus, select:focus { border-color: #8A5A99; }
+            .btn { background-color:#8A5A99; color:white; padding:15px; width:100%; border:none; border-radius:8px; font-size:1.1rem; font-weight:bold; cursor:pointer; text-decoration:none; display:block; margin-top:10px; box-sizing: border-box; transition: 0.2s; }
+            .btn:hover { background-color:#6c4777; }
+            .msg { font-size: 0.95rem; display: none; margin-bottom: 15px; padding: 10px; border-radius: 5px; }
+            .error { background: rgba(255, 76, 76, 0.1); color: #ff4c4c; border: 1px solid #ff4c4c; }
+            .success { background: rgba(76, 175, 80, 0.1); color: #4caf50; border: 1px solid #4caf50; }
+            .control-group { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-bottom: 15px; text-align: left; border: 1px solid #333;}
+            .slider-container { display: flex; justify-content: space-between; align-items: center; margin-top: 5px;}
+            input[type=range] { width: 75%; cursor: pointer; }
+            .slider-val { font-weight: bold; color: #8A5A99; width: 20%; text-align: right; }
+            .grid-labels { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+            .check-label { color:#a0a0a0; display:flex; align-items:center; gap:10px; cursor:pointer; font-size: 0.9rem;}
+            .api-group { display:flex; align-items:center; margin-top:10px; gap: 10px; margin-bottom:10px; }
+            .api-group input { margin:0; flex:1; }
+            .api-group button { width:auto; margin:0; padding:12px 15px; font-size: 0.9rem; }
+
+            /* 🔥 Mobile Adjustments */
+            @media (max-width: 600px) {
+                .container { padding: 20px 15px; }
+                .grid-labels { grid-template-columns: 1fr; }
+                h1 { font-size: 1.6rem; }
+                .api-group { gap: 5px; }
+                .api-group button { padding: 12px 10px; font-size: 0.8rem; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container" id="authBox">
+            <h1>BRLM Subtitles | Dashboard</h1>
+            <p data-i18n="authDesc">Welcome. Please authenticate.</p>
+            
+            <div class="tabs">
+                <div class="tab active" id="tab-login" onclick="switchAuthTab('login')" data-i18n="login">Login</div>
+                <div class="tab" id="tab-register" onclick="switchAuthTab('register')" data-i18n="register">Register</div>
+            </div>
+
+            <div id="authMsg" class="msg"></div>
+
+            <input type="text" id="authUsername" placeholder="Username" data-ph="userPh">
+            <input type="password" id="authPassword" placeholder="Password" data-ph="passPh">
+            <input type="password" id="authConfirm" placeholder="Re-enter Password" style="display:none;" data-ph="confirmPh">
+            
+            <button id="authBtn" class="btn" onclick="submitAuth()" data-i18n="login">Login</button>
+        </div>
+
+        <div class="container" id="dashBox" style="display:none;">
+            <button class="lang-switch" onclick="toggleLang()" data-i18n="langToggle">عربي</button>
+            <h1 data-i18n="dashTitle">Dashboard</h1>
+            <p><span data-i18n="dashWelcome">Welcome, </span><b id="lblUser" style="color:#8A5A99;"></b></p>
+            <div id="dashMsg" class="msg"></div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold;" data-i18n="grpKeys">API Providers</label>
+                
+                <div class="api-group">
+                    <input type="password" id="cfgOsKey" placeholder="OpenSubtitles API Key (Required)" data-ph="osKey">
+                    <button class="btn show-btn" onclick="toggleKey('cfgOsKey', this)" data-i18n="show">Show</button>
+                </div>
+                
+                <div class="api-group">
+                    <input type="password" id="cfgSubdlKey" placeholder="SubDL API Key (Optional)" data-ph="subdlKey">
+                    <button class="btn show-btn" onclick="toggleKey('cfgSubdlKey', this)" data-i18n="show">Show</button>
+                </div>
+                
+                <div class="api-group" style="margin-bottom:0;">
+                    <input type="password" id="cfgSubsourceKey" placeholder="SubSource API Key (Optional)" data-ph="subsourceKey">
+                    <button class="btn show-btn" onclick="toggleKey('cfgSubsourceKey', this)" data-i18n="show">Show</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpLang">Language Extraction</label>
+                <select id="cfgTargetLang" style="margin-bottom:0;">
+                    <option value="ar" data-i18n="langAr">Arabic</option>
+                    <option value="en" data-i18n="langEn">English</option>
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpRoutes">Providers & Routes</label>
+                <div class="grid-labels">
+                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles</label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteA"> <b data-i18n="routeA">Route A</b></label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL</label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteB"> <b data-i18n="routeB">Route B</b></label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource</label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteC"> <b data-i18n="routeC">Route C</b></label>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpProc">Subtitle Processing</label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> <span data-i18n="chkTags">Strip Formatting Tags</span></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> <span data-i18n="chkSdh">Remove SDH Elements</span></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> <span data-i18n="chkStats">Include Stats for Nerds</span></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span></label>
+                <label class="check-label"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b></label>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block;" data-i18n="grpMax">Max Returned Subtitles</label>
+                <div class="slider-container">
+                    <input type="range" id="cfgMaxSubs" min="1" max="20" value="5" oninput="document.getElementById('valMaxSubs').innerText = this.value">
+                    <div class="slider-val" id="valMaxSubs">5</div>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label style="color:#e5e5e5; font-weight:bold; display:block;" data-i18n="grpStrict">Engine Strictness</label>
+                <p style="color:#a0a0a0; font-size:0.85rem; margin-bottom: 5px;" data-i18n="descStrict">0 = Bypass Math | 3 = Balanced | 5 = Cut Focus</p>
+                <div class="slider-container">
+                    <input type="range" id="cfgEngine" min="0" max="5" value="3" oninput="document.getElementById('valEngine').innerText = this.value">
+                    <div class="slider-val" id="valEngine">3</div>
+                </div>
+            </div>
+
+            <button class="btn" onclick="saveSettings()" data-i18n="btnSave">Save Settings</button>
+            <div id="installWrapper" style="display:none; margin-top:15px;">
+                <a href="#" id="stremioBtn" class="btn" style="background:#4caf50;" data-i18n="btnStremio">Install to Stremio</a>
+                <button id="copyBtn" class="btn" style="background:#444;" onclick="copyManifest()" data-i18n="btnCopy">Copy Manifest Link</button>
+            </div>
+            <button class="btn" style="background:#333; margin-top:15px;" onclick="logout()" data-i18n="btnLogout">Logout</button>
+        </div>
+
+        <script>
+		    const BACKEND_URL = "http://127.0.0.1:7000";
+            const dict = {
+                en: {
+                    authDesc: "Welcome. Please authenticate.", login: "Login", register: "Register",
+                    userPh: "Username", passPh: "Password", confirmPh: "Re-enter Password",
+                    dashTitle: "Dashboard", dashWelcome: "Welcome, ",
+                    grpKeys: "API Providers", osKey: "OpenSubtitles API Key (Required)", subdlKey: "SubDL API Key (Optional)", subsourceKey: "SubSource API Key (Optional)", show: "Show", hide: "Hide",
+                    grpLang: "Language Extraction", langAr: "Arabic", langEn: "English",
+                    grpRoutes: "Providers & Routes", routeA: "Route A (Math Sync)", routeB: "Route B (Raw Match)", routeC: "Route C (Fallback)",
+                    grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield",
+                    grpMax: "Max Returned Subtitles", grpStrict: "Engine Strictness", descStrict: "0 = Bypass Math | 3 = Balanced | 5 = Cut Focus",
+                    btnSave: "Save Settings", btnStremio: "Install to Stremio", btnCopy: "Copy Manifest Link", btnLogout: "Logout", dir: "ltr", langToggle: "عربي"
+                },
+                ar: {
+                    authDesc: "مرحباً. يرجى تسجيل الدخول.", login: "دخول", register: "حساب جديد",
+                    userPh: "اسم المستخدم", passPh: "كلمة المرور", confirmPh: "إعادة كلمة المرور",
+                    dashTitle: "لوحة التحكم", dashWelcome: "أهلاً، ",
+                    grpKeys: "مفاتيح المصادر", osKey: "مفتاح OpenSubtitles (مطلوب)", subdlKey: "مفتاح SubDL (اختياري)", subsourceKey: "مفتاح SubSource (اختياري)", show: "إظهار", hide: "إخفاء",
+                    grpLang: "لغة الترجمة المطلوبة", langAr: "العربية", langEn: "الإنجليزية",
+                    grpRoutes: "الخوادم والمسارات", routeA: "المسار A (المزامنة الذكية)", routeB: "المسار B (المطابقة المباشرة)", routeC: "المسار C (الاحتياطي)",
+                    grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K",
+                    grpMax: "الحد الأقصى للترجمات", grpStrict: "قوة التدقيق", descStrict: "0 = بدون تدقيق | 3 = متوازن | 5 = تدقيق صارم للنسخة",
+                    btnSave: "حفظ الإعدادات", btnStremio: "تثبيت في Stremio", btnCopy: "نسخ الرابط", btnLogout: "خروج", dir: "rtl", langToggle: "English"
+                }
+            };
+
+            let isRegister = false;
+            let loggedUser = null;
+            let loggedPass = null;
+            let msgTimeout = null;
+            let currentLang = 'en';
+
+            // 🔥 Fetch Addon Details from Backend on Load
+            async function initDashboard() {
+                try {
+                    const res = await fetch(`${BACKEND_URL}/api/config`);
+                    const config = await res.json();
+                    document.title = `${config.name} | Dashboard`;
+                    document.querySelector('#authBox h1').innerText = config.name;
+                } catch (e) {
+                    console.error("Failed to connect to backend:", e);
+                }
+            }
+            initDashboard(); // Run immediately
+
+            function toggleLang() {
+                currentLang = currentLang === 'en' ? 'ar' : 'en';
+                applyUI(currentLang);
+            }
+
+            function applyUI(lang) {
+                currentLang = lang;
+                document.body.dir = dict[lang].dir;
+                document.querySelectorAll('[data-i18n]').forEach(el => el.innerHTML = dict[lang][el.getAttribute('data-i18n')]);
+                document.querySelectorAll('[data-ph]').forEach(el => el.placeholder = dict[lang][el.getAttribute('data-ph')]);
+                
+                // Keep the show/hide buttons accurate based on current password visibility
+                document.querySelectorAll('.api-group').forEach(group => {
+                    const input = group.querySelector('input');
+                    const btn = group.querySelector('button');
+                    btn.innerText = input.type === 'password' ? dict[lang].show : dict[lang].hide;
+                });
+            }
+
+            function showMsg(box, text, isError) {
+                clearTimeout(msgTimeout);
+                box.className = 'msg ' + (isError ? 'error' : 'success');
+                box.innerText = text;
+                box.style.display = 'block';
+                msgTimeout = setTimeout(() => { box.style.display = 'none'; }, 3000);
+            }
+
+            function switchAuthTab(mode) {
+                isRegister = mode === 'register';
+                document.getElementById('authMsg').style.display = 'none';
+                document.getElementById('tab-login').className = isRegister ? 'tab' : 'tab active';
+                document.getElementById('tab-register').className = isRegister ? 'tab active' : 'tab';
+                document.getElementById('authConfirm').style.display = isRegister ? 'block' : 'none';
+                document.getElementById('authBtn').innerText = isRegister ? dict[currentLang].register : dict[currentLang].login;
+            }
+
+            async function submitAuth() {
+                const username = document.getElementById('authUsername').value.trim();
+                const password = document.getElementById('authPassword').value;
+                const confirmPassword = document.getElementById('authConfirm').value;
+                if (!username || !password) return showMsg(document.getElementById('authMsg'), "Fill all fields.", true);
+                
+                if (isRegister) {
+                    if (!/^[a-zA-Z0-9_-]{3,20}$/.test(username)) return showMsg(document.getElementById('authMsg'), "Username must be 3-20 chars (letters, numbers, _ , -).", true);
+                    if (password.length < 4 || /\s/.test(password)) return showMsg(document.getElementById('authMsg'), "Password must be at least 4 chars with NO spaces.", true);
+                }
+
+                const endpoint = isRegister ? '/api/register' : '/api/login';
+                const payload = isRegister ? { username, password, confirmPassword } : { username, password };
+
+           try {
+                    // 🔥 Route absolute request to backend
+                    const res = await fetch(`${BACKEND_URL}${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    if (!res.ok) return showMsg(document.getElementById('authMsg'), data.error, true);
+                    if (isRegister) {
+                        showMsg(document.getElementById('authMsg'), data.message, false);
+                        switchAuthTab('login');
+                    } else {
+                        loggedUser = username; loggedPass = password;
+                        loadDashboard(data.user);
+                    }
+                } catch (e) { showMsg(document.getElementById('authMsg'), "Network Error.", true); }
+            }
+
+            function loadDashboard(user) {
+                document.getElementById('authBox').style.display = 'none';
+                document.getElementById('dashBox').style.display = 'block';
+                
+                // Initialize language
+                currentLang = user.panelLang || 'en';
+                applyUI(currentLang);
+
+                document.getElementById('lblUser').innerText = user.username;
+                
+                // Load Keys
+                document.getElementById('cfgOsKey').value = user.osKey || "";
+                document.getElementById('cfgSubdlKey').value = user.subdlKey || "";
+                document.getElementById('cfgSubsourceKey').value = user.subsourceKey || "";
+                
+                // Hide keys on load
+                document.querySelectorAll('.api-group input').forEach(input => input.type = 'password');
+
+                document.getElementById('cfgTargetLang').value = user.targetLang || "ar";
+
+                document.getElementById('cfgUseOs').checked = user.useOs !== 0;
+                document.getElementById('cfgUseSubdl').checked = user.useSubdl !== 0;
+                document.getElementById('cfgUseSubsource').checked = user.useSubsource !== 0;
+                document.getElementById('cfgAllowRouteA').checked = user.allowRouteA !== 0;
+                document.getElementById('cfgAllowRouteB').checked = user.allowRouteB !== 0;
+                document.getElementById('cfgAllowRouteC').checked = user.allowRouteC !== 0;
+                
+                document.getElementById('cfgStripTags').checked = user.stripTags === 1;
+                document.getElementById('cfgIncludeStats').checked = user.includeStats === 1;
+                document.getElementById('cfgRemoveSdh').checked = user.removeSdh === 1;
+                document.getElementById('cfgAutoFetchNext').checked = user.autoFetchNext === 1;
+                document.getElementById('cfgStrict4k').checked = user.strict4k === 1;
+                
+                document.getElementById('cfgMaxSubs').value = user.maxSubs || 5;
+                document.getElementById('valMaxSubs').innerText = user.maxSubs || 5;
+                document.getElementById('cfgEngine').value = user.engineStrength || 3;
+                document.getElementById('valEngine').innerText = user.engineStrength || 3;
+            }
+
+            async function saveSettings() {
+                const payload = {
+                    username: loggedUser, password: loggedPass,
+                    osKey: document.getElementById('cfgOsKey').value,
+                    subdlKey: document.getElementById('cfgSubdlKey').value,
+                    subsourceKey: document.getElementById('cfgSubsourceKey').value,
+                    targetLang: document.getElementById('cfgTargetLang').value,
+                    panelLang: currentLang, // Saves the active UI language toggle
+                    useOs: document.getElementById('cfgUseOs').checked, useSubdl: document.getElementById('cfgUseSubdl').checked, useSubsource: document.getElementById('cfgUseSubsource').checked,
+                    allowRouteA: document.getElementById('cfgAllowRouteA').checked, allowRouteB: document.getElementById('cfgAllowRouteB').checked, allowRouteC: document.getElementById('cfgAllowRouteC').checked,
+                    stripTags: document.getElementById('cfgStripTags').checked, includeStats: document.getElementById('cfgIncludeStats').checked, removeSdh: document.getElementById('cfgRemoveSdh').checked,
+                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked,
+                    maxSubs: document.getElementById('cfgMaxSubs').value, engineStrength: document.getElementById('cfgEngine').value
+                };
+               try {
+                    // 🔥 Route absolute request to backend
+                    const res = await fetch(`${BACKEND_URL}/api/update`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                    const data = await res.json();
+                    if (!res.ok) return showMsg(document.getElementById('dashMsg'), data.error, true);
+                    showMsg(document.getElementById('dashMsg'), data.message, false);
+                    document.getElementById('stremioBtn').href = data.installLink;
+                    document.getElementById('installWrapper').style.display = 'block';
+                } catch (e) { showMsg(document.getElementById('dashMsg'), "Network Error.", true); }
+            }
+
+            function copyManifest() {
+                const link = document.getElementById('stremioBtn').href.replace('stremio:', 'https:');
+                navigator.clipboard.writeText(link).then(() => {
+                    const btn = document.getElementById('copyBtn');
+                    const originalText = btn.innerText;
+                    btn.innerText = '✅';
+                    btn.style.backgroundColor = '#4caf50';
+                    setTimeout(() => { btn.innerText = originalText; btn.style.backgroundColor = '#444'; }, 2000);
+                });
+            }
+
+            function toggleKey(inputId, btn) {
+                const input = document.getElementById(inputId);
+                if (input.type === 'password') {
+                    input.type = 'text';
+                    btn.innerText = dict[currentLang].hide;
+                } else {
+                    input.type = 'password';
+                    btn.innerText = dict[currentLang].show;
+                }
+            }
+
+            function logout() {
+                loggedUser = null; loggedPass = null;
+                document.getElementById('authPassword').value = '';
+                document.querySelectorAll('.api-group input').forEach(input => input.type = 'password');
+                document.querySelectorAll('.show-btn').forEach(btn => btn.innerText = dict[currentLang].show);
+                
+                document.getElementById('dashBox').style.display = 'none';
+                document.getElementById('installWrapper').style.display = 'none';
+                document.getElementById('authBox').style.display = 'block';
+            }
+        </script>
+    </body>
+    </html>
