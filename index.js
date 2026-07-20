@@ -1602,8 +1602,8 @@ app.get('/dl/:cacheId', (req, res) => {
 });
 app.get('/', (req, res) => {
     try {
-        // Read the external index.html file
-        let html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+        // Read the external webpage.html file
+        let html = fs.readFileSync(path.join(__dirname, 'webpage.html'), 'utf8');
         
         // Dynamically inject backend variables into the HTML string
         html = html.replace(/__ADDON_NAME__/g, CONFIG.ADDON_NAME)
