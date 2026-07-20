@@ -58,7 +58,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.3",
+    ADDON_VERSION: "1.3.4",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -564,6 +564,20 @@ function getTextSignature(srtText, isArabic = true) {
     }
     return validLines.sort((a, b) => b.length - a.length).slice(0, 15).sort().join('');
 }
+
+// 🔥 NEW: Wraps getTextSignature so Route B's raw candidate text is compared
+// on equal footing with Route A's already SDH-stripped winner. Without this,
+// the exact same subtitle looks "different" once with SDH lines and once
+// without — and Route B re-pushes it as if it were a new find.
+function getComparableSignature(rawText, isArabic, removeSdh) {
+    if (!removeSdh) return getTextSignature(rawText, isArabic);
+    try {
+        const cleanedParsed = stripSdhAndClean(srtParser.fromSrt(rawText));
+        return getTextSignature(srtParser.toSrt(cleanedParsed), isArabic);
+    } catch {
+        return getTextSignature(rawText, isArabic);
+    }
+}
 function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false, userConfig = {}) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
 
@@ -588,15 +602,21 @@ function computePrecisionShift(englishText, arabicText, label = '', sourceName =
         }
     }
 
-    let originalArParsed, engParsedClean, arParsedClean;
+let originalArParsed, engParsedClean, arParsedClean;
     try {
         const rawEng = srtParser.fromSrt(englishText);
         originalArParsed = srtParser.fromSrt(arabicText); 
         engParsedClean = stripSdhAndClean(rawEng);
         arParsedClean  = stripSdhAndClean(originalArParsed);
-    } catch { return { passed: false, alignmentPct: 0 }; }
+    } catch (e) {
+        console.log(`    ❌ [Blocked] ${label} | Malformed/unparseable SRT: ${e.message}`);
+        return { passed: false, alignmentPct: 0 };
+    }
 
-    if (engParsedClean.length < 50 || arParsedClean.length < 50) return { passed: false, alignmentPct: 0 };
+    if (engParsedClean.length < 50 || arParsedClean.length < 50) {
+        console.log(`    ❌ [Blocked] ${label} | Too few cues after cleaning (Eng: ${engParsedClean.length}, Ar: ${arParsedClean.length}) — likely a partial/forced/sample track.`);
+        return { passed: false, alignmentPct: 0 };
+    }
 
 const engIndex   = buildEngIndex(engParsedClean);
    const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
@@ -660,8 +680,11 @@ const engIndex   = buildEngIndex(engParsedClean);
         }
     }
 
-    let { passed, alignmentPct, driftMs, globalMedian } = bestMetrics;
-    if (!passed) return { passed: false, alignmentPct: 0 };
+  let { passed, alignmentPct, driftMs, globalMedian } = bestMetrics;
+    if (!passed) {
+        console.log(`    ❌ [Blocked] ${label} | Not enough overlapping timing data to measure sync.`);
+        return { passed: false, alignmentPct: 0 };
+    }
 
     const scaleLog = bestParsed !== originalArParsed ? ' [FPS Scaled ⚙️]' : '';
     console.log(`    [Math] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms${scaleLog}`);
@@ -954,7 +977,7 @@ if (isTV) {
 
             await tryLockTvRulers(streamTypeGroup);
 
-          // 🔥 THE 4K FALLBACK PROTOCOL
+ // 🔥 THE 4K FALLBACK PROTOCOL
             let fallbackTriggered = false;
             if (osRulers.length === 0 && is4K) {
                 if (!userConfig.strict4k) {
@@ -971,6 +994,11 @@ if (osRulers.length === 0) {
                 console.log(`⚠️ No TV Rulers locked. Skipping Route A.`);
             }
 
+            // 🔥 Whichever group actually backs our locked ruler(s) — if we fell
+            // back from 4K to 1080p, Route B must match against 1080p too.
+            // Arabic releases are almost never tagged "4K", so filtering Route B
+            // against the raw 4K label would silently empty it out every time.
+            const effectiveTypeGroup = fallbackTriggered ? streamTypeGroup.replace('_4K', '') : streamTypeGroup;
             const allCandidates = [
                 ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
@@ -995,15 +1023,33 @@ if (osRulers.length === 0) {
                         continue;
                     }
                 }
-                const arabicData = await c.fetchFn();
+        const arabicData = await c.fetchFn();
                 if (!arabicData) continue;
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
 
-                // 🔥 4K Blind Trust Protocol
                 const cTokens = tokeniseRelease(c.releaseName);
                 const cGroup = getReleaseTypeGroup(cTokens);
-                if (fallbackTriggered && cGroup === streamTypeGroup) {
+
+              // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
+                let candidatePassedRouteA = false;
+                if (userConfig.allowRouteA && osRulers.length > 0) {
+                    let bestScoreForCandidate = null;
+                    for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
+                       const ruler = osRulers[rIdx];
+                        const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true, userConfig);
+                        if (result.passed && (!bestScoreForCandidate || result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
+                            bestScoreForCandidate = { candidate: c, matchedRuler: `OS Cut ${rIdx+1}`, ...result };
+                        }
+                    }
+                    if (bestScoreForCandidate) {
+                        allSurvivingTvArabic.push(bestScoreForCandidate);
+                        candidatePassedRouteA = true;
+                    }
+                }
+
+                // 🔥 4K Blind Trust Protocol (only fires if Route A couldn't verify this candidate)
+                if (!candidatePassedRouteA && fallbackTriggered && cGroup === streamTypeGroup) {
                     console.log(`  🚀 [Blind Trust] Pushing explicit 4K Arabic match: ${c.releaseName}`);
                     try {
                         let fallbackParsed = srtParser.fromSrt(arabicData.text);
@@ -1016,21 +1062,7 @@ if (osRulers.length === 0) {
                     } catch(e) {}
                     continue; 
                 }
-
-              // ─── ROUTE A: The Math Gauntlet ───
-                if (userConfig.allowRouteA && osRulers.length > 0) {
-                    let bestScoreForCandidate = null;
-                    for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
-                       const ruler = osRulers[rIdx];
-                        const result = computePrecisionShift(ruler.text, arabicData.text, `${c.source} vs OS Cut ${rIdx+1}`, c.source, detectedType, c.releaseName, true, userConfig);
-                        if (result.passed && (!bestScoreForCandidate || result.alignmentPct > bestScoreForCandidate.alignmentPct)) {
-                            bestScoreForCandidate = { candidate: c, matchedRuler: `OS Cut ${rIdx+1}`, ...result };
-                        }
-                    }
-                    if (bestScoreForCandidate) allSurvivingTvArabic.push(bestScoreForCandidate);
-                }
             }
-
      // 2. ALWAYS push the Clean English Rulers conditionally based on Route A
             if (userConfig.allowRouteA) {
                 for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
@@ -1095,7 +1127,7 @@ if (osRulers.length === 0) {
   // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
-                const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), streamTypeGroup).sort((a, b) => b.score - a.score);
+              const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
 let routeBCount = 0;
             for (const c of routeBCandidates) {
                 if (routeBCount >= 2) break;
@@ -1106,7 +1138,7 @@ let routeBCount = 0;
                     if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
                 }
 
-                const cSig = getTextSignature(c.fetchedText, isTargetArabic);
+               const cSig = getComparableSignature(c.fetchedText, isTargetArabic, userConfig.removeSdh);
                 const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
                     const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
                     return existingSubText && getTextSignature(existingSubText, isTargetArabic) === cSig;
@@ -1183,9 +1215,13 @@ let routeBCount = 0;
                 } else {
                     console.log(`🛡️ 4K Strictness Shield Active: Refusing to fall back to 1080p baselines.`);
                 }
-            } else if (!hasMovieRulers) {
+           } else if (!hasMovieRulers) {
                 console.log(`⚠️ No Movie Rulers locked. Skipping Route A.`);
             }
+
+            // 🔥 Whichever group actually backs our locked ruler(s) — if we fell
+            // back from 4K to 1080p, Route B must match against 1080p too.
+            const effectiveTypeGroup = fallbackTriggered ? streamTypeGroup.replace('_4K', '') : streamTypeGroup;
 
             const allArabicCandidates = [
                 ...arOs.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
@@ -1213,29 +1249,16 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                     }
                 }
 
-                const arabicData = await c.fetchFn();
+         const arabicData = await c.fetchFn();
                 if (!arabicData) continue;
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
-                // 🔥 4K Blind Trust Protocol
                 const cTokens = tokeniseRelease(c.releaseName);
                 const cGroup = getReleaseTypeGroup(cTokens);
-                if (fallbackTriggered && cGroup === streamTypeGroup) {
-                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Match: ${c.releaseName}`);
-                    try {
-                        let fallbackParsed = srtParser.fromSrt(arabicData.text);
-                        fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)` });
-                        let blindText = srtParser.toSrt(fallbackParsed);
-                        if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-                        const cacheId = `elite_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                        subtitleCache.set(cacheId, blindText);
-                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
-                    } catch(e) {}
-                    continue; 
-                }
 
-                // ─── ROUTE A: The Math Gauntlet ───
+                // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
+                let candidatePassedRouteA = false;
                 if (userConfig.allowRouteA && hasMovieRulers) {
                     sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
                     const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
@@ -1259,7 +1282,25 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                     testAgainstRuler(subdlBaseline, 'SubDL');
                     testAgainstRuler(subsourceBaseline, 'SubSource');
 
-                    if (bestScoreForCandidate) allSurvivingArabic.push(bestScoreForCandidate);
+                    if (bestScoreForCandidate) {
+                        allSurvivingArabic.push(bestScoreForCandidate);
+                        candidatePassedRouteA = true;
+                    }
+                }
+
+                // 🔥 4K Blind Trust Protocol (only fires if Route A couldn't verify this candidate)
+                if (!candidatePassedRouteA && fallbackTriggered && cGroup === streamTypeGroup) {
+                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Match: ${c.releaseName}`);
+                    try {
+                        let fallbackParsed = srtParser.fromSrt(arabicData.text);
+                        fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)` });
+                        let blindText = srtParser.toSrt(fallbackParsed);
+                        if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                        const cacheId = `elite_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                        subtitleCache.set(cacheId, blindText);
+                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
+                    } catch(e) {}
+                    continue; 
                 }
             }
 
@@ -1332,7 +1373,7 @@ for (const champ of allSurvivingArabic) {
         // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[Movie Mode] Extracting Route B (Top 2 Raw Matches)...`);
-                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), streamTypeGroup).sort((a, b) => b.score - a.score);
+                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
                 let routeBCount = 0;
                 
                 for (const c of routeBCandidates) {
@@ -1344,7 +1385,7 @@ for (const champ of allSurvivingArabic) {
                         if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
                     }
 
-                    const cSig = getTextSignature(c.fetchedText, isTargetArabic);
+                const cSig = getComparableSignature(c.fetchedText, isTargetArabic, userConfig.removeSdh);
                     const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
                         const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
                         return existingSubText && getTextSignature(existingSubText, isTargetArabic) === cSig;
