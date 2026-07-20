@@ -12,7 +12,11 @@ const fs = require('fs');
 const path = require('path');
 
 // 🔥 INITIALIZE SQLITE DATABASE
-const db = new Database('brlm_users.sqlite');
+// Use Railway's persistent volume if available, otherwise use the local directory
+const dataDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const dbPath = path.join(dataDir, 'brlm_users.sqlite');
+
+const db = new Database(dbPath);
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
