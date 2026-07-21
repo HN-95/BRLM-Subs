@@ -38,7 +38,8 @@ db.exec(`
     allowRouteB INTEGER DEFAULT 1,
     allowRouteC INTEGER DEFAULT 1,
     strict4k INTEGER DEFAULT 0,
-    autoFetchNext INTEGER DEFAULT 1
+    autoFetchNext INTEGER DEFAULT 1,
+    separateRemux INTEGER DEFAULT 0
   )
 `);
 
@@ -54,6 +55,16 @@ try {
         db.exec('ALTER TABLE users ADD COLUMN panelLang TEXT DEFAULT "en"');
     } catch(err) {}
 }
+
+// 🔥 AUTO-MIGRATOR #2: Adds the Remux/BluRay separation toggle for existing users
+try {
+    db.prepare('SELECT separateRemux FROM users LIMIT 1').get();
+} catch (e) {
+    console.log("⚠️ Updating database schema to include Remux/BluRay Separation toggle...");
+    try {
+        db.exec('ALTER TABLE users ADD COLUMN separateRemux INTEGER DEFAULT 0');
+    } catch(err) {}
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
@@ -62,7 +73,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.4",
+    ADDON_VERSION: "1.3.5",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -201,9 +212,13 @@ function releaseScore(setA, setB) {
     return (2 * matches) / (setA.size + setB.size);
 }
 
-function getReleaseTypeGroup(tokens) {
+function getReleaseTypeGroup(tokens, separateRemux = false) {
     let group = null;
     if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) group = tokens.has('webrip') ? 'WEBRIP' : 'WEBDL';
+    // 🔥 When enabled, a REMUX (raw disc copy) is its own group — never
+    // interchangeable with a re-encoded BluRay rip, since the two can carry
+    // genuinely different timing (different intros/cuts/frame trims).
+    else if (separateRemux && (tokens.has('remux') || tokens.has('bdremux'))) group = 'REMUX';
     else if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) group = 'BLURAY';
     else if (tokens.has('hdtv') || tokens.has('hdrip')) group = 'HDTV';
     else if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) group = 'DVD';
@@ -216,13 +231,13 @@ function getReleaseTypeGroup(tokens) {
     return group;
 }
 
-function filterBaselinesByType(candidates, streamTypeGroup) {
+function filterBaselinesByType(candidates, streamTypeGroup, separateRemux = false) {
     // Skip if config is off, or if we couldn't detect the stream type
     if (!CONFIG.STRICT_TYPE_MATCHING || !streamTypeGroup) return candidates;
     
     return candidates.filter(c => {
         const cTokens = tokeniseRelease(c.releaseName);
-        const cGroup = getReleaseTypeGroup(cTokens);
+        const cGroup = getReleaseTypeGroup(cTokens, separateRemux);
         return cGroup === streamTypeGroup;
     });
 }
@@ -836,7 +851,8 @@ async function runSubtitleEngine(args) {
             allowRouteA: userRow.allowRouteA !== 0,
             allowRouteB: userRow.allowRouteB !== 0,
             allowRouteC: userRow.allowRouteC !== 0,
-            strict4k: userRow.strict4k === 1
+            strict4k: userRow.strict4k === 1,
+            separateRemux: userRow.separateRemux === 1
         };
         const isTargetArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
         if (!userConfig.osKey) {
@@ -858,8 +874,8 @@ async function runSubtitleEngine(args) {
         const season        = idParts[1] ?? null;
         const episode       = idParts[2] ?? null;
         const videoHash     = args.extra?.videoHash ?? null;
-        const releaseTokens = tokeniseRelease(streamName || '');
-        const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
+const releaseTokens = tokeniseRelease(streamName || '');
+        const streamTypeGroup = getReleaseTypeGroup(releaseTokens, userConfig.separateRemux);
         const isTV          = !!(season && episode);
         const is4K          = releaseTokens.has('2160p') || releaseTokens.has('4k'); // 🔥 Track 4K state
 
@@ -868,6 +884,7 @@ async function runSubtitleEngine(args) {
 
 if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
         else if (streamTypeGroup?.startsWith('WEBRIP')) detectedType = 'WEBRip' + resTag;
+        else if (streamTypeGroup?.startsWith('REMUX')) detectedType = 'REMUX' + resTag;
         else if (streamTypeGroup?.startsWith('BLURAY')) detectedType = (releaseTokens.has('remux') ? 'REMUX' : 'BLURAY') + resTag;
         else if (streamTypeGroup?.startsWith('HDTV')) detectedType = 'HDTV' + resTag;
         else if (streamTypeGroup?.startsWith('DVD')) detectedType = 'DVD' + resTag;
@@ -884,7 +901,7 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 // 🔥 Cache Key now tracks all active configurations to avoid crossover
        const providerKey = `${userConfig.useOs?1:0}${userConfig.useSubdl?1:0}${userConfig.useSubsource?1:0}`;
        const routeKey = `${userConfig.allowRouteA?1:0}${userConfig.allowRouteB?1:0}${userConfig.allowRouteC?1:0}`;
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_remux${userConfig.separateRemux?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
        if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
@@ -952,8 +969,8 @@ if (isTV) {
             let seenTextSnippets = new Set(); 
 
             // 🔥 HELPER: Attempts to lock rulers for a specific group
-            const tryLockTvRulers = async (targetGroup) => {
-                const strictEng = filterBaselinesByType(combinedEng, targetGroup);
+const tryLockTvRulers = async (targetGroup) => {
+                const strictEng = filterBaselinesByType(combinedEng, targetGroup, userConfig.separateRemux);
                 for (const c of strictEng) {
                     if (osRulers.length >= CONFIG.TV_DISTINCT_CUTS_LIMIT) break;
                     const srt = await c.fetchFn();
@@ -1032,8 +1049,8 @@ if (osRulers.length === 0) {
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
 
-                const cTokens = tokeniseRelease(c.releaseName);
-                const cGroup = getReleaseTypeGroup(cTokens);
+              const cTokens = tokeniseRelease(c.releaseName);
+                const cGroup = getReleaseTypeGroup(cTokens, userConfig.separateRemux);
 
               // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
                 let candidatePassedRouteA = false;
@@ -1131,7 +1148,7 @@ if (osRulers.length === 0) {
   // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
-              const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
+              const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), effectiveTypeGroup, userConfig.separateRemux).sort((a, b) => b.score - a.score);
 let routeBCount = 0;
             for (const c of routeBCandidates) {
                 if (routeBCount >= 2) break;
@@ -1182,10 +1199,10 @@ let routeBCount = 0;
             let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
             // 🔥 HELPER: Attempts to lock rulers for a specific group
-            const tryLockMovieRulers = async (targetGroup) => {
-                const fOs = filterBaselinesByType(engOs, targetGroup);
-                const fSubdl = filterBaselinesByType(engSubdl, targetGroup);
-                const fSubsource = filterBaselinesByType(engSubsource, targetGroup);
+           const tryLockMovieRulers = async (targetGroup) => {
+                const fOs = filterBaselinesByType(engOs, targetGroup, userConfig.separateRemux);
+                const fSubdl = filterBaselinesByType(engSubdl, targetGroup, userConfig.separateRemux);
+                const fSubsource = filterBaselinesByType(engSubsource, targetGroup, userConfig.separateRemux);
                 
                 for (const c of fOs) {
                     if (osBaseline) break;
@@ -1258,8 +1275,8 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
-                const cTokens = tokeniseRelease(c.releaseName);
-                const cGroup = getReleaseTypeGroup(cTokens);
+               const cTokens = tokeniseRelease(c.releaseName);
+                const cGroup = getReleaseTypeGroup(cTokens, userConfig.separateRemux);
 
                 // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
                 let candidatePassedRouteA = false;
@@ -1377,7 +1394,7 @@ for (const champ of allSurvivingArabic) {
         // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[Movie Mode] Extracting Route B (Top 2 Raw Matches)...`);
-                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
+                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), effectiveTypeGroup, userConfig.separateRemux).sort((a, b) => b.score - a.score);
                 let routeBCount = 0;
                 
                 for (const c of routeBCandidates) {
@@ -1614,24 +1631,23 @@ app.post('/api/login', (req, res) => {
 app.post('/api/update', (req, res) => {
     const { 
         username, password, osKey, subdlKey, subsourceKey, targetLang, panelLang, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
-        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext
+        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext, separateRemux
     } = req.body;
     
     const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
     if (!user) return res.status(401).json({ error: "Authentication failed." });
     
     try {
-        db.prepare(`
+  db.prepare(`
             UPDATE users 
             SET osKey = ?, subdlKey = ?, subsourceKey = ?, targetLang = ?, panelLang = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
-                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?
+                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?, separateRemux = ?
             WHERE LOWER(username) = LOWER(?)
         `).run(
             osKey.trim(), subdlKey ? subdlKey.trim() : "", subsourceKey ? subsourceKey.trim() : "", targetLang || "ar", panelLang || "en", stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
-            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0,
+            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0, separateRemux ? 1 : 0,
             username
         );
-        
         const configStr = encodeURIComponent(JSON.stringify({ username: username }));
         const installLink = `stremio://${HOST.replace(/^https?:\/\//, '')}/${configStr}/manifest.json`;
         res.json({ success: true, message: "Settings saved!", installLink });
