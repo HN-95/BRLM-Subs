@@ -73,7 +73,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.5",
+    ADDON_VERSION: "1.3.6",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -511,13 +511,37 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
 // ─────────────────────────────────────────────────────────────────────────────
 // MATH ENGINE (SDH DE-NOISER, SCALING, & DISTINCT CUT CHECKER)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// 🔥 SDH LINE CLEANER: strips [bracketed sound/description tags] and
+// (parenthetical asides), plus a leading "SPEAKER:" / "ROLE:" tag some SDH
+// tracks put at the start of a line to say who's talking. Works for Latin
+// and Arabic script alike, since it doesn't care what characters make up
+// the speaker name — only that a short prefix is followed by a colon.
+// The colon must be followed by whitespace/end-of-line (not immediately by
+// a digit) so real dialogue like "3:45" or "12:30" is never touched.
+function stripSdhFromLine(text) {
+    if (!text) return '';
+    let clean = text;
+    clean = clean.replace(/\[.*?\]/g, '');
+    clean = clean.replace(/\(.*?\)/g, '');
+    clean = clean.replace(/^\s*[-–—]?\s*[^:\n]{1,25}:(?=\s|$)\s*/, '');
+    return clean.trim();
+}
+
+
 function stripSdhAndClean(parsedArray) {
     let cleanArray = [];
     for (const line of parsedArray) {
-        let cleanText = line.text.replace(/<[^>]+>/g, '');
-        cleanText = cleanText.replace(/\[.*?\]/g, '');
-        cleanText = cleanText.replace(/\(.*?\)/g, '');
-        if (cleanText.trim().length > 0) cleanArray.push(line);
+        const noTags = line.text.replace(/<[^>]+>/g, '');
+        const rawLines = noTags.split('\n');
+        const cleanLines = [];
+        for (const raw of rawLines) {
+            const cleanL = stripSdhFromLine(raw);
+            if (cleanL.length > 0) cleanLines.push(cleanL);
+        }
+        if (cleanLines.length > 0) {
+            cleanArray.push({ ...line, text: cleanLines.join('\n') });
+        }
     }
     return cleanArray;
 }
@@ -760,12 +784,12 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
         let cleanParsed = [];
 
         // 🔥 Conditionally Remove SDH
-        if (userConfig.removeSdh) {
+      if (userConfig.removeSdh) {
             for (let i = 0; i < parsed.length; i++) {
                 let rawLines = parsed[i].text.split('\n');
                 let cleanLines = [];
                 for (let line of rawLines) {
-                    let cleanL = line.replace(/\[.*?\]/gs, '').replace(/\(.*?\)/gs, '').trim();
+                    let cleanL = stripSdhFromLine(line);
                     const hasLetters = /[a-zA-Z]/.test(cleanL);
                     if (hasLetters && cleanL === cleanL.toUpperCase()) continue;
                     if (cleanL.length > 0) cleanLines.push(cleanL);
