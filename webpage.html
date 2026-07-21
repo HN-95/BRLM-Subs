@@ -111,8 +111,10 @@
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> <span data-i18n="chkTags">Strip Formatting Tags</span></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> <span data-i18n="chkSdh">Remove SDH Elements</span></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> <span data-i18n="chkStats">Include Stats for Nerds</span></label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span></label>
-                <label class="check-label"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b></label>
+               <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b></label>
+                <label class="check-label"><input type="checkbox" id="cfgSeparateRemux"> <b data-i18n="chkRemux">Separate Remux from BluRay</b></label>
+            
             </div>
 
             <div class="control-group">
@@ -141,7 +143,7 @@
         </div>
 
         <script>
-		    const BACKEND_URL = "";
+		    const BACKEND_URL = "http://127.0.0.1:7000";
             const dict = {
                 en: {
                     authDesc: "Welcome. Please authenticate.", login: "Login", register: "Register",
@@ -150,7 +152,7 @@
                     grpKeys: "API Providers", osKey: "OpenSubtitles API Key (Required)", subdlKey: "SubDL API Key (Optional)", subsourceKey: "SubSource API Key (Optional)", show: "Show", hide: "Hide",
                     grpLang: "Language Extraction", langAr: "Arabic", langEn: "English",
                     grpRoutes: "Providers & Routes", routeA: "Route A (Math Sync)", routeB: "Route B (Raw Match)", routeC: "Route C (Fallback)",
-                    grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield",
+                   grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield", chkRemux: "Separate Remux from BluRay",
                     grpMax: "Max Returned Subtitles", grpStrict: "Engine Strictness", descStrict: "0 = Bypass Math | 3 = Balanced | 5 = Cut Focus",
                     btnSave: "Save Settings", btnStremio: "Install to Stremio", btnCopy: "Copy Manifest Link", btnLogout: "Logout", dir: "ltr", langToggle: "عربي"
                 },
@@ -161,7 +163,7 @@
                     grpKeys: "مفاتيح المصادر", osKey: "مفتاح OpenSubtitles (مطلوب)", subdlKey: "مفتاح SubDL (اختياري)", subsourceKey: "مفتاح SubSource (اختياري)", show: "إظهار", hide: "إخفاء",
                     grpLang: "لغة الترجمة المطلوبة", langAr: "العربية", langEn: "الإنجليزية",
                     grpRoutes: "الخوادم والمسارات", routeA: "المسار A (المزامنة الذكية)", routeB: "المسار B (المطابقة المباشرة)", routeC: "المسار C (الاحتياطي)",
-                    grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K",
+                    grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K", chkRemux: "فصل الـ Remux عن BluRay",
                     grpMax: "الحد الأقصى للترجمات", grpStrict: "قوة التدقيق", descStrict: "0 = بدون تدقيق | 3 = متوازن | 5 = تدقيق صارم للنسخة",
                     btnSave: "حفظ الإعدادات", btnStremio: "تثبيت في Stremio", btnCopy: "نسخ الرابط", btnLogout: "خروج", dir: "rtl", langToggle: "English"
                 }
@@ -283,6 +285,7 @@
                 document.getElementById('cfgRemoveSdh').checked = user.removeSdh === 1;
                 document.getElementById('cfgAutoFetchNext').checked = user.autoFetchNext === 1;
                 document.getElementById('cfgStrict4k').checked = user.strict4k === 1;
+                document.getElementById('cfgSeparateRemux').checked = user.separateRemux === 1;
                 
                 document.getElementById('cfgMaxSubs').value = user.maxSubs || 5;
                 document.getElementById('valMaxSubs').innerText = user.maxSubs || 5;
@@ -301,7 +304,7 @@
                     useOs: document.getElementById('cfgUseOs').checked, useSubdl: document.getElementById('cfgUseSubdl').checked, useSubsource: document.getElementById('cfgUseSubsource').checked,
                     allowRouteA: document.getElementById('cfgAllowRouteA').checked, allowRouteB: document.getElementById('cfgAllowRouteB').checked, allowRouteC: document.getElementById('cfgAllowRouteC').checked,
                     stripTags: document.getElementById('cfgStripTags').checked, includeStats: document.getElementById('cfgIncludeStats').checked, removeSdh: document.getElementById('cfgRemoveSdh').checked,
-                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked,
+                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked, separateRemux: document.getElementById('cfgSeparateRemux').checked,
                     maxSubs: document.getElementById('cfgMaxSubs').value, engineStrength: document.getElementById('cfgEngine').value
                 };
                try {
