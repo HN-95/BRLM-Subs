@@ -62,7 +62,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.7",
+    ADDON_VERSION: "1.3.8",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -534,34 +534,83 @@ async function getArchiveSrt(url, season = null, episode = null, extraHeaders = 
 async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, releaseTokens, limit = 10, apiKey }) {
     try {
         const key = apiKey || CONFIG.SUBSOURCE_KEY;
-        const searchUrl = `https://api.subsource.net/api/v1/movies/search?searchType=imdb&imdb=tt${imdbId}`;
+        const isTV = !!(season && episode);
+
+        // 🔥 CRITICAL FIX: SubSource models EACH SEASON of a TV series as its
+        // own distinct movieId — /movies/search documents a "season" filter
+        // (example: "?searchType=text&q=...&season=1") and its response
+        // objects carry a "season" field. /subtitles itself has NO season or
+        // episode filter at all (its only filters are movieId, language,
+        // productionType, releaseType, releaseInfo, uploader,
+        // hearingImpaired, foreignParts, framerate, page, limit, sort) — so
+        // the old &season=&episode= appended to /subtitles was silently
+        // ignored. Without "season" on the SEARCH step, we could be handed
+        // an arbitrary/default season's movieId before any local filtering
+        // even ran — the real reason later-season requests kept surfacing
+        // Season-1 packs.
+        const searchParams = new URLSearchParams();
+        searchParams.set('searchType', 'imdb');
+        searchParams.set('imdb', `tt${imdbId}`);
+        searchParams.set('type', isTV ? 'series' : 'movie');
+        if (isTV) searchParams.set('season', String(parseInt(season, 10)));
+
+        const searchUrl = `https://api.subsource.net/api/v1/movies/search?${searchParams.toString()}`;
         const sRes = await fetchWithTimeout(searchUrl, { headers: { 'X-API-Key': key } });
         if (!sRes.ok) return [];
-        
+
         const sData = await sRes.json();
-        const movie = sData.data?.[0];
-        if (!movie) return [];
+        const candidates = sData.data || [];
+        if (!candidates.length) return [];
+
+        // Prefer whichever result's own "season" field actually matches —
+        // defensive in case the API ever returns more than one entry.
+        let movie = candidates[0];
+        if (isTV) {
+            const seasNum = parseInt(season, 10);
+            const exact = candidates.find(m => parseInt(m.season, 10) === seasNum);
+            if (exact) movie = exact;
+        }
 
         const langNames = { ar:'arabic', en:'english', fr:'french', es:'spanish', pt:'portuguese', de:'german', it:'italian', ru:'russian', tr:'turkish', hi:'hindi' };
         const targetLang = langNames[langCode.toLowerCase()] || 'english';
-        let url = `https://api.subsource.net/api/v1/subtitles?movieId=${movie.movieId}&language=${targetLang}`;
-        if (season && episode) url += `&season=${season}&episode=${episode}`;
 
+        // 🔥 /subtitles has no season/episode filter — only movieId +
+        // language matter here (productionType/releaseType are explicitly
+        // flagged by the docs as unreliable: "may return limited results
+        // since most imported subtitles from Subscene don't include this
+        // metadata"). Episode-level narrowing happens locally afterward
+        // (enforceEpisodeMatch + archive extraction), same as every other
+        // provider. limit=100 is the documented max — the old request never
+        // set it and silently got the API's default of 20.
+        const subParams = new URLSearchParams();
+        subParams.set('movieId', String(movie.movieId));
+        subParams.set('language', targetLang);
+        subParams.set('limit', '100');
+        subParams.set('sort', 'popular');
+
+        const url = `https://api.subsource.net/api/v1/subtitles?${subParams.toString()}`;
         const res = await fetchWithTimeout(url, { headers: { 'X-API-Key': key } });
         if (!res.ok) return [];
-        
+
         const data = await res.json();
-        let subs = Array.isArray(data) ? data : (data.data || data.items || data.subtitles || []);
-        
+        let subs = data.data || [];
+
         subs = subs.filter(s => s.language?.toLowerCase() === targetLang);
 
-        const scored = subs.map(sub => ({
-            id: sub.subtitleId,
-            releaseName: (sub.releaseInfo && sub.releaseInfo[0]) || 'SubSource Match',
-            downloadUrl: `https://api.subsource.net/api/v1/subtitles/${sub.subtitleId}/download`,
-            source: 'SubSource',
-            score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease((sub.releaseInfo && sub.releaseInfo[0]) || '')) : 0
-        }));
+        // 🔥 releaseInfo is an ARRAY of separate tags (e.g. ["BluRay",
+        // "1080p"]) — the old code only read index [0], discarding every
+        // other tag (resolution, codec, edition, etc.) that our type-
+        // matching and scoring depend on.
+        const scored = subs.map(sub => {
+            const releaseStr = (sub.releaseInfo && sub.releaseInfo.length) ? sub.releaseInfo.join(' ') : '';
+            return {
+                id: sub.subtitleId,
+                releaseName: releaseStr || 'SubSource Match',
+                downloadUrl: `https://api.subsource.net/api/v1/subtitles/${sub.subtitleId}/download`,
+                source: 'SubSource',
+                score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(releaseStr)) : 0
+            };
+        });
 
         scored.sort((a, b) => b.score - a.score);
         return scored.slice(0, limit);
