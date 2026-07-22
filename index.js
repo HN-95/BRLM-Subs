@@ -38,8 +38,7 @@ db.exec(`
     allowRouteB INTEGER DEFAULT 1,
     allowRouteC INTEGER DEFAULT 1,
     strict4k INTEGER DEFAULT 0,
-    autoFetchNext INTEGER DEFAULT 1,
-    separateRemux INTEGER DEFAULT 0
+    autoFetchNext INTEGER DEFAULT 1
   )
 `);
 
@@ -55,16 +54,6 @@ try {
         db.exec('ALTER TABLE users ADD COLUMN panelLang TEXT DEFAULT "en"');
     } catch(err) {}
 }
-
-// 🔥 AUTO-MIGRATOR #2: Adds the Remux/BluRay separation toggle for existing users
-try {
-    db.prepare('SELECT separateRemux FROM users LIMIT 1').get();
-} catch (e) {
-    console.log("⚠️ Updating database schema to include Remux/BluRay Separation toggle...");
-    try {
-        db.exec('ALTER TABLE users ADD COLUMN separateRemux INTEGER DEFAULT 0');
-    } catch(err) {}
-}
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
@@ -73,7 +62,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.6",
+    ADDON_VERSION: "1.3.7",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
     SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
@@ -212,13 +201,9 @@ function releaseScore(setA, setB) {
     return (2 * matches) / (setA.size + setB.size);
 }
 
-function getReleaseTypeGroup(tokens, separateRemux = false) {
+function getReleaseTypeGroup(tokens) {
     let group = null;
     if (tokens.has('webdl') || tokens.has('webrip') || tokens.has('web')) group = tokens.has('webrip') ? 'WEBRIP' : 'WEBDL';
-    // 🔥 When enabled, a REMUX (raw disc copy) is its own group — never
-    // interchangeable with a re-encoded BluRay rip, since the two can carry
-    // genuinely different timing (different intros/cuts/frame trims).
-    else if (separateRemux && (tokens.has('remux') || tokens.has('bdremux'))) group = 'REMUX';
     else if (tokens.has('bluray') || tokens.has('remux') || tokens.has('bdrip') || tokens.has('brrip') || tokens.has('bdremux')) group = 'BLURAY';
     else if (tokens.has('hdtv') || tokens.has('hdrip')) group = 'HDTV';
     else if (tokens.has('dvdrip') || tokens.has('dvdscr') || tokens.has('dvd')) group = 'DVD';
@@ -231,13 +216,13 @@ function getReleaseTypeGroup(tokens, separateRemux = false) {
     return group;
 }
 
-function filterBaselinesByType(candidates, streamTypeGroup, separateRemux = false) {
+function filterBaselinesByType(candidates, streamTypeGroup) {
     // Skip if config is off, or if we couldn't detect the stream type
     if (!CONFIG.STRICT_TYPE_MATCHING || !streamTypeGroup) return candidates;
     
     return candidates.filter(c => {
         const cTokens = tokeniseRelease(c.releaseName);
-        const cGroup = getReleaseTypeGroup(cTokens, separateRemux);
+        const cGroup = getReleaseTypeGroup(cTokens);
         return cGroup === streamTypeGroup;
     });
 }
@@ -301,18 +286,17 @@ function formatTime(ms) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function searchOS(url, apiKey) {
     try {
-        const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey, 'User-Agent': 'StremioArabicElite' } });
+        const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey, 'User-Agent': `${CONFIG.ADDON_NAME} v${CONFIG.ADDON_VERSION}` } });
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
 }
-
 async function getOsSrt(fileId, apiKey) {
     try {
         const req = await fetchWithTimeout('https://api.opensubtitles.com/api/v1/download', {
             method: 'POST',
             timeout: CONFIG.SRT_FETCH_TIMEOUT_MS,
-            headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': 'StremioArabicElite', 'Accept': 'application/json' },
+            headers: { 'Api-Key': apiKey, 'Content-Type': 'application/json', 'User-Agent': `${CONFIG.ADDON_NAME} v${CONFIG.ADDON_VERSION}`, 'Accept': 'application/json' },
             body: JSON.stringify({ file_id: parseInt(fileId) })
         });
       
@@ -326,69 +310,146 @@ async function getOsSrt(fileId, apiKey) {
     } catch { return null; }
 }
 async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey }) {
-    let results = [];
-    if (videoHash) {
-        const url = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&moviehash=${videoHash}`;
-        const hashData = await searchOS(url, apiKey);
-        if (hashData.data?.length) {
-            results.push(...hashData.data.map(s => ({
-                fileId: s.attributes.files[0].file_id,
-                releaseName: s.attributes.release || 'OS Hash Match',
-                source: 'OpenSubtitles',
-                score: 2
-            })));
+    try {
+        const isTV = !!(season && episode);
+
+        // 🔥 Per docs: "Remove leading zeroes in ID parameters (IMDB ID, TMDB ID...)"
+        const cleanImdbId = parseInt(imdbId, 10);
+        if (!cleanImdbId || Number.isNaN(cleanImdbId)) return [];
+
+        // 🔥 ONE combined request instead of two. Per docs: "If a moviehash is
+        // sent with a request, a moviehash_match boolean field will be added
+        // to the response. The matching subtitles will always come first" —
+        // OS does the hash-priority sorting for us when it's part of the
+        // same request.
+        //
+        // 🔥 Per docs: "Use imdb_id for movie or episode. Use parent_imdb_id
+        // for TV Shows." Our imdbId is always the SHOW's parent ID (from
+        // Stremio's "tt123:season:episode" format) — so TV requests must use
+        // parent_imdb_id + season_number + episode_number, never imdb_id.
+        const params = new URLSearchParams();
+        params.set('languages', lang.toLowerCase());
+        if (isTV) {
+            params.set('parent_imdb_id', String(cleanImdbId));
+            params.set('season_number', String(parseInt(season, 10)));
+            params.set('episode_number', String(parseInt(episode, 10)));
+            params.set('type', 'episode');
+        } else {
+            params.set('imdb_id', String(cleanImdbId));
+            params.set('type', 'movie');
         }
-    }
+        if (videoHash) params.set('moviehash', videoHash);
 
-    let poolUrl = `https://api.opensubtitles.com/api/v1/subtitles?languages=${lang}&imdb_id=${imdbId}&order_by=download_count&order_direction=desc`;
-    if (season && episode) poolUrl += `&season_number=${season}&episode_number=${episode}`;
-    const poolData = await searchOS(poolUrl, apiKey);
+        // 🔥 Per docs' Best Practices: server-side ordering is "expensive,
+        // time consuming" and blocks caching — we already do our own
+        // client-side release-token scoring below, so order_by/
+        // order_direction is dropped entirely.
 
-    if (poolData.data?.length) {
-        const poolEntries = poolData.data.map(s => ({
+        // 🔥 Per docs: "Avoid http redirection by sending request parameters
+        // sorted and without default values."
+        const sorted = new URLSearchParams([...params.entries()].sort((a, b) => a[0].localeCompare(b[0])));
+        const url = `https://api.opensubtitles.com/api/v1/subtitles?${sorted.toString()}`;
+
+        const data = await searchOS(url, apiKey);
+        if (!data.data?.length) return [];
+
+        const mapped = data.data.map(s => ({
             fileId: s.attributes.files[0].file_id,
-            releaseName: s.attributes.release || 'OS Search Match',
+            releaseName: s.attributes.release || 'OS Match',
             source: 'OpenSubtitles',
+            hashMatch: !!(s.attributes?.moviehash_match ?? s.moviehash_match),
             score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(s.attributes.release || '')) : 0
         }));
-        results.push(...poolEntries);
-    }
 
-    results.sort((a, b) => b.score - a.score);
-    const seen = new Set();
-    return results.filter(r => {
-        if (seen.has(r.fileId)) return false;
-        seen.add(r.fileId);
-        return true;
-    }).slice(0, limit);
+        // Hash matches are the strongest signal available (exact file match) — float them above our own token scoring.
+        mapped.sort((a, b) => {
+            if (a.hashMatch !== b.hashMatch) return a.hashMatch ? -1 : 1;
+            return b.score - a.score;
+        });
+
+        const seen = new Set();
+        return mapped.filter(r => {
+            if (seen.has(r.fileId)) return false;
+            seen.add(r.fileId);
+            return true;
+        }).slice(0, limit);
+    } catch { return []; }
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 2: SUBDL
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10, apiKey }) {
     try {
         const key = apiKey || CONFIG.SUBDL_API_KEY;
-        let url = `https://api.subdl.com/api/v1/subtitles?api_key=${key}&imdb_id=tt${imdbId}&languages=${lang.toLowerCase()}`;
-        
+        const isTV = !!(season && episode);
+
+        // 🔥 CRITICAL FIX: the old request never told SubDL which season/
+        // episode we wanted, so it searched the WHOLE show and depended
+        // entirely on local regex filtering afterward. season_number and
+        // episode_number are real, documented server-side filters — sending
+        // them stops wrong-season/wrong-episode results at the source.
+        const params = new URLSearchParams();
+        params.set('api_key', key);
+        params.set('imdb_id', `tt${imdbId}`);
+        params.set('languages', lang.toUpperCase());
+        params.set('subs_per_page', '30'); // 🔥 API max — old request had no override and silently got the default of 10
+        params.set('client', 'stremio');
+        if (isTV) {
+            params.set('type', 'tv');
+            params.set('season_number', String(parseInt(season, 10)));
+            params.set('episode_number', String(parseInt(episode, 10)));
+            // 🔥 unpack=1: for full-season packs, SubDL returns exact season/
+            // episode metadata + a direct download URL for EACH file inside —
+            // lets us target the correct episode precisely instead of
+            // guessing from filenames inside a zip.
+            params.set('unpack', '1');
+        } else {
+            params.set('type', 'movie');
+        }
+
+        const url = `https://api.subdl.com/api/v1/subtitles?${params.toString()}`;
         const res = await fetchWithTimeout(url);
         if (!res.ok) return [];
         const data = await res.json();
-        if (!data.subtitles?.length) return [];
-        
-        const scored = data.subtitles.map(sub => ({
-            id: sub.url,
-            releaseName: sub.release_name || 'SubDL Match',
-            downloadUrl: "https://dl.subdl.com" + (sub.url.startsWith('/') ? sub.url : '/' + sub.url),
-            source: 'SubDL',
-            score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(sub.release_name || '')) : 0
-        }));
-        
-        scored.sort((a, b) => b.score - a.score);
-        return scored.slice(0, limit);
+        if (!data.status || !data.subtitles?.length) return [];
+
+        const results = [];
+        for (const sub of data.subtitles) {
+            const isFullSeason = !!(sub.full_season ?? sub.Full_season);
+
+            // 🔥 Precise episode targeting inside a season pack
+            if (isTV && isFullSeason && Array.isArray(sub.unpack_files) && sub.unpack_files.length) {
+                const seasNum = parseInt(season, 10);
+                const epNum = parseInt(episode, 10);
+                const matchedFile = sub.unpack_files.find(f => parseInt(f.season, 10) === seasNum && parseInt(f.episode, 10) === epNum);
+                if (matchedFile) {
+                    const fileUrl = matchedFile.url.startsWith('/') ? matchedFile.url : `/${matchedFile.url}`;
+                    results.push({
+                        id: matchedFile.file_n_id || matchedFile.url,
+                        releaseName: matchedFile.release_name || sub.release_name || 'SubDL Match',
+                        downloadUrl: `https://dl.subdl.com${fileUrl}`,
+                        source: 'SubDL',
+                        score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(matchedFile.release_name || sub.release_name || '')) : 0
+                    });
+                    continue; // Exact file found — skip the whole-pack fallback below
+                }
+                // Requested episode wasn't listed in this pack's metadata — fall through to the old zip-scan path as a safety net.
+            }
+
+            const subUrl = sub.url.startsWith('/') ? sub.url : `/${sub.url}`;
+            results.push({
+                id: sub.url,
+                releaseName: sub.release_name || 'SubDL Match',
+                downloadUrl: `https://dl.subdl.com${subUrl}`,
+                source: 'SubDL',
+                score: releaseTokens.size ? releaseScore(releaseTokens, tokeniseRelease(sub.release_name || '')) : 0
+            });
+        }
+
+        results.sort((a, b) => b.score - a.score);
+        return results.slice(0, limit);
     } catch { return []; }
 }
-
 // 🔥 NEW HELPER: Bulletproof Archive Scanner (ZIP & RAR)
 function findEpisodeInArchive(entries, season, episode) {
     if (!season || !episode) return entries[0];
@@ -486,7 +547,7 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
         let url = `https://api.subsource.net/api/v1/subtitles?movieId=${movie.movieId}&language=${targetLang}`;
         if (season && episode) url += `&season=${season}&episode=${episode}`;
 
-        const res = await fetchWithTimeout(url, { headers: { 'X-API-Key': CONFIG.SUBSOURCE_KEY } });
+        const res = await fetchWithTimeout(url, { headers: { 'X-API-Key': key } });
         if (!res.ok) return [];
         
         const data = await res.json();
@@ -511,37 +572,13 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
 // ─────────────────────────────────────────────────────────────────────────────
 // MATH ENGINE (SDH DE-NOISER, SCALING, & DISTINCT CUT CHECKER)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// 🔥 SDH LINE CLEANER: strips [bracketed sound/description tags] and
-// (parenthetical asides), plus a leading "SPEAKER:" / "ROLE:" tag some SDH
-// tracks put at the start of a line to say who's talking. Works for Latin
-// and Arabic script alike, since it doesn't care what characters make up
-// the speaker name — only that a short prefix is followed by a colon.
-// The colon must be followed by whitespace/end-of-line (not immediately by
-// a digit) so real dialogue like "3:45" or "12:30" is never touched.
-function stripSdhFromLine(text) {
-    if (!text) return '';
-    let clean = text;
-    clean = clean.replace(/\[.*?\]/g, '');
-    clean = clean.replace(/\(.*?\)/g, '');
-    clean = clean.replace(/^\s*[-–—]?\s*[^:\n]{1,25}:(?=\s|$)\s*/, '');
-    return clean.trim();
-}
-
-
 function stripSdhAndClean(parsedArray) {
     let cleanArray = [];
     for (const line of parsedArray) {
-        const noTags = line.text.replace(/<[^>]+>/g, '');
-        const rawLines = noTags.split('\n');
-        const cleanLines = [];
-        for (const raw of rawLines) {
-            const cleanL = stripSdhFromLine(raw);
-            if (cleanL.length > 0) cleanLines.push(cleanL);
-        }
-        if (cleanLines.length > 0) {
-            cleanArray.push({ ...line, text: cleanLines.join('\n') });
-        }
+        let cleanText = line.text.replace(/<[^>]+>/g, '');
+        cleanText = cleanText.replace(/\[.*?\]/g, '');
+        cleanText = cleanText.replace(/\(.*?\)/g, '');
+        if (cleanText.trim().length > 0) cleanArray.push(line);
     }
     return cleanArray;
 }
@@ -784,12 +821,12 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
         let cleanParsed = [];
 
         // 🔥 Conditionally Remove SDH
-      if (userConfig.removeSdh) {
+        if (userConfig.removeSdh) {
             for (let i = 0; i < parsed.length; i++) {
                 let rawLines = parsed[i].text.split('\n');
                 let cleanLines = [];
                 for (let line of rawLines) {
-                    let cleanL = stripSdhFromLine(line);
+                    let cleanL = line.replace(/\[.*?\]/gs, '').replace(/\(.*?\)/gs, '').trim();
                     const hasLetters = /[a-zA-Z]/.test(cleanL);
                     if (hasLetters && cleanL === cleanL.toUpperCase()) continue;
                     if (cleanL.length > 0) cleanLines.push(cleanL);
@@ -875,8 +912,7 @@ async function runSubtitleEngine(args) {
             allowRouteA: userRow.allowRouteA !== 0,
             allowRouteB: userRow.allowRouteB !== 0,
             allowRouteC: userRow.allowRouteC !== 0,
-            strict4k: userRow.strict4k === 1,
-            separateRemux: userRow.separateRemux === 1
+            strict4k: userRow.strict4k === 1
         };
         const isTargetArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
         if (!userConfig.osKey) {
@@ -898,8 +934,8 @@ async function runSubtitleEngine(args) {
         const season        = idParts[1] ?? null;
         const episode       = idParts[2] ?? null;
         const videoHash     = args.extra?.videoHash ?? null;
-const releaseTokens = tokeniseRelease(streamName || '');
-        const streamTypeGroup = getReleaseTypeGroup(releaseTokens, userConfig.separateRemux);
+        const releaseTokens = tokeniseRelease(streamName || '');
+        const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
         const isTV          = !!(season && episode);
         const is4K          = releaseTokens.has('2160p') || releaseTokens.has('4k'); // 🔥 Track 4K state
 
@@ -908,7 +944,6 @@ const releaseTokens = tokeniseRelease(streamName || '');
 
 if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
         else if (streamTypeGroup?.startsWith('WEBRIP')) detectedType = 'WEBRip' + resTag;
-        else if (streamTypeGroup?.startsWith('REMUX')) detectedType = 'REMUX' + resTag;
         else if (streamTypeGroup?.startsWith('BLURAY')) detectedType = (releaseTokens.has('remux') ? 'REMUX' : 'BLURAY') + resTag;
         else if (streamTypeGroup?.startsWith('HDTV')) detectedType = 'HDTV' + resTag;
         else if (streamTypeGroup?.startsWith('DVD')) detectedType = 'DVD' + resTag;
@@ -925,7 +960,7 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 // 🔥 Cache Key now tracks all active configurations to avoid crossover
        const providerKey = `${userConfig.useOs?1:0}${userConfig.useSubdl?1:0}${userConfig.useSubsource?1:0}`;
        const routeKey = `${userConfig.allowRouteA?1:0}${userConfig.allowRouteB?1:0}${userConfig.allowRouteC?1:0}`;
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_remux${userConfig.separateRemux?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
        if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
@@ -982,7 +1017,7 @@ if (isTV) {
        let combinedEng = [
                 ...engOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...engSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
-                ...engSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': CONFIG.SUBSOURCE_KEY }) }))
+                ...engSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY }) }))
             ];
 
             const originalCount = combinedEng.length;
@@ -993,8 +1028,8 @@ if (isTV) {
             let seenTextSnippets = new Set(); 
 
             // 🔥 HELPER: Attempts to lock rulers for a specific group
-const tryLockTvRulers = async (targetGroup) => {
-                const strictEng = filterBaselinesByType(combinedEng, targetGroup, userConfig.separateRemux);
+            const tryLockTvRulers = async (targetGroup) => {
+                const strictEng = filterBaselinesByType(combinedEng, targetGroup);
                 for (const c of strictEng) {
                     if (osRulers.length >= CONFIG.TV_DISTINCT_CUTS_LIMIT) break;
                     const srt = await c.fetchFn();
@@ -1047,7 +1082,7 @@ if (osRulers.length === 0) {
             const allCandidates = [
                 ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
-                ...arSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': CONFIG.SUBSOURCE_KEY }) }))
+                ...arSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY }) }))
             ];
 
             let allSurvivingTvArabic = [];
@@ -1073,8 +1108,8 @@ if (osRulers.length === 0) {
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
 
-              const cTokens = tokeniseRelease(c.releaseName);
-                const cGroup = getReleaseTypeGroup(cTokens, userConfig.separateRemux);
+                const cTokens = tokeniseRelease(c.releaseName);
+                const cGroup = getReleaseTypeGroup(cTokens);
 
               // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
                 let candidatePassedRouteA = false;
@@ -1172,7 +1207,7 @@ if (osRulers.length === 0) {
   // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
-              const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), effectiveTypeGroup, userConfig.separateRemux).sort((a, b) => b.score - a.score);
+              const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
 let routeBCount = 0;
             for (const c of routeBCandidates) {
                 if (routeBCount >= 2) break;
@@ -1223,10 +1258,10 @@ let routeBCount = 0;
             let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
             // 🔥 HELPER: Attempts to lock rulers for a specific group
-           const tryLockMovieRulers = async (targetGroup) => {
-                const fOs = filterBaselinesByType(engOs, targetGroup, userConfig.separateRemux);
-                const fSubdl = filterBaselinesByType(engSubdl, targetGroup, userConfig.separateRemux);
-                const fSubsource = filterBaselinesByType(engSubsource, targetGroup, userConfig.separateRemux);
+            const tryLockMovieRulers = async (targetGroup) => {
+                const fOs = filterBaselinesByType(engOs, targetGroup);
+                const fSubdl = filterBaselinesByType(engSubdl, targetGroup);
+                const fSubsource = filterBaselinesByType(engSubsource, targetGroup);
                 
                 for (const c of fOs) {
                     if (osBaseline) break;
@@ -1299,8 +1334,8 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
                 if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
                 
-               const cTokens = tokeniseRelease(c.releaseName);
-                const cGroup = getReleaseTypeGroup(cTokens, userConfig.separateRemux);
+                const cTokens = tokeniseRelease(c.releaseName);
+                const cGroup = getReleaseTypeGroup(cTokens);
 
                 // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
                 let candidatePassedRouteA = false;
@@ -1418,7 +1453,7 @@ for (const champ of allSurvivingArabic) {
         // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[Movie Mode] Extracting Route B (Top 2 Raw Matches)...`);
-                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), effectiveTypeGroup, userConfig.separateRemux).sort((a, b) => b.score - a.score);
+                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
                 let routeBCount = 0;
                 
                 for (const c of routeBCandidates) {
@@ -1655,23 +1690,24 @@ app.post('/api/login', (req, res) => {
 app.post('/api/update', (req, res) => {
     const { 
         username, password, osKey, subdlKey, subsourceKey, targetLang, panelLang, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
-        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext, separateRemux
+        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext
     } = req.body;
     
     const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
     if (!user) return res.status(401).json({ error: "Authentication failed." });
     
     try {
-  db.prepare(`
+        db.prepare(`
             UPDATE users 
             SET osKey = ?, subdlKey = ?, subsourceKey = ?, targetLang = ?, panelLang = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
-                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?, separateRemux = ?
+                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?
             WHERE LOWER(username) = LOWER(?)
         `).run(
             osKey.trim(), subdlKey ? subdlKey.trim() : "", subsourceKey ? subsourceKey.trim() : "", targetLang || "ar", panelLang || "en", stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
-            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0, separateRemux ? 1 : 0,
+            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0,
             username
         );
+        
         const configStr = encodeURIComponent(JSON.stringify({ username: username }));
         const installLink = `stremio://${HOST.replace(/^https?:\/\//, '')}/${configStr}/manifest.json`;
         res.json({ success: true, message: "Settings saved!", installLink });
