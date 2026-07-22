@@ -350,7 +350,20 @@ async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, rel
         const sorted = new URLSearchParams([...params.entries()].sort((a, b) => a[0].localeCompare(b[0])));
         const url = `https://api.opensubtitles.com/api/v1/subtitles?${sorted.toString()}`;
 
-        const data = await searchOS(url, apiKey);
+       const data = await searchOS(url, apiKey);
+
+        // 🔥 TV-only diagnostic: reads the season number OS itself attached
+        // to each returned result (not what we asked for) — a mismatch here
+        // means OS ignored/misread our parent_imdb_id + season_number filter.
+        if (isTV) {
+            const seasonsSeen = [...new Set(
+                (data.data || [])
+                    .map(s => s.attributes?.feature_details?.season_number)
+                    .filter(v => v !== undefined && v !== null)
+            )];
+            console.log(`  🔍 [OpenSubtitles] Seasons in response: [${seasonsSeen.join(', ') || 'none — 0 results'}] (requested S${season}E${episode})`);
+        }
+
         if (!data.data?.length) return [];
 
         const mapped = data.data.map(s => ({
@@ -411,6 +424,19 @@ async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseToke
         const res = await fetchWithTimeout(url);
         if (!res.ok) return [];
         const data = await res.json();
+
+        // 🔥 TV-only diagnostic: reads the season number SubDL attached to
+        // each returned subtitle (not what we asked for) — confirms the
+        // provider actually understood our season_number/episode_number filter.
+        if (isTV) {
+            const seasonsSeen = [...new Set(
+                (data.subtitles || [])
+                    .map(sub => sub.season)
+                    .filter(v => v !== undefined && v !== null)
+            )];
+            console.log(`  🔍 [SubDL] Seasons in response: [${seasonsSeen.join(', ') || 'none — 0 results'}] (requested S${season}E${episode})`);
+        }
+
         if (!data.status || !data.subtitles?.length) return [];
 
         const results = [];
@@ -558,8 +584,19 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
         const sRes = await fetchWithTimeout(searchUrl, { headers: { 'X-API-Key': key } });
         if (!sRes.ok) return [];
 
-        const sData = await sRes.json();
+       const sData = await sRes.json();
         const candidates = sData.data || [];
+
+        // 🔥 TV-only diagnostic: reads the season number SubSource itself
+        // attached to each returned movie/season entry — confirms
+        // /movies/search actually understood our "season" filter and
+        // resolved the correct per-season movieId, rather than defaulting
+        // to an arbitrary one.
+        if (isTV) {
+            const seasonsSeen = [...new Set(candidates.map(m => m.season).filter(v => v !== undefined && v !== null))];
+            console.log(`  🔍 [SubSource] Seasons in response: [${seasonsSeen.join(', ') || 'none — 0 results'}] (requested S${season}E${episode})`);
+        }
+
         if (!candidates.length) return [];
 
         // Prefer whichever result's own "season" field actually matches —
