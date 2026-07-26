@@ -62,13 +62,10 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.8",
+    ADDON_VERSION: "1.3.9",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
-    SUBDL_API_KEY: "eOg4zBUtULlU4bnZNw8TxPuIeJabAnxp",
-    SUBSOURCE_KEY: "sk_5e25899dbf3a10bd8581778b2fa65698a50d27bec099309d24a185a29ea2bceb",
-    ADDIC7ED_COOKIE: process.env.ADDIC7ED_COOKIE || "", // Optional Cloudflare bypass
-
+   
     // ─── SEARCH & FETCH LIMITS ────────────────────────────────────────────────
     ARABIC_CANDIDATE_LIMIT: 30,        // Max Arabic subtitles to fetch per provider
     MOVIE_BASELINE_LIMIT: 100,           // Max English baselines to check per provider (Movies)
@@ -125,6 +122,23 @@ const subtitleCache = new Map();
 // 🔥 NEW: Caches the final calculated subtitle list for 2 hours to prevent API burn
 const responseCache = new Map();
 const CACHE_TTL_MS = 1000 * 60 * 60 * 2;
+
+// 🔥 PER-USER PROVIDER STATUS TRACKER (in-memory)
+// Reflects the outcome of the most recent REAL request made to each
+// provider for a given user — never a synthetic ping — so checking it never
+// costs extra API quota and always matches what's actually happening.
+const providerStatus = new Map();
+function setProviderStatus(username, provider, status) {
+    if (!username) return;
+    providerStatus.set(`${username.toLowerCase()}:${provider}`, { status, updatedAt: Date.now() });
+}
+function recordProviderHttpStatus(username, provider, httpStatus) {
+    let status = 'ok';
+    if (httpStatus === 429) status = 'limited';
+    else if (httpStatus === 401 || httpStatus === 403) status = 'invalid';
+    else if (httpStatus && httpStatus >= 400) status = 'error';
+    setProviderStatus(username, provider, status);
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // MANIFEST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -284,9 +298,10 @@ function formatTime(ms) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 1: OPENSUBTITLES
 // ─────────────────────────────────────────────────────────────────────────────
-async function searchOS(url, apiKey) {
+async function searchOS(url, apiKey, username) {
     try {
         const res = await fetchWithTimeout(url, { headers: { 'Api-Key': apiKey, 'User-Agent': `${CONFIG.ADDON_NAME} v${CONFIG.ADDON_VERSION}` } });
+        recordProviderHttpStatus(username, 'openSubtitles', res.status);
         if (!res.ok) return { data: [] };
         return await res.json();
     } catch { return { data: [] }; }
@@ -309,7 +324,7 @@ async function getOsSrt(fileId, apiKey) {
         return { text: decodeArabicFile(Buffer.from(buffer)) };
     } catch { return null; }
 }
-async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey }) {
+async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey, username }) {
     try {
         const isTV = !!(season && episode);
 
@@ -350,7 +365,7 @@ async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, rel
         const sorted = new URLSearchParams([...params.entries()].sort((a, b) => a[0].localeCompare(b[0])));
         const url = `https://api.opensubtitles.com/api/v1/subtitles?${sorted.toString()}`;
 
-       const data = await searchOS(url, apiKey);
+       const data = await searchOS(url, apiKey, username);
 
         // 🔥 TV-only diagnostic: reads the season number OS itself attached
         // to each returned result (not what we asked for) — a mismatch here
@@ -391,9 +406,12 @@ async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, rel
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 2: SUBDL
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10, apiKey }) {
+async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseTokens, limit = 10, apiKey, username }) {
     try {
-        const key = apiKey || CONFIG.SUBDL_API_KEY;
+        // 🔥 No shared fallback anymore — if this user hasn't set their own
+        // key, skip SubDL entirely rather than sending an empty/invalid one.
+        if (!apiKey) { setProviderStatus(username, 'subdl', 'noKey'); return []; }
+        const key = apiKey;
         const isTV = !!(season && episode);
 
         // 🔥 CRITICAL FIX: the old request never told SubDL which season/
@@ -420,10 +438,20 @@ async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseToke
             params.set('type', 'movie');
         }
 
-        const url = `https://api.subdl.com/api/v1/subtitles?${params.toString()}`;
+const url = `https://api.subdl.com/api/v1/subtitles?${params.toString()}`;
         const res = await fetchWithTimeout(url);
+        recordProviderHttpStatus(username, 'subdl', res.status);
         if (!res.ok) return [];
         const data = await res.json();
+
+        // 🔥 SubDL signals key/quota failures via a 200 OK response with
+        // {status:false, error:"..."} in the BODY, not a 401/403 HTTP code —
+        // recordProviderHttpStatus (which only sees res.status) can't catch
+        // this on its own, so we check the body's own status flag explicitly.
+        if (data.status === false) {
+            setProviderStatus(username, 'subdl', 'invalid');
+            return [];
+        }
 
         // 🔥 TV-only diagnostic: reads the season number SubDL attached to
         // each returned subtitle (not what we asked for) — confirms the
@@ -557,11 +585,13 @@ async function getArchiveSrt(url, season = null, episode = null, extraHeaders = 
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 3: SUBSOURCE
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, releaseTokens, limit = 10, apiKey }) {
+async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, releaseTokens, limit = 10, apiKey, username }) {
     try {
-        const key = apiKey || CONFIG.SUBSOURCE_KEY;
+        // 🔥 No shared fallback anymore — if this user hasn't set their own
+        // key, skip SubSource entirely rather than sending an empty/invalid one.
+        if (!apiKey) { setProviderStatus(username, 'subsource', 'noKey'); return []; }
+        const key = apiKey;
         const isTV = !!(season && episode);
-
         // 🔥 CRITICAL FIX: SubSource models EACH SEASON of a TV series as its
         // own distinct movieId — /movies/search documents a "season" filter
         // (example: "?searchType=text&q=...&season=1") and its response
@@ -580,13 +610,20 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
         searchParams.set('type', isTV ? 'series' : 'movie');
         if (isTV) searchParams.set('season', String(parseInt(season, 10)));
 
-        const searchUrl = `https://api.subsource.net/api/v1/movies/search?${searchParams.toString()}`;
+const searchUrl = `https://api.subsource.net/api/v1/movies/search?${searchParams.toString()}`;
         const sRes = await fetchWithTimeout(searchUrl, { headers: { 'X-API-Key': key } });
+        recordProviderHttpStatus(username, 'subsource', sRes.status);
         if (!sRes.ok) return [];
 
        const sData = await sRes.json();
+        // 🔥 Defensive: in case SubSource ever signals a failure via 200 OK
+        // + success:false (matches the response envelope in its own docs),
+        // rather than always risking res.status alone (like SubDL does).
+        if (sData.success === false) {
+            setProviderStatus(username, 'subsource', 'invalid');
+            return [];
+        }
         const candidates = sData.data || [];
-
         // 🔥 TV-only diagnostic: reads the season number SubSource itself
         // attached to each returned movie/season entry — confirms
         // /movies/search actually understood our "season" filter and
@@ -624,12 +661,16 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
         subParams.set('language', targetLang);
         subParams.set('limit', '100');
         subParams.set('sort', 'popular');
-
-        const url = `https://api.subsource.net/api/v1/subtitles?${subParams.toString()}`;
+const url = `https://api.subsource.net/api/v1/subtitles?${subParams.toString()}`;
         const res = await fetchWithTimeout(url, { headers: { 'X-API-Key': key } });
+        recordProviderHttpStatus(username, 'subsource', res.status);
         if (!res.ok) return [];
 
         const data = await res.json();
+        if (data.success === false) {
+            setProviderStatus(username, 'subsource', 'invalid');
+            return [];
+        }
         let subs = data.data || [];
 
         subs = subs.filter(s => s.language?.toLowerCase() === targetLang);
@@ -1001,6 +1042,11 @@ async function runSubtitleEngine(args) {
             strict4k: userRow.strict4k === 1
         };
         const isTargetArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
+        // 🔥 The real language tag every CONTENT winner (Route A/B/C, Blind
+        // Trust) should be pushed under — was hardcoded to "ara" everywhere,
+        // which is why English-target results were landing in Stremio's
+        // Arabic section regardless of what was actually fetched and synced.
+        const outputLang = isTargetArabic ? 'ara' : 'eng';
         if (!userConfig.osKey) {
             console.log(`❌ Blocked request: User ${username} has no OpenSubtitles Key in DB.`);
             const nokeyId = `nokey2_${Date.now()}.srt`;
@@ -1082,14 +1128,13 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 if (isTV) {
             console.log(`\n[TV Mode] Fetching OS Rulers + Arabic Candidates...`);
             let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey }) : [],
-                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15, apiKey: userConfig.subdlKey }) : [],
-                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15, apiKey: userConfig.subsourceKey }) : [],
-                userConfig.useOs ? fetchOsCandidates({ lang: userConfig.targetLang, imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }) : [],
-                userConfig.useSubdl ? fetchSubdlCandidates({ lang: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subdlKey }) : [],
-                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subsourceKey }) : []
+                userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.TV_BASELINE_FETCH_POOL, apiKey: activeOsKey, username }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: 15, apiKey: userConfig.subdlKey, username }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: 15, apiKey: userConfig.subsourceKey, username }) : [],
+                userConfig.useOs ? fetchOsCandidates({ lang: userConfig.targetLang, imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey, username }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subdlKey, username }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subsourceKey, username }) : []
             ]);
-
 // 🔥 NEW: Intercept API garbage
             engOs = enforceEpisodeMatch(engOs, season, episode);
             engSubdl = enforceEpisodeMatch(engSubdl, season, episode);
@@ -1103,7 +1148,7 @@ if (isTV) {
        let combinedEng = [
                 ...engOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...engSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
-                ...engSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY }) }))
+                ...engSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey }) }))
             ];
 
             const originalCount = combinedEng.length;
@@ -1168,7 +1213,7 @@ if (osRulers.length === 0) {
             const allCandidates = [
                 ...arOs.map(c => ({ ...c, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
-                ...arSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY }) }))
+                ...arSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey }) }))
             ];
 
             let allSurvivingTvArabic = [];
@@ -1224,16 +1269,16 @@ if (osRulers.length === 0) {
                         if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
                         const cacheId = `elite_tv_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                         subtitleCache.set(cacheId, blindText);
-                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}] ${c.releaseName}` });
+                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}] ${c.releaseName}` });
                     } catch(e) {}
                     continue; 
                 }
             }
      // 2. ALWAYS push the Clean English Rulers conditionally based on Route A
-            if (userConfig.allowRouteA) {
+           if (userConfig.allowRouteA) {
                 for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
                     const cleanEnglish = processEnglishRuler(osRulers[rIdx], `OS Cut ${rIdx+1}`, detectedType, isTV, releaseTokens, userConfig);
-                    if (cleanEnglish) finalOutput.push(cleanEnglish);
+                    if (cleanEnglish) finalOutput.push({ ...cleanEnglish, isRuler: true });
                 }
             }
 
@@ -1284,8 +1329,8 @@ if (osRulers.length === 0) {
                 
                 subtitleCache.set(cacheId, finalSrtText);
                 
-             finalOutput.push({
-                    id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara",
+            finalOutput.push({
+                    id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang,
                     title: `[Synced to ${candidate.matchedRuler} | ${candidate.alignmentPct.toFixed(0)}%] (${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms)\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
                 });
             }
@@ -1304,8 +1349,8 @@ let routeBCount = 0;
                     if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
                 }
 
-               const cSig = getComparableSignature(c.fetchedText, isTargetArabic, userConfig.removeSdh);
-                const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
+              const cSig = getComparableSignature(c.fetchedText, isTargetArabic, userConfig.removeSdh);
+                const isAlreadyInRouteA = finalOutput.filter(o => !o.isRuler).some(existing => {
                     const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
                     return existingSubText && getTextSignature(existingSubText, isTargetArabic) === cSig;
                 });
@@ -1320,7 +1365,7 @@ let routeBCount = 0;
                     if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
                     const cacheId = `elite_tv_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                     subtitleCache.set(cacheId, finalRouteBText);
-                    finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[⚠️ Route B | Raw Top Match]\n[${c.source}] ${c.releaseName}` });
+                   finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Top Match]\n[${c.source}] ${c.releaseName}` });
                     routeBCount++;
                 } catch(e) {}
             }
@@ -1331,14 +1376,14 @@ let routeBCount = 0;
         // =====================================================================
         else {
             console.log(`\n[Movie Mode] Fetching 3 Master Rulers + Candidates...`);
-            let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
-                userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey }) : [],
-                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: userConfig.subdlKey }) : [],
-                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: userConfig.subsourceKey }) : [],
+        let [engOs, engSubdl, engSubsource, arOs, arSubdl, arSubsource] = await Promise.all([
+                userConfig.useOs ? fetchOsCandidates({ lang: 'en', imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: activeOsKey, username }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: userConfig.subdlKey, username }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: 'en', imdbId, season, episode, releaseTokens, limit: CONFIG.MOVIE_BASELINE_LIMIT, apiKey: userConfig.subsourceKey, username }) : [],
                 
-                userConfig.useOs ? fetchOsCandidates({ lang: userConfig.targetLang, imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey }) : [],
-                userConfig.useSubdl ? fetchSubdlCandidates({ lang: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subdlKey }) : [],
-                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subsourceKey }) : []
+                userConfig.useOs ? fetchOsCandidates({ lang: userConfig.targetLang, imdbId, season, episode, videoHash, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: activeOsKey, username }) : [],
+                userConfig.useSubdl ? fetchSubdlCandidates({ lang: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subdlKey, username }) : [],
+                userConfig.useSubsource ? fetchSubsourceCandidates({ langCode: userConfig.targetLang, imdbId, season, episode, releaseTokens, limit: CONFIG.ARABIC_CANDIDATE_LIMIT, apiKey: userConfig.subsourceKey, username }) : []
             ]);
 
             let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
@@ -1361,7 +1406,7 @@ let routeBCount = 0;
                 }
                 for (const c of fSubsource) {
                     if (subsourceBaseline) break;
-                    const key = userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY;
+                    const key = userConfig.subsourceKey;
                     subsourceBaseline = await getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': key });
                     if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked [${targetGroup}]`); }
                 }
@@ -1392,7 +1437,7 @@ let routeBCount = 0;
             const allArabicCandidates = [
                 ...arOs.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getOsSrt(c.fileId, activeOsKey) })),
                 ...arSubdl.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl) })),
-                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': userConfig.subsourceKey || CONFIG.SUBSOURCE_KEY }) })),
+                ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': userConfig.subsourceKey }) })),
             ];
 
             let allSurvivingArabic = [];
@@ -1464,7 +1509,7 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                         if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
                         const cacheId = `elite_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                         subtitleCache.set(cacheId, blindText);
-                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
+                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
                     } catch(e) {}
                     continue; 
                 }
@@ -1513,9 +1558,12 @@ for (const champ of allSurvivingArabic) {
             }
            // 4. Push Clean English Rulers conditionally
            if (userConfig.allowRouteA) {
-               if (osBaseline) finalOutput.push(processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens, userConfig));
-               if (subdlBaseline) finalOutput.push(processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens, userConfig));
-               if (subsourceBaseline) finalOutput.push(processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens, userConfig));
+               const r1 = osBaseline ? processEnglishRuler(osBaseline, 'OpenSubtitles', detectedType, isTV, releaseTokens, userConfig) : null;
+               if (r1) finalOutput.push({ ...r1, isRuler: true });
+               const r2 = subdlBaseline ? processEnglishRuler(subdlBaseline, 'SubDL', detectedType, isTV, releaseTokens, userConfig) : null;
+               if (r2) finalOutput.push({ ...r2, isRuler: true });
+               const r3 = subsourceBaseline ? processEnglishRuler(subsourceBaseline, 'SubSource', detectedType, isTV, releaseTokens, userConfig) : null;
+               if (r3) finalOutput.push({ ...r3, isRuler: true });
            }
 // 5. Push the Top Arabic Winners
           for (const champ of topArabic) {
@@ -1529,9 +1577,8 @@ for (const champ of allSurvivingArabic) {
                 }
                 
                 subtitleCache.set(cacheId, finalSrtText);
-                
-               finalOutput.push({
-                    id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara",
+              finalOutput.push({
+                    id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang,
                     title: `[Synced to ${champ.rulerName} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
                 });
             }
@@ -1551,8 +1598,8 @@ for (const champ of allSurvivingArabic) {
                         if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
                     }
 
-                const cSig = getComparableSignature(c.fetchedText, isTargetArabic, userConfig.removeSdh);
-                    const isAlreadyInRouteA = finalOutput.filter(o => o.lang === 'ara').some(existing => {
+               const cSig = getComparableSignature(c.fetchedText, isTargetArabic, userConfig.removeSdh);
+                    const isAlreadyInRouteA = finalOutput.filter(o => !o.isRuler).some(existing => {
                         const existingSubText = subtitleCache.get(existing.id.split('/').pop() || existing.id) || "";
                         return existingSubText && getTextSignature(existingSubText, isTargetArabic) === cSig;
                     });
@@ -1568,7 +1615,7 @@ for (const champ of allSurvivingArabic) {
                         const cacheId = `elite_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                         subtitleCache.set(cacheId, finalRouteBText);
                         
-                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[⚠️ Route B | Raw Match]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
+                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Match]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
                         routeBCount++;
                     } catch(e) {}
                 }
@@ -1578,12 +1625,11 @@ for (const champ of allSurvivingArabic) {
 // FINAL DELIVERY & FALLBACK (ROUTE C)
 // =====================================================================
 // FINAL DELIVERY & FALLBACK (ROUTE C)
-        // =====================================================================
-        finalOutput = finalOutput.filter(item => item !== null);
-        const arabicWinnersCount = finalOutput.filter(sub => sub.lang === 'ara').length;
+finalOutput = finalOutput.filter(item => item !== null);
+        const winnersCount = finalOutput.filter(sub => !sub.isRuler).length;
 
       // 🔥 ROUTE C: If Route A and Route B both failed entirely, serve the absolute fallback
-        if (userConfig.allowRouteC && arabicWinnersCount === 0 && bestFallback) {
+        if (userConfig.allowRouteC && winnersCount === 0 && bestFallback) {
             console.log(`⚠️ Route A & B failed. Serving Route C (Fallback) from ${bestFallback.candidate.source}.`);
             let fallbackParsed;
             try {
@@ -1596,39 +1642,42 @@ for (const champ of allSurvivingArabic) {
             let finalSrtText = bestFallback.text;
             if (stripTags) finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
             subtitleCache.set(cacheId, finalSrtText);
-            finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: "ara", title: `[🔴 Route C | Fallback]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
+            finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[🔴 Route C | Fallback]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
         }
 
        if (finalOutput.length > 0) {
-            // 🔥 Enforce the Max Returned Subtitles config
-            const engSubs = finalOutput.filter(sub => sub.lang === 'eng');
-            const araSubs = finalOutput.filter(sub => sub.lang === 'ara').slice(0, userConfig.maxSubs);
-            finalOutput = [...engSubs, ...araSubs];
+            // 🔥 Enforce the Max Returned Subtitles config. Split on isRuler
+            // (not lang) — the Master Ruler and the real winners can share
+            // the same lang tag (both "eng") when the target language is
+            // English, so lang alone can no longer tell them apart.
+            const rulerSubs = finalOutput.filter(sub => sub.isRuler).map(({ isRuler, ...rest }) => rest);
+            const contentSubs = finalOutput.filter(sub => !sub.isRuler).slice(0, userConfig.maxSubs);
+            finalOutput = [...rulerSubs, ...contentSubs];
 
             console.log(`\n👑 --- MASTER RULERS USED ---`);
-            engSubs.forEach(r => console.log(`   ${r.title.replace('\n', ' | ')}`));
+            rulerSubs.forEach(r => console.log(`   ${r.title.replace('\n', ' | ')}`));
 
-            console.log(`\n🏆 --- ARABIC WINNERS ---`);
-            araSubs.forEach(sub => console.log(`   ${sub.title.replace('\n', ' | ')}`));
+            console.log(`\n🏆 --- WINNERS (${outputLang.toUpperCase()}) ---`);
+            contentSubs.forEach(sub => console.log(`   ${sub.title.replace('\n', ' | ')}`));
 
             console.log(`\n✅ [Done] ${finalOutput.length} total result(s) returned.`);
             
             if (userConfig.includeStats) {
                 const engineMode = isTV ? 'TV Show/Series' : 'Movie';
                 const serviceTag = streamingService ? ` [${streamingService}]` : '';
-                const totalAra = araSubs.length;
-                const totalEng = engSubs.length;
-                const statsText = `1\n00:00:01,000 --> 00:40:00,000\n{\\an7}<font color="#00ffcc"><b>[ 📊 BRLM Subs: Stats for Nerds ]</b></font>\n<font color="#cccccc"><b>Version:</b> ${CONFIG.ADDON_VERSION}\n<b>Engine:</b> ${engineMode}\n<b>Stream Type:</b> ${detectedType}${serviceTag}\n<b>File Name:</b> ${streamName || 'Unknown'}\n<b>Result:</b> ${totalAra} Arabic Syncs | ${totalEng} Master Rulers</font>`;
+                const totalWinners = contentSubs.length;
+                const totalRulers = rulerSubs.length;
+                const statsText = `1\n00:00:01,000 --> 00:40:00,000\n{\\an7}<font color="#00ffcc"><b>[ 📊 BRLM Subs: Stats for Nerds ]</b></font>\n<font color="#cccccc"><b>Version:</b> ${CONFIG.ADDON_VERSION}\n<b>Engine:</b> ${engineMode}\n<b>Stream Type:</b> ${detectedType}${serviceTag}\n<b>File Name:</b> ${streamName || 'Unknown'}\n<b>Result:</b> ${totalWinners} ${outputLang === 'ara' ? 'Arabic' : 'English'} Syncs | ${totalRulers} Master Rulers</font>`;
                 const statsCacheId = `stats_nerds_${Date.now()}.srt`;
                 subtitleCache.set(statsCacheId, statsText);
                 finalOutput.unshift({ id: statsCacheId, url: `${HOST}/dl/${statsCacheId}`, lang: "eng", title: `📊 Stats for Nerds (Debug Info)` });
             }
 
-            // 🔥 BUG FIX: Only save to cache if we actually found Arabic subtitles.
-            if (araSubs.length > 0) {
+            // 🔥 Only save to cache if we actually found real winners.
+            if (contentSubs.length > 0) {
                 responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
             } else {
-                console.log(`⚠️ Zero Arabic subs generated. Skipping cache to allow immediate retries.`);
+                console.log(`⚠️ Zero winners generated. Skipping cache to allow immediate retries.`);
             }
             
             return { subtitles: finalOutput };
@@ -1800,6 +1849,18 @@ app.post('/api/update', (req, res) => {
     } catch (e) {
         res.status(500).json({ error: "Failed to update settings." });
     }
+});
+
+app.get('/api/provider-status', (req, res) => {
+    const username = (req.query.username || '').toLowerCase();
+    if (!username) return res.status(400).json({ error: 'Missing username' });
+    const providers = ['openSubtitles', 'subdl', 'subsource'];
+    const result = {};
+    for (const p of providers) {
+        const entry = providerStatus.get(`${username}:${p}`);
+        result[p] = entry ? entry.status : 'unknown';
+    }
+    res.json(result);
 });
 
 app.get('/dl/:cacheId', (req, res) => {
