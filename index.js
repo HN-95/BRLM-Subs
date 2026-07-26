@@ -62,7 +62,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.3.9",
+    ADDON_VERSION: "1.4.0",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -139,6 +139,71 @@ function recordProviderHttpStatus(username, provider, httpStatus) {
     else if (httpStatus && httpStatus >= 400) status = 'error';
     setProviderStatus(username, provider, status);
 }
+
+// 🔥 RELIABILITY #1 — CIRCUIT BREAKER: if a provider JUST told us (via a
+// real request) that it's rate-limited or the key is invalid, skip it for
+// a short cooldown instead of waiting out a full 6-8s timeout on a request
+// that's essentially guaranteed to fail again. This is a fast-fail, not a
+// permanent block — cooldowns are short so a provider that recovers (rate
+// limit window passes) or gets a fresh key isn't stuck "off" for long.
+const PROVIDER_COOLDOWN_MS = { limited: 60 * 1000, invalid: 5 * 60 * 1000, error: 30 * 1000 };
+function isProviderCoolingDown(username, provider) {
+    if (!username) return false;
+    const entry = providerStatus.get(`${username.toLowerCase()}:${provider}`);
+    if (!entry) return false;
+    const cooldown = PROVIDER_COOLDOWN_MS[entry.status];
+    if (!cooldown) return false;
+    return (Date.now() - entry.updatedAt) < cooldown;
+}
+
+// 🔥 RELIABILITY #2 — BOUNDED-CONCURRENCY PREFETCH: downloads several
+// candidates' subtitle text in small parallel batches instead of one at a
+// time, cutting real wall-clock wait time. Deliberately capped (not "fetch
+// everything at once") so a single request never opens dozens of
+// simultaneous outbound connections — that would spike memory holding many
+// response bodies at once AND risk tripping a provider's own rate limit,
+// which is exactly the kind of self-inflicted slowdown this is meant to
+// avoid. This only changes WHEN the download happens (earlier, in
+// parallel) — every candidate is still evaluated in its original order
+// afterward, so none of the existing selection/scoring/math logic changes.
+const PREFETCH_BATCH_SIZE = 4;
+async function prefetchInBatches(candidates, batchSize = PREFETCH_BATCH_SIZE) {
+    for (let i = 0; i < candidates.length; i += batchSize) {
+        const batch = candidates.slice(i, i + batchSize);
+        await Promise.all(batch.map(async c => {
+            try { c._prefetched = await c.fetchFn(); } catch { c._prefetched = null; }
+        }));
+    }
+}
+
+// 🔥 RELIABILITY #3 — subtitleCache previously had no eviction at all:
+// every generated .srt lived in memory for the life of the process. Map
+// preserves insertion order, so we can safely trim the OLDEST entries once
+// the cache grows past a sane size — zero changes needed at any of the
+// existing .set() call sites throughout the file. Checked infrequently
+// (every 15 min) since it's a maintenance sweep, not something that needs
+// to run on the request hot path.
+const MAX_SUBTITLE_CACHE_ENTRIES = 1500;
+setInterval(() => {
+    if (subtitleCache.size <= MAX_SUBTITLE_CACHE_ENTRIES) return;
+    const excess = subtitleCache.size - MAX_SUBTITLE_CACHE_ENTRIES;
+    const it = subtitleCache.keys();
+    for (let i = 0; i < excess; i++) {
+        const oldestKey = it.next().value;
+        if (oldestKey === undefined) break;
+        subtitleCache.delete(oldestKey);
+    }
+    console.log(`🧹 [Cache Sweep] Trimmed ${excess} oldest subtitle cache entries (cap: ${MAX_SUBTITLE_CACHE_ENTRIES}).`);
+}, 15 * 60 * 1000);
+
+// 🔥 RELIABILITY #5 — IN-FLIGHT REQUEST COALESCING: if two requests for the
+// same user+title arrive while the first is still running (e.g. the
+// background autoFetchNext pre-cacher overlapping with a real foreground
+// request for the same episode, or Stremio firing a duplicate call), the
+// second one just awaits the first's result instead of running the entire
+// fetch-and-sync pipeline — and burning provider API quota — a second time
+// for identical work.
+const inFlightRequests = new Map();
 // ─────────────────────────────────────────────────────────────────────────────
 // MANIFEST
 // ─────────────────────────────────────────────────────────────────────────────
@@ -326,6 +391,11 @@ async function getOsSrt(fileId, apiKey) {
 }
 async function fetchOsCandidates({ lang, imdbId, season, episode, videoHash, releaseTokens, limit = 10, apiKey, username }) {
     try {
+        // 🔥 Circuit breaker: skip a provider that JUST rate-limited/rejected us
+        if (isProviderCoolingDown(username, 'openSubtitles')) {
+            console.log(`  🛑 [Circuit Breaker] Skipping OpenSubtitles (recent limited/invalid status).`);
+            return [];
+        }
         const isTV = !!(season && episode);
 
         // 🔥 Per docs: "Remove leading zeroes in ID parameters (IMDB ID, TMDB ID...)"
@@ -411,6 +481,11 @@ async function fetchSubdlCandidates({ imdbId, lang, season, episode, releaseToke
         // 🔥 No shared fallback anymore — if this user hasn't set their own
         // key, skip SubDL entirely rather than sending an empty/invalid one.
         if (!apiKey) { setProviderStatus(username, 'subdl', 'noKey'); return []; }
+        // 🔥 Circuit breaker: skip a provider that JUST rate-limited/rejected us
+        if (isProviderCoolingDown(username, 'subdl')) {
+            console.log(`  🛑 [Circuit Breaker] Skipping SubDL (recent limited/invalid status).`);
+            return [];
+        }
         const key = apiKey;
         const isTV = !!(season && episode);
 
@@ -590,6 +665,11 @@ async function fetchSubsourceCandidates({ imdbId, langCode, season, episode, rel
         // 🔥 No shared fallback anymore — if this user hasn't set their own
         // key, skip SubSource entirely rather than sending an empty/invalid one.
         if (!apiKey) { setProviderStatus(username, 'subsource', 'noKey'); return []; }
+        // 🔥 Circuit breaker: skip a provider that JUST rate-limited/rejected us
+        if (isProviderCoolingDown(username, 'subsource')) {
+            console.log(`  🛑 [Circuit Breaker] Skipping SubSource (recent limited/invalid status).`);
+            return [];
+        }
         const key = apiKey;
         const isTV = !!(season && episode);
         // 🔥 CRITICAL FIX: SubSource models EACH SEASON of a TV series as its
@@ -1158,13 +1238,27 @@ if (isTV) {
    let osRulers = []; 
             let seenTextSnippets = new Set(); 
 
-            // 🔥 HELPER: Attempts to lock rulers for a specific group
+            // 🔥 HELPER: Attempts to lock rulers for a specific group.
+            // Downloads happen in small concurrent batches (network I/O
+            // parallelized) but are still EVALUATED in the exact original
+            // order, one at a time — so which candidate becomes "Ruler 1" vs
+            // "Ruler 2" and the distinct-cut comparisons are unchanged from
+            // before. We check the early-exit condition BETWEEN batches (and
+            // mid-batch) so once enough rulers are locked we stop launching
+            // further downloads instead of eagerly fetching a whole extra
+            // batch we no longer need.
             const tryLockTvRulers = async (targetGroup) => {
                 const strictEng = filterBaselinesByType(combinedEng, targetGroup);
-                for (const c of strictEng) {
+                for (let i = 0; i < strictEng.length; i += PREFETCH_BATCH_SIZE) {
                     if (osRulers.length >= CONFIG.TV_DISTINCT_CUTS_LIMIT) break;
-                    const srt = await c.fetchFn();
-                    if (srt) {
+                    const batch = strictEng.slice(i, i + PREFETCH_BATCH_SIZE);
+                    const batchResults = await Promise.all(batch.map(async c => {
+                        try { return { c, srt: await c.fetchFn() }; } catch { return { c, srt: null }; }
+                    }));
+
+                    for (const { c, srt } of batchResults) {
+                        if (osRulers.length >= CONFIG.TV_DISTINCT_CUTS_LIMIT) break;
+                        if (!srt) continue;
                         const textSnippet = srt.text.substring(0, 200).trim();
                         if (seenTextSnippets.has(textSnippet)) continue;
                         seenTextSnippets.add(textSnippet);
@@ -1205,6 +1299,17 @@ if (osRulers.length === 0) {
                 console.log(`⚠️ No TV Rulers locked. Skipping Route A.`);
             }
 
+            // 🔥 BUG FIX: precomputed once so the gauntlet loop below can
+            // cheaply skip any "content" candidate that's textually IDENTICAL
+            // to a Master Ruler (this happens when target language == 'en',
+            // since the ruler and content pools then query the same provider
+            // for the same language and can return the same file). Syncing a
+            // file against itself produces a near-perfect "winner" that's the
+            // same subtitle as the Master Ruler — except the Ruler never
+            // applies stripTags/removeSdh while a real winner does, so it
+            // looked like "the same subtitle twice, one formatted, one not."
+            const rulerSignatures = osRulers.map(r => getTextSignature(r.text, isTargetArabic));
+
             // 🔥 Whichever group actually backs our locked ruler(s) — if we fell
             // back from 4K to 1080p, Route B must match against 1080p too.
             // Arabic releases are almost never tagged "4K", so filtering Route B
@@ -1222,23 +1327,43 @@ if (osRulers.length === 0) {
             const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
             const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
 
-            console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
-            for (let i = 0; i < allCandidates.length; i++) {
-                const c = allCandidates[i];
-
-                if (userConfig.engineStrength === 5 && userCuts.length > 0) {
+            // 🔥 Apply the cheap, synchronous cut-focus filter BEFORE
+            // prefetching — so we never waste a network download on a
+            // candidate we were going to skip anyway. allCandidates itself
+            // stays untouched (Route B below still needs the full list).
+            let tvCandidatesToProcess = allCandidates;
+            if (userConfig.engineStrength === 5 && userCuts.length > 0) {
+                tvCandidatesToProcess = allCandidates.filter(c => {
                     const cTokens = tokeniseRelease(c.releaseName);
                     const hasMatchingCut = userCuts.some(cut => cTokens.has(cut) || (cut === 'dc' && cTokens.has('director')) || (cut === 'director' && cTokens.has('dc')));
-                    if (!hasMatchingCut) {
-                        console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
-                        continue;
-                    }
-                }
-        const arabicData = await c.fetchFn();
-                if (!arabicData) continue;
-                c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
-                if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
+                    if (!hasMatchingCut) console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
+                    return hasMatchingCut;
+                });
+            }
+            await prefetchInBatches(tvCandidatesToProcess);
 
+            console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
+            for (let i = 0; i < tvCandidatesToProcess.length; i++) {
+                const c = tvCandidatesToProcess[i];
+
+             const arabicData = c._prefetched;
+                if (!arabicData) continue;
+
+                // 🔥 BUG FIX: skip a candidate that's literally the same file
+                // as an already-locked Master Ruler. Checked BEFORE
+                // .fetchedText is set, so Route B can't independently
+                // re-surface it either.
+                if (rulerSignatures.some(sig => sig.length > 50 && sig === getTextSignature(arabicData.text, isTargetArabic))) {
+                    continue;
+                }
+
+                c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
+                // 🔥 Route C should hand back the BEST-scoring fallback, not
+                // just whichever candidate happened to download first —
+                // score is already computed by each provider's fetch step.
+                if (!bestFallback || c.score > bestFallback.candidate.score) {
+                    bestFallback = { candidate: c, text: arabicData.text };
+                }
                 const cTokens = tokeniseRelease(c.releaseName);
                 const cGroup = getReleaseTypeGroup(cTokens);
 
@@ -1388,28 +1513,42 @@ let routeBCount = 0;
 
             let osBaseline = null, subdlBaseline = null, subsourceBaseline = null;
 
-            // 🔥 HELPER: Attempts to lock rulers for a specific group
+            // 🔥 HELPER: Attempts to lock rulers for a specific group. These
+            // three providers' rulers are fully independent of each other
+            // (no shared distinct-cut bookkeeping like TV mode has), so
+            // running them concurrently rather than one-after-another cuts
+            // wall-clock ruler-locking time roughly to the slowest of the
+            // three instead of the sum of all three. Each provider's own
+            // loop still stops at its first success — unchanged.
             const tryLockMovieRulers = async (targetGroup) => {
                 const fOs = filterBaselinesByType(engOs, targetGroup);
                 const fSubdl = filterBaselinesByType(engSubdl, targetGroup);
                 const fSubsource = filterBaselinesByType(engSubsource, targetGroup);
-                
-                for (const c of fOs) {
-                    if (osBaseline) break;
-                    osBaseline = await getOsSrt(c.fileId, activeOsKey);
-                    if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked [${targetGroup}]`); }
-                }
-                for (const c of fSubdl) {
-                    if (subdlBaseline) break;
-                    subdlBaseline = await getArchiveSrt(c.downloadUrl);
-                    if (subdlBaseline) { subdlBaseline.candidate = c; console.log(`  ✅ SubDL Ruler locked [${targetGroup}]`); }
-                }
-                for (const c of fSubsource) {
-                    if (subsourceBaseline) break;
-                    const key = userConfig.subsourceKey;
-                    subsourceBaseline = await getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': key });
-                    if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked [${targetGroup}]`); }
-                }
+
+                await Promise.all([
+                    (async () => {
+                        for (const c of fOs) {
+                            if (osBaseline) break;
+                            osBaseline = await getOsSrt(c.fileId, activeOsKey);
+                            if (osBaseline) { osBaseline.candidate = c; console.log(`  ✅ OS Ruler locked [${targetGroup}]`); }
+                        }
+                    })(),
+                    (async () => {
+                        for (const c of fSubdl) {
+                            if (subdlBaseline) break;
+                            subdlBaseline = await getArchiveSrt(c.downloadUrl);
+                            if (subdlBaseline) { subdlBaseline.candidate = c; console.log(`  ✅ SubDL Ruler locked [${targetGroup}]`); }
+                        }
+                    })(),
+                    (async () => {
+                        for (const c of fSubsource) {
+                            if (subsourceBaseline) break;
+                            const key = userConfig.subsourceKey;
+                            subsourceBaseline = await getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': key });
+                            if (subsourceBaseline) { subsourceBaseline.candidate = c; console.log(`  ✅ SubSource Ruler locked [${targetGroup}]`); }
+                        }
+                    })()
+                ]);
             };
 
             await tryLockMovieRulers(streamTypeGroup);
@@ -1426,9 +1565,15 @@ let routeBCount = 0;
                 } else {
                     console.log(`🛡️ 4K Strictness Shield Active: Refusing to fall back to 1080p baselines.`);
                 }
-           } else if (!hasMovieRulers) {
+          } else if (!hasMovieRulers) {
                 console.log(`⚠️ No Movie Rulers locked. Skipping Route A.`);
             }
+
+            // 🔥 BUG FIX: same self-sync duplicate protection as TV mode —
+            // see the matching comment there for the full explanation.
+            const rulerSignatures = [osBaseline, subdlBaseline, subsourceBaseline]
+                .filter(Boolean)
+                .map(r => getTextSignature(r.text, isTargetArabic));
 
             // 🔥 Whichever group actually backs our locked ruler(s) — if we fell
             // back from 4K to 1080p, Route B must match against 1080p too.
@@ -1447,23 +1592,42 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
             const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
             const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
 
-            console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
-            for (let i = 0; i < allArabicCandidates.length; i++) {
-                const c = allArabicCandidates[i];
-
-                if (userConfig.engineStrength === 5 && userCuts.length > 0) {
+            // 🔥 Apply the cheap, synchronous cut-focus filter BEFORE
+            // prefetching — so we never waste a network download on a
+            // candidate we were going to skip anyway. allArabicCandidates
+            // itself stays untouched (Route B below still needs the full list).
+            let movieCandidatesToProcess = allArabicCandidates;
+            if (userConfig.engineStrength === 5 && userCuts.length > 0) {
+                movieCandidatesToProcess = allArabicCandidates.filter(c => {
                     const cTokens = tokeniseRelease(c.releaseName);
                     const hasMatchingCut = userCuts.some(cut => cTokens.has(cut) || (cut === 'dc' && cTokens.has('director')) || (cut === 'director' && cTokens.has('dc')));
-                    if (!hasMatchingCut) {
-                        console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
-                        continue;
-                    }
+                    if (!hasMatchingCut) console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
+                    return hasMatchingCut;
+                });
+            }
+            await prefetchInBatches(movieCandidatesToProcess);
+
+            console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
+            for (let i = 0; i < movieCandidatesToProcess.length; i++) {
+                const c = movieCandidatesToProcess[i];
+
+              const arabicData = c._prefetched;
+                if (!arabicData) continue;
+
+                // 🔥 BUG FIX: skip a candidate that's literally the same file
+                // as an already-locked Master Ruler. Checked BEFORE
+                // .fetchedText is set, so Route B can't independently
+                // re-surface it either.
+                if (rulerSignatures.some(sig => sig.length > 50 && sig === getTextSignature(arabicData.text, isTargetArabic))) {
+                    continue;
                 }
 
-         const arabicData = await c.fetchFn();
-                if (!arabicData) continue;
                 c.fetchedText = arabicData.text; // 🔥 Cache for Route B & C
-                if (!bestFallback) bestFallback = { candidate: c, text: arabicData.text };
+                // 🔥 Route C should hand back the BEST-scoring fallback, not
+                // just whichever candidate happened to download first.
+                if (!bestFallback || c.score > bestFallback.candidate.score) {
+                    bestFallback = { candidate: c, text: arabicData.text };
+                }
                 
                 const cTokens = tokeniseRelease(c.releaseName);
                 const cGroup = getReleaseTypeGroup(cTokens);
@@ -1692,12 +1856,33 @@ finalOutput = finalOutput.filter(item => item !== null);
     }
 } // <--- The engine is now cleanly sealed with this bracket
 
+// 🔥 RELIABILITY #5 (continued): thin wrapper applied at BOTH places
+// runSubtitleEngine gets called (the live request handler below, and the
+// background autoFetchNext pre-cacher) — so a live request and a
+// background pre-cache for the exact same user+episode that happen to
+// overlap in time share one execution instead of duplicating the entire
+// fetch-and-sync pipeline. Falls through unchanged if nothing is in flight.
+async function runSubtitleEngineCoalesced(args) {
+    const coalesceKey = `${(args.config?.username || 'anon').toLowerCase()}:${args.id}`;
+    if (inFlightRequests.has(coalesceKey)) {
+        console.log(`\n⏳ [Coalesced] Joining in-flight request for ${args.id} instead of duplicating work.`);
+        return inFlightRequests.get(coalesceKey);
+    }
+    const enginePromise = runSubtitleEngine(args);
+    inFlightRequests.set(coalesceKey, enginePromise);
+    try {
+        return await enginePromise;
+    } finally {
+        inFlightRequests.delete(coalesceKey);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // THE TRAFFIC COP (Main Handler & Smart Background Pre-Cacher)
 // ─────────────────────────────────────────────────────────────────────────────
 builder.defineSubtitlesHandler(async (args) => {
     // 1. Await the actual request so the user gets their subtitles instantly
-    const result = await runSubtitleEngine(args);
+    const result = await runSubtitleEngineCoalesced(args);
 
     // 2. Smart Fire-and-Forget Pre-fetcher!
     let autoFetchNext = true; // Default to ON
@@ -1763,7 +1948,7 @@ builder.defineSubtitlesHandler(async (args) => {
 }
 
                 console.log(`\n⏳ [Pre-Cache Daemon] Queuing background sync for next episode: ${nextEpArgs.id}...`);
-                await runSubtitleEngine(nextEpArgs);
+                await runSubtitleEngineCoalesced(nextEpArgs);
             }
         })().catch(err => {
             console.log(`[Pre-Cache] Background task aborted silently.`);
