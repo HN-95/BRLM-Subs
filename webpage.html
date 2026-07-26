@@ -31,18 +31,35 @@
             .api-group { display:flex; align-items:center; margin-top:10px; gap: 10px; margin-bottom:10px; }
             .api-group input { margin:0; flex:1; }
             .api-group button { width:auto; margin:0; padding:12px 15px; font-size: 0.9rem; }
-
-            /* 🔥 Mobile Adjustments */
+            .provider-status { display:inline-block; font-size:0.68rem; font-weight:bold; padding:2px 8px; border-radius:10px; margin-left:6px; vertical-align:middle; white-space:nowrap; }
+            .provider-status.status-ok { background:rgba(76,175,80,.15); color:#4caf50; border:1px solid #4caf50; }
+            .provider-status.status-limited, .provider-status.status-invalid { background:rgba(255,76,76,.15); color:#ff4c4c; border:1px solid #ff4c4c; }
+            .provider-status.status-error { background:rgba(255,193,7,.15); color:#ffc107; border:1px solid #ffc107; }
+            .provider-status.status-noKey, .provider-status.status-unknown { background:rgba(160,160,160,.15); color:#a0a0a0; border:1px solid #666; }
+            .toast-container { position:fixed; top:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:10px; pointer-events:none; max-width:min(340px, calc(100vw - 40px)); }
+            .toast { pointer-events:auto; position:relative; overflow:hidden; background:#202020; border:1px solid #333; border-left:4px solid #4caf50; color:#e5e5e5; padding:14px 18px; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,.45); font-size:0.9rem; font-weight:600; display:flex; align-items:center; gap:10px; transform:translateX(120%) scale(0.9); opacity:0; animation:toastIn 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+            .toast.error { border-left-color:#ff4c4c; }
+            .toast.hide { animation:toastOut 0.35s ease-in forwards; }
+            .toast .toast-icon { font-size:1.2rem; flex-shrink:0; }
+            .toast .toast-bar { position:absolute; left:0; bottom:0; height:3px; width:100%; background:#4caf50; opacity:.6; animation:toastShrink linear forwards; }
+            .toast.error .toast-bar { background:#ff4c4c; }
+            @keyframes toastIn { 0% { transform:translateX(120%) scale(0.9); opacity:0; } 60% { transform:translateX(-8px) scale(1.02); opacity:1; } 100% { transform:translateX(0) scale(1); opacity:1; } }
+            @keyframes toastOut { to { transform:translateX(120%) scale(0.9); opacity:0; } }
+            @keyframes toastShrink { from { width:100%; } to { width:0%; } }
+           /* 🔥 Mobile Adjustments */
             @media (max-width: 600px) {
                 .container { padding: 20px 15px; }
                 .grid-labels { grid-template-columns: 1fr; }
                 h1 { font-size: 1.6rem; }
                 .api-group { gap: 5px; }
                 .api-group button { padding: 12px 10px; font-size: 0.8rem; }
+                .toast-container { top: 12px; right: 12px; max-width: calc(100vw - 24px); }
+                .toast { font-size: 0.85rem; padding: 12px 14px; }
             }
         </style>
     </head>
     <body>
+         <div id="toastContainer" class="toast-container"></div>
         <div class="container" id="authBox">
             <h1>BRLM Subtitles | Dashboard</h1>
             <p data-i18n="authDesc">Welcome. Please authenticate.</p>
@@ -97,11 +114,11 @@
             <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpRoutes">Providers & Routes</label>
                 <div class="grid-labels">
-                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles</label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles <span class="provider-status status-unknown" id="statusOs">–</span></label>
                     <label class="check-label"><input type="checkbox" id="cfgAllowRouteA"> <b data-i18n="routeA">Route A</b></label>
-                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL</label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL <span class="provider-status status-unknown" id="statusSubdl">–</span></label>
                     <label class="check-label"><input type="checkbox" id="cfgAllowRouteB"> <b data-i18n="routeB">Route B</b></label>
-                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource</label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource <span class="provider-status status-unknown" id="statusSubsource">–</span></label>
                     <label class="check-label"><input type="checkbox" id="cfgAllowRouteC"> <b data-i18n="routeC">Route C</b></label>
                 </div>
             </div>
@@ -143,13 +160,14 @@
         </div>
 
         <script>
-		    const BACKEND_URL = "";
+		    const BACKEND_URL = "http://127.0.0.1:7000";
             const dict = {
                 en: {
                     authDesc: "Welcome. Please authenticate.", login: "Login", register: "Register",
                     userPh: "Username", passPh: "Password", confirmPh: "Re-enter Password",
                     dashTitle: "Dashboard", dashWelcome: "Welcome, ",
-                    grpKeys: "API Providers", osKey: "OpenSubtitles API Key (Required)", subdlKey: "SubDL API Key (Optional)", subsourceKey: "SubSource API Key (Optional)", show: "Show", hide: "Hide",
+                    grpKeys: "API Providers", osKey: "OpenSubtitles API Key (Required)", subdlKey: "SubDL API Key (required to enable SubDL)", subsourceKey: "SubSource API Key (required to enable SubSource)", show: "Show", hide: "Hide",
+                    warnNoSubdl: "SubDL is enabled but no key is set — it won't return results.", warnNoSubsource: "SubSource is enabled but no key is set — it won't return results.",
                     grpLang: "Language Extraction", langAr: "Arabic", langEn: "English",
                     grpRoutes: "Providers & Routes", routeA: "Route A (Math Sync)", routeB: "Route B (Raw Match)", routeC: "Route C (Fallback)",
                    grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield", chkRemux: "Separate Remux from BluRay",
@@ -160,19 +178,26 @@
                     authDesc: "مرحباً. يرجى تسجيل الدخول.", login: "دخول", register: "حساب جديد",
                     userPh: "اسم المستخدم", passPh: "كلمة المرور", confirmPh: "إعادة كلمة المرور",
                     dashTitle: "لوحة التحكم", dashWelcome: "أهلاً، ",
-                    grpKeys: "مفاتيح المصادر", osKey: "مفتاح OpenSubtitles (مطلوب)", subdlKey: "مفتاح SubDL (اختياري)", subsourceKey: "مفتاح SubSource (اختياري)", show: "إظهار", hide: "إخفاء",
+                    grpKeys: "مفاتيح المصادر", osKey: "مفتاح OpenSubtitles (مطلوب)", subdlKey: "مفتاح SubDL (مطلوب لتفعيل SubDL)", subsourceKey: "مفتاح SubSource (مطلوب لتفعيل SubSource)", show: "إظهار", hide: "إخفاء",
+                    warnNoSubdl: "خدمة SubDL مفعّلة لكن لا يوجد مفتاح — لن تُرجع نتائج.", warnNoSubsource: "خدمة SubSource مفعّلة لكن لا يوجد مفتاح — لن تُرجع نتائج.",
                     grpLang: "لغة الترجمة المطلوبة", langAr: "العربية", langEn: "الإنجليزية",
                     grpRoutes: "الخوادم والمسارات", routeA: "المسار A (المزامنة الذكية)", routeB: "المسار B (المطابقة المباشرة)", routeC: "المسار C (الاحتياطي)",
                     grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K", chkRemux: "فصل الـ Remux عن BluRay",
                     grpMax: "الحد الأقصى للترجمات", grpStrict: "قوة التدقيق", descStrict: "0 = بدون تدقيق | 3 = متوازن | 5 = تدقيق صارم للنسخة",
                     btnSave: "حفظ الإعدادات", btnStremio: "تثبيت في Stremio", btnCopy: "نسخ الرابط", btnLogout: "خروج", dir: "rtl", langToggle: "English"
                 }
+          };
+
+            const providerStatusLabels = {
+                en: { ok: 'Working', limited: 'Limit Reached', invalid: 'Invalid Key', noKey: 'No Key', error: 'Error', unknown: 'Not Tested' },
+                ar: { ok: 'يعمل', limited: 'تم بلوغ الحد', invalid: 'مفتاح غير صالح', noKey: 'لا يوجد مفتاح', error: 'خطأ', unknown: 'لم يُختبر' }
             };
+            let lastProviderStatus = { openSubtitles: 'unknown', subdl: 'unknown', subsource: 'unknown' };
+            let statusPollTimer = null;
 
             let isRegister = false;
             let loggedUser = null;
             let loggedPass = null;
-            let msgTimeout = null;
             let currentLang = 'en';
 
             // 🔥 Fetch Addon Details from Backend on Load
@@ -193,7 +218,7 @@
                 applyUI(currentLang);
             }
 
-            function applyUI(lang) {
+        function applyUI(lang) {
                 currentLang = lang;
                 document.body.dir = dict[lang].dir;
                 document.querySelectorAll('[data-i18n]').forEach(el => el.innerHTML = dict[lang][el.getAttribute('data-i18n')]);
@@ -205,14 +230,54 @@
                     const btn = group.querySelector('button');
                     btn.innerText = input.type === 'password' ? dict[lang].show : dict[lang].hide;
                 });
+
+                applyProviderStatus('statusOs', lastProviderStatus.openSubtitles);
+                applyProviderStatus('statusSubdl', lastProviderStatus.subdl);
+                applyProviderStatus('statusSubsource', lastProviderStatus.subsource);
+            }
+
+            function showToast(text, isError = false, duration = 3000) {
+                const container = document.getElementById('toastContainer');
+                const toast = document.createElement('div');
+                toast.className = 'toast' + (isError ? ' error' : '');
+                toast.innerHTML = `<span class="toast-icon">${isError ? '⚠️' : '✅'}</span><span class="toast-text"></span><div class="toast-bar" style="animation-duration: ${duration}ms;"></div>`;
+                toast.querySelector('.toast-text').textContent = text;
+                container.appendChild(toast);
+
+                const removeToast = () => {
+                    toast.classList.add('hide');
+                    toast.addEventListener('animationend', () => toast.remove(), { once: true });
+                };
+                setTimeout(removeToast, duration);
             }
 
             function showMsg(box, text, isError) {
-                clearTimeout(msgTimeout);
-                box.className = 'msg ' + (isError ? 'error' : 'success');
-                box.innerText = text;
-                box.style.display = 'block';
-                msgTimeout = setTimeout(() => { box.style.display = 'none'; }, 3000);
+                // 🔥 Routes through the floating toast (top-right, animated)
+                // instead of the old inline box, so nobody has to scroll up
+                // to see whether an action succeeded. `box` is kept unused so
+                // every existing call site needs zero changes.
+                showToast(text, isError);
+            }
+
+            function applyProviderStatus(elId, status) {
+                const el = document.getElementById(elId);
+                if (!el) return;
+                const s = status || 'unknown';
+                el.className = 'provider-status status-' + s;
+                el.innerText = (providerStatusLabels[currentLang] || providerStatusLabels.en)[s] || s;
+            }
+
+            async function refreshProviderStatus() {
+                if (!loggedUser) return;
+                try {
+                    const res = await fetch(`${BACKEND_URL}/api/provider-status?username=${encodeURIComponent(loggedUser)}`);
+                    if (!res.ok) return;
+                    const data = await res.json();
+                    lastProviderStatus = data;
+                    applyProviderStatus('statusOs', data.openSubtitles);
+                    applyProviderStatus('statusSubdl', data.subdl);
+                    applyProviderStatus('statusSubsource', data.subsource);
+                } catch (e) {}
             }
 
             function switchAuthTab(mode) {
@@ -260,6 +325,10 @@
                 // Initialize language
                 currentLang = user.panelLang || 'en';
                 applyUI(currentLang);
+
+                refreshProviderStatus();
+                clearInterval(statusPollTimer);
+                statusPollTimer = setInterval(refreshProviderStatus, 15000);
 
                 document.getElementById('lblUser').innerText = user.username;
                 
@@ -313,8 +382,11 @@
                     const data = await res.json();
                     if (!res.ok) return showMsg(document.getElementById('dashMsg'), data.error, true);
                     showMsg(document.getElementById('dashMsg'), data.message, false);
+                    if (payload.useSubdl && !payload.subdlKey) showToast(dict[currentLang].warnNoSubdl, true, 5000);
+                    if (payload.useSubsource && !payload.subsourceKey) showToast(dict[currentLang].warnNoSubsource, true, 5000);
                     document.getElementById('stremioBtn').href = data.installLink;
                     document.getElementById('installWrapper').style.display = 'block';
+                    refreshProviderStatus();
                 } catch (e) { showMsg(document.getElementById('dashMsg'), "Network Error.", true); }
             }
 
@@ -346,6 +418,9 @@
                 document.querySelectorAll('.api-group input').forEach(input => input.type = 'password');
                 document.querySelectorAll('.show-btn').forEach(btn => btn.innerText = dict[currentLang].show);
                 
+                clearInterval(statusPollTimer);
+                lastProviderStatus = { openSubtitles: 'unknown', subdl: 'unknown', subsource: 'unknown' };
+
                 document.getElementById('dashBox').style.display = 'none';
                 document.getElementById('installWrapper').style.display = 'none';
                 document.getElementById('authBox').style.display = 'block';
