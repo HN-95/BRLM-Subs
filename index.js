@@ -38,7 +38,11 @@ db.exec(`
     allowRouteB INTEGER DEFAULT 1,
     allowRouteC INTEGER DEFAULT 1,
     strict4k INTEGER DEFAULT 0,
-    autoFetchNext INTEGER DEFAULT 1
+    autoFetchNext INTEGER DEFAULT 1,
+    matchCut INTEGER DEFAULT 0,
+    matchCutDirector INTEGER DEFAULT 1,
+    matchCutTheatrical INTEGER DEFAULT 1,
+    matchCutExtended INTEGER DEFAULT 1
   )
 `);
 
@@ -54,6 +58,31 @@ try {
         db.exec('ALTER TABLE users ADD COLUMN panelLang TEXT DEFAULT "en"');
     } catch(err) {}
 }
+
+// 🔥 AUTO-MIGRATOR #2: Adds the "Match subtitles with the movie's cut" toggle
+try {
+    db.prepare('SELECT matchCut FROM users LIMIT 1').get();
+} catch (e) {
+    console.log("⚠️ Updating database schema to include Cut Matching toggle...");
+    try {
+        db.exec('ALTER TABLE users ADD COLUMN matchCut INTEGER DEFAULT 0');
+    } catch(err) {}
+}
+
+// 🔥 AUTO-MIGRATOR #3: Adds per-cut sub-toggles (Director's/Theatrical/
+// Extended) for the Cut Matching feature. Default to ON (1) so anyone who
+// already enabled matchCut keeps today's exact strict-for-all-3 behavior
+// until they explicitly dial a specific cut back in the new panel.
+try {
+    db.prepare('SELECT matchCutDirector FROM users LIMIT 1').get();
+} catch (e) {
+    console.log("⚠️ Updating database schema to include per-cut Match Cut toggles...");
+    try {
+        db.exec('ALTER TABLE users ADD COLUMN matchCutDirector INTEGER DEFAULT 1');
+        db.exec('ALTER TABLE users ADD COLUMN matchCutTheatrical INTEGER DEFAULT 1');
+        db.exec('ALTER TABLE users ADD COLUMN matchCutExtended INTEGER DEFAULT 1');
+    } catch(err) {}
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
@@ -62,7 +91,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.4.0",
+    ADDON_VERSION: "1.4.1",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -304,6 +333,63 @@ function filterBaselinesByType(candidates, streamTypeGroup) {
         const cGroup = getReleaseTypeGroup(cTokens);
         return cGroup === streamTypeGroup;
     });
+}
+
+// 🔥 "Match subtitles with the movie's cut" — user-configurable, OFF by
+// default (userConfig.matchCut), with a per-cut panel (matchCutDirector /
+// matchCutTheatrical / matchCutExtended) controlling exactly which of the
+// 3 recognized editions get STRICT enforcement. Recognizes whatever naming
+// an uploader used: tokeniseRelease() already treats "Director's Cut",
+// "Directors Cut", "Director Cut", and "DC" as separate raw tokens;
+// getCanonicalCut() groups all of them into one value.
+//
+// Rules:
+//   1. If the played file's cut is one the user opted into strict mode for
+//      (a checked chip), a candidate is only accepted if it declares the
+//      EXACT SAME cut.
+//   2. If the played file's cut is a KNOWN cut but NOT opted into strict
+//      mode (chip left unchecked) — a candidate is still REJECTED if it's
+//      explicitly tagged with a DIFFERENT known cut (Director's/Theatrical/
+//      Extended are never interchangeable, strict mode or not). An UNTAGGED
+//      candidate is allowed through, since most releases of the default
+//      cut never bother tagging it — but it's flagged "unverified" so the
+//      caller can note that on the output, since we're assuming rather
+//      than confirming compatibility.
+//   3. If the played file itself declares no known cut at all, there's
+//      nothing to check against — everything passes, untouched.
+function getCanonicalCut(tokens) {
+    if (tokens.has('director') || tokens.has('directors') || tokens.has('dc')) return 'director';
+    if (tokens.has('extended')) return 'extended';
+    if (tokens.has('theatrical')) return 'theatrical';
+    return null;
+}
+function checkCutCompatibility(userTokens, candidateReleaseName, enabledCuts) {
+    const userCut = getCanonicalCut(userTokens);
+    if (!userCut) return { compatible: true, unverified: false };
+
+    const candidateTokens = tokeniseRelease(candidateReleaseName);
+    const candidateCut = getCanonicalCut(candidateTokens);
+
+    if (enabledCuts.has(userCut)) {
+        return { compatible: candidateCut === userCut, unverified: false };
+    }
+    // Not strict for this cut — but a candidate explicitly tagged with a
+    // DIFFERENT known cut is still a confirmed mismatch, always rejected.
+    if (candidateCut !== null && candidateCut !== userCut) {
+        return { compatible: false, unverified: false };
+    }
+    // Either untagged, or (rarely) explicitly the same cut by luck.
+    return { compatible: true, unverified: candidateCut === null };
+}
+// Thin boolean wrapper — used by ruler-locking call sites that just need a
+// plain pass/fail filter and don't track "unverified" for their own output.
+function isCutCompatible(userTokens, candidateReleaseName, enabledCuts) {
+    return checkCutCompatibility(userTokens, candidateReleaseName, enabledCuts).compatible;
+}
+// Small note appended to a subtitle's title when it only passed cut-
+// matching because it was untagged and assumed compatible, not confirmed.
+function cutUnverifiedNote(candidate) {
+    return candidate && candidate._cutUnverified ? ' | ⚠️ Unverified Cut Match' : '';
 }
 
 // 🔥 NEW: The API Bouncer (Kills wrong seasons/episodes before they download)
@@ -1119,7 +1205,11 @@ async function runSubtitleEngine(args) {
             allowRouteA: userRow.allowRouteA !== 0,
             allowRouteB: userRow.allowRouteB !== 0,
             allowRouteC: userRow.allowRouteC !== 0,
-            strict4k: userRow.strict4k === 1
+            strict4k: userRow.strict4k === 1,
+            matchCut: userRow.matchCut === 1,
+            matchCutDirector: userRow.matchCutDirector === 1,
+            matchCutTheatrical: userRow.matchCutTheatrical === 1,
+            matchCutExtended: userRow.matchCutExtended === 1
         };
         const isTargetArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
         // 🔥 The real language tag every CONTENT winner (Route A/B/C, Blind
@@ -1169,10 +1259,27 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
         if (releaseTokens.has('unrated')) cutTag.push('UNRATED');
         if (releaseTokens.has('final')) cutTag.push('FINAL');
        const editionKey = cutTag.length > 0 ? `_${cutTag.join('-')}` : '';
+
+        // 🔥 Hoisted here (was previously computed separately, later, inside
+        // each of TV/Movie mode) so ruler-locking can ALSO use it — the
+        // "Match subtitles with the movie's cut" feature needs to filter
+        // rulers, not just content candidates, or a wrong-edition ruler
+        // still gets locked and Route A syncs everything against it anyway.
+        const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
+        const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
+
+        // 🔥 Which canonical cuts the user opted into strict enforcement
+        // for, via the new per-cut panel. Built once, passed to every
+        // isCutCompatible() call below.
+        const enabledCutSet = new Set();
+        if (userConfig.matchCutDirector) enabledCutSet.add('director');
+        if (userConfig.matchCutTheatrical) enabledCutSet.add('theatrical');
+        if (userConfig.matchCutExtended) enabledCutSet.add('extended');
+
 // 🔥 Cache Key now tracks all active configurations to avoid crossover
        const providerKey = `${userConfig.useOs?1:0}${userConfig.useSubdl?1:0}${userConfig.useSubsource?1:0}`;
        const routeKey = `${userConfig.allowRouteA?1:0}${userConfig.allowRouteB?1:0}${userConfig.allowRouteC?1:0}`;
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_mcut${userConfig.matchCut?1:0}${[...enabledCutSet].sort().join('')}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
        if (responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
@@ -1248,7 +1355,10 @@ if (isTV) {
             // further downloads instead of eagerly fetching a whole extra
             // batch we no longer need.
             const tryLockTvRulers = async (targetGroup) => {
-                const strictEng = filterBaselinesByType(combinedEng, targetGroup);
+                let strictEng = filterBaselinesByType(combinedEng, targetGroup);
+                if (userConfig.matchCut) {
+                    strictEng = strictEng.filter(c => isCutCompatible(releaseTokens, c.releaseName, enabledCutSet));
+                }
                 for (let i = 0; i < strictEng.length; i += PREFETCH_BATCH_SIZE) {
                     if (osRulers.length >= CONFIG.TV_DISTINCT_CUTS_LIMIT) break;
                     const batch = strictEng.slice(i, i + PREFETCH_BATCH_SIZE);
@@ -1323,9 +1433,7 @@ if (osRulers.length === 0) {
 
             let allSurvivingTvArabic = [];
 
-          // 🔥 Strictness Level 5 (Identify User Video Cut)
-            const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
-            const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
+          // 🔥 Strictness Level 5 uses cutKeywords/userCuts computed earlier
 
             // 🔥 Apply the cheap, synchronous cut-focus filter BEFORE
             // prefetching — so we never waste a network download on a
@@ -1333,11 +1441,25 @@ if (osRulers.length === 0) {
             // stays untouched (Route B below still needs the full list).
             let tvCandidatesToProcess = allCandidates;
             if (userConfig.engineStrength === 5 && userCuts.length > 0) {
-                tvCandidatesToProcess = allCandidates.filter(c => {
+                tvCandidatesToProcess = tvCandidatesToProcess.filter(c => {
                     const cTokens = tokeniseRelease(c.releaseName);
                     const hasMatchingCut = userCuts.some(cut => cTokens.has(cut) || (cut === 'dc' && cTokens.has('director')) || (cut === 'director' && cTokens.has('dc')));
                     if (!hasMatchingCut) console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
                     return hasMatchingCut;
+                });
+            }
+            // 🔥 NEW: "Match subtitles with the movie's cut" — independent,
+            // opt-in toggle (separate from engine strictness). See
+            // checkCutCompatibility() for the exact Director/Theatrical/Extended matching rules.
+            if (userConfig.matchCut) {
+                tvCandidatesToProcess = tvCandidatesToProcess.filter(c => {
+                    const result = checkCutCompatibility(releaseTokens, c.releaseName, enabledCutSet);
+                    if (!result.compatible) {
+                        console.log(`  🎬 [Cut Match] Skipping ${c.releaseName} (Edition mismatch with played file)`);
+                        return false;
+                    }
+                    if (result.unverified) c._cutUnverified = true;
+                    return true;
                 });
             }
             await prefetchInBatches(tvCandidatesToProcess);
@@ -1364,11 +1486,8 @@ if (osRulers.length === 0) {
                 if (!bestFallback || c.score > bestFallback.candidate.score) {
                     bestFallback = { candidate: c, text: arabicData.text };
                 }
-                const cTokens = tokeniseRelease(c.releaseName);
-                const cGroup = getReleaseTypeGroup(cTokens);
 
               // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
-                let candidatePassedRouteA = false;
                 if (userConfig.allowRouteA && osRulers.length > 0) {
                     let bestScoreForCandidate = null;
                     for (let rIdx = 0; rIdx < osRulers.length; rIdx++) {
@@ -1380,24 +1499,16 @@ if (osRulers.length === 0) {
                     }
                     if (bestScoreForCandidate) {
                         allSurvivingTvArabic.push(bestScoreForCandidate);
-                        candidatePassedRouteA = true;
                     }
                 }
-
-                // 🔥 4K Blind Trust Protocol (only fires if Route A couldn't verify this candidate)
-                if (!candidatePassedRouteA && fallbackTriggered && cGroup === streamTypeGroup) {
-                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Arabic match: ${c.releaseName}`);
-                    try {
-                        let fallbackParsed = srtParser.fromSrt(arabicData.text);
-                        fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)` });
-                        let blindText = srtParser.toSrt(fallbackParsed);
-                        if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-                        const cacheId = `elite_tv_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                        subtitleCache.set(cacheId, blindText);
-                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}] ${c.releaseName}` });
-                    } catch(e) {}
-                    continue; 
-                }
+                // 🔥 REMOVED: 4K Blind Trust Protocol. It bypassed Route A's
+                // math verification ENTIRELY (always "0ms, Unverified") on
+                // nothing more than a matching 4K tag — no sync check, no
+                // cut/edition check at all. A candidate that fails Route A
+                // now simply isn't pushed here; it can still surface via
+                // Route B ("Raw Match") or Route C, both of which are
+                // honest about being unverified instead of dressed up as a
+                // confident "4K Trust" result.
             }
      // 2. ALWAYS push the Clean English Rulers conditionally based on Route A
            if (userConfig.allowRouteA) {
@@ -1456,7 +1567,7 @@ if (osRulers.length === 0) {
                 
             finalOutput.push({
                     id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang,
-                    title: `[Synced to ${candidate.matchedRuler} | ${candidate.alignmentPct.toFixed(0)}%] (${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms)\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
+                    title: `[Synced to ${candidate.matchedRuler} | ${candidate.alignmentPct.toFixed(0)}%${cutUnverifiedNote(candidate.candidate)}] (${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms)\n[${candidate.candidate.source}] ${candidate.candidate.releaseName}`
                 });
             }
 
@@ -1490,7 +1601,7 @@ let routeBCount = 0;
                     if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
                     const cacheId = `elite_tv_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                     subtitleCache.set(cacheId, finalRouteBText);
-                   finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Top Match]\n[${c.source}] ${c.releaseName}` });
+                   finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Top Match${cutUnverifiedNote(c)}]\n[${c.source}] ${c.releaseName}` });
                     routeBCount++;
                 } catch(e) {}
             }
@@ -1521,9 +1632,14 @@ let routeBCount = 0;
             // three instead of the sum of all three. Each provider's own
             // loop still stops at its first success — unchanged.
             const tryLockMovieRulers = async (targetGroup) => {
-                const fOs = filterBaselinesByType(engOs, targetGroup);
-                const fSubdl = filterBaselinesByType(engSubdl, targetGroup);
-                const fSubsource = filterBaselinesByType(engSubsource, targetGroup);
+                let fOs = filterBaselinesByType(engOs, targetGroup);
+                let fSubdl = filterBaselinesByType(engSubdl, targetGroup);
+                let fSubsource = filterBaselinesByType(engSubsource, targetGroup);
+                if (userConfig.matchCut) {
+                    fOs = fOs.filter(c => isCutCompatible(releaseTokens, c.releaseName, enabledCutSet));
+                    fSubdl = fSubdl.filter(c => isCutCompatible(releaseTokens, c.releaseName, enabledCutSet));
+                    fSubsource = fSubsource.filter(c => isCutCompatible(releaseTokens, c.releaseName, enabledCutSet));
+                }
 
                 await Promise.all([
                     (async () => {
@@ -1588,9 +1704,7 @@ let routeBCount = 0;
             let allSurvivingArabic = [];
 let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
 
-            // 🔥 Strictness Level 5 (Identify User Video Cut)
-            const cutKeywords = ['director', 'directors', 'extended', 'theatrical', 'unrated', 'final', 'dc'];
-            const userCuts = [...releaseTokens].filter(t => cutKeywords.includes(t));
+            // 🔥 Strictness Level 5 uses cutKeywords/userCuts computed earlier
 
             // 🔥 Apply the cheap, synchronous cut-focus filter BEFORE
             // prefetching — so we never waste a network download on a
@@ -1598,11 +1712,24 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
             // itself stays untouched (Route B below still needs the full list).
             let movieCandidatesToProcess = allArabicCandidates;
             if (userConfig.engineStrength === 5 && userCuts.length > 0) {
-                movieCandidatesToProcess = allArabicCandidates.filter(c => {
+                movieCandidatesToProcess = movieCandidatesToProcess.filter(c => {
                     const cTokens = tokeniseRelease(c.releaseName);
                     const hasMatchingCut = userCuts.some(cut => cTokens.has(cut) || (cut === 'dc' && cTokens.has('director')) || (cut === 'director' && cTokens.has('dc')));
                     if (!hasMatchingCut) console.log(`  🛡️ [Level 5 Cut Focus] Skipping ${c.releaseName} (Missing required cut)`);
                     return hasMatchingCut;
+                });
+            }
+            // 🔥 NEW: "Match subtitles with the movie's cut" — independent,
+            // opt-in toggle (separate from engine strictness).
+            if (userConfig.matchCut) {
+                movieCandidatesToProcess = movieCandidatesToProcess.filter(c => {
+                    const result = checkCutCompatibility(releaseTokens, c.releaseName, enabledCutSet);
+                    if (!result.compatible) {
+                        console.log(`  🎬 [Cut Match] Skipping ${c.releaseName} (Edition mismatch with played file)`);
+                        return false;
+                    }
+                    if (result.unverified) c._cutUnverified = true;
+                    return true;
                 });
             }
             await prefetchInBatches(movieCandidatesToProcess);
@@ -1628,12 +1755,8 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                 if (!bestFallback || c.score > bestFallback.candidate.score) {
                     bestFallback = { candidate: c, text: arabicData.text };
                 }
-                
-                const cTokens = tokeniseRelease(c.releaseName);
-                const cGroup = getReleaseTypeGroup(cTokens);
 
                 // ─── ROUTE A: The Math Gauntlet (tried FIRST, even against a 4K-fallback ruler) ───
-                let candidatePassedRouteA = false;
                 if (userConfig.allowRouteA && hasMovieRulers) {
                     sourceCounters[c.source] = (sourceCounters[c.source] || 0) + 1;
                     const candidateLabel = `${c.source}[${sourceCounters[c.source]}]`;
@@ -1659,24 +1782,16 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
 
                     if (bestScoreForCandidate) {
                         allSurvivingArabic.push(bestScoreForCandidate);
-                        candidatePassedRouteA = true;
                     }
                 }
-
-                // 🔥 4K Blind Trust Protocol (only fires if Route A couldn't verify this candidate)
-                if (!candidatePassedRouteA && fallbackTriggered && cGroup === streamTypeGroup) {
-                    console.log(`  🚀 [Blind Trust] Pushing explicit 4K Match: ${c.releaseName}`);
-                    try {
-                        let fallbackParsed = srtParser.fromSrt(arabicData.text);
-                        fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Blind Trust)` });
-                        let blindText = srtParser.toSrt(fallbackParsed);
-                        if (stripTags) blindText = blindText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-                        const cacheId = `elite_ar_blind_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
-                        subtitleCache.set(cacheId, blindText);
-                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[👑 4K Trust | Unverified] (0ms)\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
-                    } catch(e) {}
-                    continue; 
-                }
+                // 🔥 REMOVED: 4K Blind Trust Protocol. It bypassed Route A's
+                // math verification ENTIRELY (always "0ms, Unverified") on
+                // nothing more than a matching 4K tag — no sync check, no
+                // cut/edition check at all. A candidate that fails Route A
+                // now simply isn't pushed here; it can still surface via
+                // Route B ("Raw Match") or Route C, both of which are
+                // honest about being unverified instead of dressed up as a
+                // confident "4K Trust" result.
             }
 
             // 2. Sort by "True Sync Score" (Native 0ms matches float to the absolute top)
@@ -1743,7 +1858,7 @@ for (const champ of allSurvivingArabic) {
                 subtitleCache.set(cacheId, finalSrtText);
               finalOutput.push({
                     id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang,
-                    title: `[Synced to ${champ.rulerName} Ruler | ${champ.alignmentPct.toFixed(0)}%] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
+                    title: `[Synced to ${champ.rulerName} Ruler | ${champ.alignmentPct.toFixed(0)}%${cutUnverifiedNote(champ.candidate)}] (${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms)\n[${champ.candidate.source}[${champ.candidate.trackNum}]] ${champ.candidate.releaseName}`
                 });
             }
 
@@ -1779,7 +1894,7 @@ for (const champ of allSurvivingArabic) {
                         const cacheId = `elite_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
                         subtitleCache.set(cacheId, finalRouteBText);
                         
-                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Match]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
+                       finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Match${cutUnverifiedNote(c)}]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
                         routeBCount++;
                     } catch(e) {}
                 }
@@ -1806,7 +1921,7 @@ finalOutput = finalOutput.filter(item => item !== null);
             let finalSrtText = bestFallback.text;
             if (stripTags) finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
             subtitleCache.set(cacheId, finalSrtText);
-            finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[🔴 Route C | Fallback]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
+            finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[🔴 Route C | Fallback${cutUnverifiedNote(bestFallback.candidate)}]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
         }
 
        if (finalOutput.length > 0) {
@@ -2010,7 +2125,7 @@ app.post('/api/login', (req, res) => {
 app.post('/api/update', (req, res) => {
     const { 
         username, password, osKey, subdlKey, subsourceKey, targetLang, panelLang, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
-        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext
+        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext, matchCut, matchCutDirector, matchCutTheatrical, matchCutExtended
     } = req.body;
     
     const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
@@ -2020,11 +2135,13 @@ app.post('/api/update', (req, res) => {
         db.prepare(`
             UPDATE users 
             SET osKey = ?, subdlKey = ?, subsourceKey = ?, targetLang = ?, panelLang = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
-                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?
+                useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?, matchCut = ?,
+                matchCutDirector = ?, matchCutTheatrical = ?, matchCutExtended = ?
             WHERE LOWER(username) = LOWER(?)
         `).run(
             osKey.trim(), subdlKey ? subdlKey.trim() : "", subsourceKey ? subsourceKey.trim() : "", targetLang || "ar", panelLang || "en", stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
-            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0,
+            useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0, matchCut ? 1 : 0,
+            matchCutDirector ? 1 : 0, matchCutTheatrical ? 1 : 0, matchCutExtended ? 1 : 0,
             username
         );
         
