@@ -1,7 +1,7 @@
 <!DOCTYPE html>
     <html lang="en" dir="ltr">
-    <head>
-		<link rel="icon" type="svg+xml" href="logo.svg">
+	<head>
+	    
         <meta charset="UTF-8">
         <!-- 🔥 Mobile Viewport (Makes the page responsive on phones) -->
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -47,6 +47,19 @@
             @keyframes toastIn { 0% { transform:translateX(120%) scale(0.9); opacity:0; } 60% { transform:translateX(-8px) scale(1.02); opacity:1; } 100% { transform:translateX(0) scale(1); opacity:1; } }
             @keyframes toastOut { to { transform:translateX(120%) scale(0.9); opacity:0; } }
             @keyframes toastShrink { from { width:100%; } to { width:0%; } }
+
+            /* 🔥 Cut-Matching Panel */
+            .cut-panel { max-height:0; opacity:0; overflow:hidden; transition: max-height 0.45s cubic-bezier(0.4,0,0.2,1), opacity 0.3s ease, margin-top 0.35s ease; margin-top:0; }
+            .cut-panel.open { max-height:220px; opacity:1; margin-top:12px; }
+            .cut-panel-inner { background: linear-gradient(135deg, rgba(138,90,153,0.14), rgba(138,90,153,0.04)); border:1px solid rgba(138,90,153,0.4); border-radius:10px; padding:14px; }
+            .cut-panel-desc { color:#a0a0a0; font-size:0.8rem; margin:0 0 10px 0; line-height:1.45; }
+            .cut-chips { display:flex; gap:8px; flex-wrap:wrap; }
+            .cut-chip { display:inline-flex; align-items:center; gap:6px; padding:8px 14px; border-radius:999px; border:1.5px solid #444; background:#161616; color:#888; font-size:0.85rem; font-weight:600; cursor:pointer; user-select:none; transition: all 0.28s cubic-bezier(0.34,1.56,0.64,1); }
+            .cut-chip:hover { border-color:#8A5A99; color:#ccc; transform:translateY(-1px); }
+            .cut-chip:active { transform:scale(0.94); }
+            .cut-chip.active { background:linear-gradient(135deg,#8A5A99,#6c4777); border-color:#8A5A99; color:#fff; transform:scale(1.05); box-shadow:0 4px 16px rgba(138,90,153,0.5); }
+            .cut-chip.active:hover { transform:scale(1.08) translateY(-1px); }
+
            /* 🔥 Mobile Adjustments */
             @media (max-width: 600px) {
                 .container { padding: 20px 15px; }
@@ -131,7 +144,19 @@
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> <span data-i18n="chkStats">Include Stats for Nerds</span></label>
                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b></label>
-                <label class="check-label"><input type="checkbox" id="cfgSeparateRemux"> <b data-i18n="chkRemux">Separate Remux from BluRay</b></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgSeparateRemux"> <b data-i18n="chkRemux">Separate Remux from BluRay</b></label>
+                <label class="check-label"><input type="checkbox" id="cfgMatchCut" onchange="toggleCutPanel(this.checked, true)"> <b data-i18n="chkMatchCut">Match Subtitles With Movie's Cut</b></label>
+
+                <div class="cut-panel" id="cutPanel">
+                    <div class="cut-panel-inner">
+                        <p class="cut-panel-desc" data-i18n="cutPanelDesc">Only be strict for the cuts you select below — leave a cut unchecked to skip strict matching for it.</p>
+                        <div class="cut-chips">
+                            <div class="cut-chip active" id="chipDirector" onclick="toggleCutChip(this)">🎬 <span data-i18n="cutDirector">Director's Cut</span></div>
+                            <div class="cut-chip active" id="chipTheatrical" onclick="toggleCutChip(this)">🎭 <span data-i18n="cutTheatrical">Theatrical</span></div>
+                            <div class="cut-chip active" id="chipExtended" onclick="toggleCutChip(this)">🎞️ <span data-i18n="cutExtended">Extended</span></div>
+                        </div>
+                    </div>
+                </div>
             
             </div>
 
@@ -171,7 +196,8 @@
                     warnNoSubdl: "SubDL is enabled but no key is set — it won't return results.", warnNoSubsource: "SubSource is enabled but no key is set — it won't return results.",
                     grpLang: "Language Extraction", langAr: "Arabic", langEn: "English",
                     grpRoutes: "Providers & Routes", routeA: "Route A (Math Sync)", routeB: "Route B (Raw Match)", routeC: "Route C (Fallback)",
-                   grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield", chkRemux: "Separate Remux from BluRay",
+                   grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield", chkRemux: "Separate Remux from BluRay", chkMatchCut: "Match Subtitles With Movie's Cut",
+                    cutPanelDesc: "Only be strict for the cuts you select below — leave a cut unchecked to skip strict matching for it.", cutDirector: "Director's Cut", cutTheatrical: "Theatrical", cutExtended: "Extended",
                     grpMax: "Max Returned Subtitles", grpStrict: "Engine Strictness", descStrict: "0 = Bypass Math | 3 = Balanced | 5 = Cut Focus",
                     btnSave: "Save Settings", btnStremio: "Install to Stremio", btnCopy: "Copy Manifest Link", btnLogout: "Logout", dir: "ltr", langToggle: "عربي"
                 },
@@ -183,7 +209,8 @@
                     warnNoSubdl: "خدمة SubDL مفعّلة لكن لا يوجد مفتاح — لن تُرجع نتائج.", warnNoSubsource: "خدمة SubSource مفعّلة لكن لا يوجد مفتاح — لن تُرجع نتائج.",
                     grpLang: "لغة الترجمة المطلوبة", langAr: "العربية", langEn: "الإنجليزية",
                     grpRoutes: "الخوادم والمسارات", routeA: "المسار A (المزامنة الذكية)", routeB: "المسار B (المطابقة المباشرة)", routeC: "المسار C (الاحتياطي)",
-                    grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K", chkRemux: "فصل الـ Remux عن BluRay",
+                    grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K", chkRemux: "فصل الـ Remux عن BluRay", chkMatchCut: "مطابقة الترجمة مع نسخة الفيلم",
+                    cutPanelDesc: "التدقيق الصارم يعمل فقط على النسخ التي تحددها هنا — اترك أي نسخة غير محددة لتخطي التدقيق الصارم لها.", cutDirector: "نسخة المخرج", cutTheatrical: "العرض السينمائي", cutExtended: "النسخة الموسعة",
                     grpMax: "الحد الأقصى للترجمات", grpStrict: "قوة التدقيق", descStrict: "0 = بدون تدقيق | 3 = متوازن | 5 = تدقيق صارم للنسخة",
                     btnSave: "حفظ الإعدادات", btnStremio: "تثبيت في Stremio", btnCopy: "نسخ الرابط", btnLogout: "خروج", dir: "rtl", langToggle: "English"
                 }
@@ -217,6 +244,26 @@
             function toggleLang() {
                 currentLang = currentLang === 'en' ? 'ar' : 'en';
                 applyUI(currentLang);
+            }
+
+            // 🔥 Shows/hides the per-cut chip panel. `animate=false` is used on
+            // initial dashboard load so it snaps straight to the correct state
+            // instead of visibly sliding open every time the page loads for a
+            // user who already has the feature enabled.
+            function toggleCutPanel(show, animate) {
+                const panel = document.getElementById('cutPanel');
+                if (!animate) panel.style.transition = 'none';
+                panel.classList.toggle('open', show);
+                if (!animate) {
+                    // Force a reflow so the transition:none actually applies
+                    // before we restore it, then hand control back to CSS.
+                    void panel.offsetHeight;
+                    requestAnimationFrame(() => { panel.style.transition = ''; });
+                }
+            }
+
+            function toggleCutChip(el) {
+                el.classList.toggle('active');
             }
 
         function applyUI(lang) {
@@ -356,6 +403,11 @@
                 document.getElementById('cfgAutoFetchNext').checked = user.autoFetchNext === 1;
                 document.getElementById('cfgStrict4k').checked = user.strict4k === 1;
                 document.getElementById('cfgSeparateRemux').checked = user.separateRemux === 1;
+                document.getElementById('cfgMatchCut').checked = user.matchCut === 1;
+                document.getElementById('chipDirector').classList.toggle('active', user.matchCutDirector !== 0);
+                document.getElementById('chipTheatrical').classList.toggle('active', user.matchCutTheatrical !== 0);
+                document.getElementById('chipExtended').classList.toggle('active', user.matchCutExtended !== 0);
+                toggleCutPanel(user.matchCut === 1, false);
                 
                 document.getElementById('cfgMaxSubs').value = user.maxSubs || 5;
                 document.getElementById('valMaxSubs').innerText = user.maxSubs || 5;
@@ -374,7 +426,10 @@
                     useOs: document.getElementById('cfgUseOs').checked, useSubdl: document.getElementById('cfgUseSubdl').checked, useSubsource: document.getElementById('cfgUseSubsource').checked,
                     allowRouteA: document.getElementById('cfgAllowRouteA').checked, allowRouteB: document.getElementById('cfgAllowRouteB').checked, allowRouteC: document.getElementById('cfgAllowRouteC').checked,
                     stripTags: document.getElementById('cfgStripTags').checked, includeStats: document.getElementById('cfgIncludeStats').checked, removeSdh: document.getElementById('cfgRemoveSdh').checked,
-                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked, separateRemux: document.getElementById('cfgSeparateRemux').checked,
+                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked, separateRemux: document.getElementById('cfgSeparateRemux').checked, matchCut: document.getElementById('cfgMatchCut').checked,
+                    matchCutDirector: document.getElementById('chipDirector').classList.contains('active'),
+                    matchCutTheatrical: document.getElementById('chipTheatrical').classList.contains('active'),
+                    matchCutExtended: document.getElementById('chipExtended').classList.contains('active'),
                     maxSubs: document.getElementById('cfgMaxSubs').value, engineStrength: document.getElementById('cfgEngine').value
                 };
                try {
