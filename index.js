@@ -91,7 +91,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.4.1",
+    ADDON_VERSION: "1.4.2",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -417,25 +417,45 @@ function enforceEpisodeMatch(candidates, season, episode) {
     });
 }
 
+// 🔥 Repairs the classic "UTF-8 decoded as Latin-1, then re-saved as UTF-8"
+// mistake — produces garbage that's itself perfectly VALID UTF-8 (so the
+// broken-character check below never sees it), showing up as "â€™" for an
+// apostrophe, "â€"" for an em-dash, or "â‚¬"-style garbage for a Euro sign
+// — exactly the "weird symbol near €" pattern. Detects ALL UTF-8 lead-byte
+// ranges misread as Latin-1 (2-byte: C2-DF, 3-byte: E0-EF, 4-byte: F0-F4)
+// — most punctuation like €, smart quotes, and em-dashes live in the
+// 3-byte E0-EF range specifically. Fix: reinterpret the string's
+// codepoints as raw Latin-1 bytes, then decode THOSE as UTF-8 — the
+// standard round-trip repair for this exact, very common mistake.
+function repairMojibake(text) {
+    const mojibakePattern = /[\u00c2-\u00df][\u0080-\u00bf]|[\u00e0-\u00ef][\u0080-\u00bf]{2}|[\u00f0-\u00f4][\u0080-\u00bf]{3}/;
+    if (!mojibakePattern.test(text)) return text;
+    try {
+        const repaired = Buffer.from(text, 'latin1').toString('utf8');
+        if (!repaired.includes('\uFFFD')) return repaired;
+    } catch (e) {}
+    return text;
+}
+
 function decodeArabicFile(buffer) {
     const utf8 = buffer.toString('utf8');
     
     // 🔥 Uses exact hex code so it never gets erased: Counts broken symbols
     const brokenCharCount = (utf8.match(/\uFFFD/g) || []).length;
     
+    let result;
     // Only drop to win1256 if the file is completely unreadable in UTF-8
     if (brokenCharCount > 30) {
-        return iconv.decode(buffer, 'win1256');
-    }
-    
-    // If UTF-8 produced no Arabic text at all, test win1256 just in case
-    if (!/[\u0600-\u06FF]/.test(utf8)) {
+        result = iconv.decode(buffer, 'win1256');
+    } else if (!/[\u0600-\u06FF]/.test(utf8)) {
+        // If UTF-8 produced no Arabic text at all, test win1256 just in case
         const win1256 = iconv.decode(buffer, 'win1256');
-        if (/[\u0600-\u06FF]/.test(win1256)) return win1256;
+        result = /[\u0600-\u06FF]/.test(win1256) ? win1256 : utf8;
+    } else {
+        result = utf8;
     }
-    
-    // Otherwise, trust the UTF-8 decode
-    return utf8;
+
+    return repairMojibake(result);
 }
 
 function formatTime(ms) {
@@ -865,13 +885,46 @@ const url = `https://api.subsource.net/api/v1/subtitles?${subParams.toString()}`
 // ─────────────────────────────────────────────────────────────────────────────
 // MATH ENGINE (SDH DE-NOISER, SCALING, & DISTINCT CUT CHECKER)
 // ─────────────────────────────────────────────────────────────────────────────
+// 🔥 SDH LINE CLEANER — shared by content candidates (stripSdhAndClean)
+// AND English baselines (processEnglishRuler below), so both get IDENTICAL
+// treatment. Strips: [bracketed sound descriptions], (parenthetical
+// asides), a leading "SPEAKER:" / "Man 1:" / "Police Officer:" tag however
+// an uploader wrote it, and any residual line that's ENTIRELY uppercase
+// after cleaning (stylized MUSIC/SOUND cues or bare speaker-name lines
+// with no colon). Deliberately does NOT touch <html>/{ass} tags — that's
+// stripTags's separate, independent job, so the two settings never fight
+// each other. Returns '' if the whole line should be dropped.
+function stripSdhFromLine(text) {
+    if (!text) return '';
+    let clean = text;
+    clean = clean.replace(/\[.*?\]/g, '');
+    clean = clean.replace(/\(.*?\)/g, '');
+    clean = clean.replace(/^\s*[-–—]?\s*[^:\n]{1,25}:(?=\s|$)\s*/, '');
+    clean = clean.trim();
+
+    // Judge all-caps against a tag-free copy so an incidental lowercase
+    // letter inside a formatting tag (e.g. the "i" in <i>) never masks
+    // genuinely all-caps SDH noise — but tags themselves are preserved in
+    // what we actually return.
+    const forCapsCheck = clean.replace(/<[^>]+>/g, '');
+    const hasLetters = /[a-zA-Z]/.test(forCapsCheck);
+    if (hasLetters && forCapsCheck === forCapsCheck.toUpperCase()) return '';
+
+    return clean;
+}
+
 function stripSdhAndClean(parsedArray) {
     let cleanArray = [];
     for (const line of parsedArray) {
-        let cleanText = line.text.replace(/<[^>]+>/g, '');
-        cleanText = cleanText.replace(/\[.*?\]/g, '');
-        cleanText = cleanText.replace(/\(.*?\)/g, '');
-        if (cleanText.trim().length > 0) cleanArray.push(line);
+        const rawLines = line.text.split('\n');
+        const cleanLines = [];
+        for (const raw of rawLines) {
+            const cleanL = stripSdhFromLine(raw);
+            if (cleanL.length > 0) cleanLines.push(cleanL);
+        }
+        if (cleanLines.length > 0) {
+            cleanArray.push({ ...line, text: cleanLines.join('\n') });
+        }
     }
     return cleanArray;
 }
@@ -1113,15 +1166,15 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
         let parsed = srtParser.fromSrt(baselineObj.text);
         let cleanParsed = [];
 
-        // 🔥 Conditionally Remove SDH
+        // 🔥 Conditionally Remove SDH — now uses the SAME shared cleaner as
+        // stripSdhAndClean (used for winners), so baselines and winners get
+        // identical SDH treatment, not two independently-maintained cleaners.
         if (userConfig.removeSdh) {
             for (let i = 0; i < parsed.length; i++) {
                 let rawLines = parsed[i].text.split('\n');
                 let cleanLines = [];
                 for (let line of rawLines) {
-                    let cleanL = line.replace(/\[.*?\]/gs, '').replace(/\(.*?\)/gs, '').trim();
-                    const hasLetters = /[a-zA-Z]/.test(cleanL);
-                    if (hasLetters && cleanL === cleanL.toUpperCase()) continue;
+                    const cleanL = stripSdhFromLine(line);
                     if (cleanL.length > 0) cleanLines.push(cleanL);
                 }
                 if (cleanLines.length > 0) cleanParsed.push({ ...parsed[i], text: cleanLines.join('\n') });
