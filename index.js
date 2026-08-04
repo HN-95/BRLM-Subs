@@ -91,7 +91,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.4.2",
+    ADDON_VERSION: "1.4.3",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -438,24 +438,44 @@ function repairMojibake(text) {
 }
 
 function decodeArabicFile(buffer) {
-    const utf8 = buffer.toString('utf8');
-    
-    // 🔥 Uses exact hex code so it never gets erased: Counts broken symbols
-    const brokenCharCount = (utf8.match(/\uFFFD/g) || []).length;
-    
-    let result;
-    // Only drop to win1256 if the file is completely unreadable in UTF-8
-    if (brokenCharCount > 30) {
-        result = iconv.decode(buffer, 'win1256');
-    } else if (!/[\u0600-\u06FF]/.test(utf8)) {
-        // If UTF-8 produced no Arabic text at all, test win1256 just in case
-        const win1256 = iconv.decode(buffer, 'win1256');
-        result = /[\u0600-\u06FF]/.test(win1256) ? win1256 : utf8;
-    } else {
-        result = utf8;
+    let buf = buffer;
+
+    // 🔥 Strip a UTF-8 BOM so it never leaks into the first cue's text.
+    if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+        buf = buf.subarray(3);
+    }
+    // 🔥 UTF-16 files (some tools export these) — detect by BOM and decode properly
+    // instead of letting them fall through as unreadable UTF-8.
+    if (buf.length >= 2 && buf[0] === 0xFF && buf[1] === 0xFE) {
+        return repairMojibake(iconv.decode(buf.subarray(2), 'utf16le'));
+    }
+    if (buf.length >= 2 && buf[0] === 0xFE && buf[1] === 0xFF) {
+        return repairMojibake(iconv.decode(buf.subarray(2), 'utf16be'));
     }
 
-    return repairMojibake(result);
+    const utf8 = buf.toString('utf8');
+
+    // 🔥 CRITICAL FIX: if the bytes are VALID UTF-8, always trust them.
+    // The old logic instead asked "did UTF-8 produce any Arabic?" — which is
+    // false for every English subtitle — and then fell through to win1256.
+    // win1256 misdecodes UTF-8 punctuation into Arabic-range characters
+    // (♪ = E2 99 AA becomes "â™ھ", and that ھ sits inside 0600-06FF), so the
+    // "did win1256 find Arabic?" check passed and the ENTIRE English file was
+    // returned as win1256 garbage — turning ♪ into ھ and every em-dash/curly
+    // quote into "â€"/"â€™" (the € symbol). A single music note was enough to
+    // poison a whole file.
+    if (!utf8.includes('\uFFFD')) {
+        return repairMojibake(utf8);
+    }
+
+    // Not valid UTF-8 → it's a legacy single-byte encoding. Prefer win1256
+    // only when it yields a MEANINGFUL amount of Arabic (not one stray glyph),
+    // otherwise treat it as Latin (win1252).
+    const win1256 = iconv.decode(buf, 'win1256');
+    const arabicCount = (win1256.match(/[\u0600-\u06FF]/g) || []).length;
+    if (arabicCount >= 20) return win1256;
+
+    return repairMojibake(iconv.decode(buf, 'win1252'));
 }
 
 function formatTime(ms) {
@@ -894,19 +914,35 @@ const url = `https://api.subsource.net/api/v1/subtitles?${subParams.toString()}`
 // with no colon). Deliberately does NOT touch <html>/{ass} tags — that's
 // stripTags's separate, independent job, so the two settings never fight
 // each other. Returns '' if the whole line should be dropped.
+// 🔥 Speaker-label matcher. Fires at the START of a line OR mid-line right
+// after sentence-ending punctuation — so "Hey how are you? Jack: I am fine."
+// loses only the "Jack:" part. A label is 1-4 words that each begin with a
+// capital/digit (JACK, Man 1, Police Officer, Dr. Smith, NARRATOR), which is
+// deliberately stricter than the old "any ≤25 chars before a colon" rule:
+// that older rule also ate real dialogue like "Remember this: never give up",
+// while this one leaves it intact.
+const SDH_SPEAKER_RE = /(?:^|(?<=[.!?…"'’)\]]\s))\s*[-–—]?\s*[A-Z][A-Za-z0-9'’.\-]*(?:\s+[A-Z0-9#][A-Za-z0-9'’.\-]*){0,3}\s?:(?=\s|$)\s*/g;
+
 function stripSdhFromLine(text) {
     if (!text) return '';
     let clean = text;
     clean = clean.replace(/\[.*?\]/g, '');
     clean = clean.replace(/\(.*?\)/g, '');
-    clean = clean.replace(/^\s*[-–—]?\s*[^:\n]{1,25}:(?=\s|$)\s*/, '');
-    clean = clean.trim();
+    clean = clean.replace(SDH_SPEAKER_RE, '');
+    // Collapse the double-spaces left behind by mid-line removals
+    clean = clean.replace(/\s{2,}/g, ' ').trim();
 
     // Judge all-caps against a tag-free copy so an incidental lowercase
     // letter inside a formatting tag (e.g. the "i" in <i>) never masks
     // genuinely all-caps SDH noise — but tags themselves are preserved in
     // what we actually return.
     const forCapsCheck = clean.replace(/<[^>]+>/g, '');
+
+    // 🔥 Nothing but punctuation/symbols survived (e.g. "(GRUNTS)." leaving a
+    // lone "."), so the whole line was SDH noise — drop it instead of
+    // emitting an orphaned punctuation cue.
+    if (!/[\p{L}\p{N}]/u.test(forCapsCheck)) return '';
+
     const hasLetters = /[a-zA-Z]/.test(forCapsCheck);
     if (hasLetters && forCapsCheck === forCapsCheck.toUpperCase()) return '';
 
