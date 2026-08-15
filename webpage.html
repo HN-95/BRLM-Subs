@@ -60,6 +60,19 @@
             .cut-chip.active { background:linear-gradient(135deg,#8A5A99,#6c4777); border-color:#8A5A99; color:#fff; transform:scale(1.05); box-shadow:0 4px 16px rgba(138,90,153,0.5); }
             .cut-chip.active:hover { transform:scale(1.08) translateY(-1px); }
 
+            /* 🔥 Info icons + tooltips */
+            .info-icon { display:inline-flex; align-items:center; justify-content:center; width:15px; height:15px; min-width:15px; border-radius:50%; background:#333; color:#a0a0a0; font-size:0.62rem; font-weight:bold; cursor:help; position:relative; transition:all 0.2s ease; font-style:normal; }
+            .info-icon:hover { background:#8A5A99; color:#fff; }
+            .info-icon .tip { visibility:hidden; opacity:0; position:absolute; bottom:130%; left:50%; transform:translateX(-50%) translateY(4px); background:#0d0d0d; color:#e5e5e5; border:1px solid #8A5A99; padding:9px 12px; border-radius:8px; font-size:0.75rem; font-weight:normal; line-height:1.5; width:230px; text-align:left; z-index:500; box-shadow:0 6px 20px rgba(0,0,0,.6); transition:opacity 0.22s ease, transform 0.22s ease; pointer-events:none; }
+            .info-icon:hover .tip { visibility:visible; opacity:1; transform:translateX(-50%) translateY(0); }
+            body[dir="rtl"] .info-icon .tip { text-align:right; }
+            /* Keep tooltips inside the panel near the edges */
+            .info-icon.tip-left .tip { left:auto; right:0; transform:translateX(0) translateY(4px); }
+            .info-icon.tip-left:hover .tip { transform:translateX(0) translateY(0); }
+            @media (max-width:600px) {
+                .info-icon .tip { width:180px; font-size:0.7rem; }
+            }
+
            /* 🔥 Mobile Adjustments */
             @media (max-width: 600px) {
                 .container { padding: 20px 15px; }
@@ -99,7 +112,7 @@
             <div id="dashMsg" class="msg"></div>
 
             <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold;" data-i18n="grpKeys">API Providers</label>
+                <label style="color:#e5e5e5; font-weight:bold;" data-i18n="grpKeys">API Providers</label> <i class="info-icon">i<span class="tip" data-i18n="tipKeys"></span></i>
                 
                 <div class="api-group">
                     <input type="password" id="cfgOsKey" placeholder="OpenSubtitles API Key (Required)" data-ph="osKey">
@@ -118,7 +131,7 @@
             </div>
 
             <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpLang">Language Extraction</label>
+                <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpLang">Language Extraction</label> <i class="info-icon">i<span class="tip" data-i18n="tipLang"></span></i>
                 <select id="cfgTargetLang" style="margin-bottom:0;">
                     <option value="ar" data-i18n="langAr">Arabic</option>
                     <option value="en" data-i18n="langEn">English</option>
@@ -128,24 +141,24 @@
             <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpRoutes">Providers & Routes</label>
                 <div class="grid-labels">
-                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles <span class="provider-status status-unknown" id="statusOs">–</span></label>
-                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteA"> <b data-i18n="routeA">Route A</b></label>
-                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL <span class="provider-status status-unknown" id="statusSubdl">–</span></label>
-                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteB"> <b data-i18n="routeB">Route B</b></label>
-                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource <span class="provider-status status-unknown" id="statusSubsource">–</span></label>
-                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteC"> <b data-i18n="routeC">Route C</b></label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseOs"> OpenSubtitles <i class="info-icon">i<span class="tip" data-i18n="tipUseOs"></span></i> <span class="provider-status status-unknown" id="statusOs">–</span></label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteA"> <b data-i18n="routeA">Route A</b> <i class="info-icon tip-left">i<span class="tip" data-i18n="tipRouteA"></span></i></label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubdl"> SubDL <i class="info-icon">i<span class="tip" data-i18n="tipUseSubdl"></span></i> <span class="provider-status status-unknown" id="statusSubdl">–</span></label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteB"> <b data-i18n="routeB">Route B</b> <i class="info-icon tip-left">i<span class="tip" data-i18n="tipRouteB"></span></i></label>
+                    <label class="check-label"><input type="checkbox" id="cfgUseSubsource"> SubSource <i class="info-icon">i<span class="tip" data-i18n="tipUseSubsource"></span></i> <span class="provider-status status-unknown" id="statusSubsource">–</span></label>
+                    <label class="check-label"><input type="checkbox" id="cfgAllowRouteC"> <b data-i18n="routeC">Route C</b> <i class="info-icon tip-left">i<span class="tip" data-i18n="tipRouteC"></span></i></label>
                 </div>
             </div>
 
             <div class="control-group">
                 <label style="color:#e5e5e5; font-weight:bold; display:block; margin-bottom:10px;" data-i18n="grpProc">Subtitle Processing</label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> <span data-i18n="chkTags">Strip Formatting Tags</span></label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> <span data-i18n="chkSdh">Remove SDH Elements</span></label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> <span data-i18n="chkStats">Include Stats for Nerds</span></label>
-               <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span></label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b></label>
-                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgSeparateRemux"> <b data-i18n="chkRemux">Separate Remux from BluRay</b></label>
-                <label class="check-label"><input type="checkbox" id="cfgMatchCut" onchange="toggleCutPanel(this.checked, true)"> <b data-i18n="chkMatchCut">Match Subtitles With Movie's Cut</b></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> <span data-i18n="chkTags">Strip Formatting Tags</span> <i class="info-icon">i<span class="tip" data-i18n="tipTags"></span></i></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> <span data-i18n="chkSdh">Remove SDH Elements</span> <i class="info-icon">i<span class="tip" data-i18n="tipSdh"></span></i></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> <span data-i18n="chkStats">Include Stats for Nerds</span> <i class="info-icon">i<span class="tip" data-i18n="tipStats"></span></i></label>
+               <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span> <i class="info-icon">i<span class="tip" data-i18n="tipAuto"></span></i></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b> <i class="info-icon">i<span class="tip" data-i18n="tip4k"></span></i></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgSeparateRemux"> <b data-i18n="chkRemux">Separate Remux from BluRay</b> <i class="info-icon">i<span class="tip" data-i18n="tipRemux"></span></i></label>
+                <label class="check-label"><input type="checkbox" id="cfgMatchCut" onchange="toggleCutPanel(this.checked, true)"> <b data-i18n="chkMatchCut">Match Subtitles With Movie's Cut</b> <i class="info-icon">i<span class="tip" data-i18n="tipMatchCut"></span></i></label>
 
                 <div class="cut-panel" id="cutPanel">
                     <div class="cut-panel-inner">
@@ -161,7 +174,7 @@
             </div>
 
             <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block;" data-i18n="grpMax">Max Returned Subtitles</label>
+                <label style="color:#e5e5e5; font-weight:bold; display:block;" data-i18n="grpMax">Max Returned Subtitles</label> <i class="info-icon">i<span class="tip" data-i18n="tipMax"></span></i>
                 <div class="slider-container">
                     <input type="range" id="cfgMaxSubs" min="1" max="20" value="5" oninput="document.getElementById('valMaxSubs').innerText = this.value">
                     <div class="slider-val" id="valMaxSubs">5</div>
@@ -169,7 +182,7 @@
             </div>
 
             <div class="control-group">
-                <label style="color:#e5e5e5; font-weight:bold; display:block;" data-i18n="grpStrict">Engine Strictness</label>
+                <label style="color:#e5e5e5; font-weight:bold; display:block;" data-i18n="grpStrict">Engine Strictness</label> <i class="info-icon">i<span class="tip" data-i18n="tipStrict"></span></i>
                 <p style="color:#a0a0a0; font-size:0.85rem; margin-bottom: 5px;" data-i18n="descStrict">0 = Bypass Math | 3 = Balanced | 5 = Cut Focus</p>
                 <div class="slider-container">
                     <input type="range" id="cfgEngine" min="0" max="5" value="3" oninput="document.getElementById('valEngine').innerText = this.value">
@@ -182,11 +195,12 @@
                 <a href="#" id="stremioBtn" class="btn" style="background:#4caf50;" data-i18n="btnStremio">Install to Stremio</a>
                 <button id="copyBtn" class="btn" style="background:#444;" onclick="copyManifest()" data-i18n="btnCopy">Copy Manifest Link</button>
             </div>
+            <button class="btn" style="background:#7a4a2a; margin-top:15px;" onclick="resetSettings()" data-i18n="btnReset">Reset to Default Settings</button>
             <button class="btn" style="background:#333; margin-top:15px;" onclick="logout()" data-i18n="btnLogout">Logout</button>
         </div>
 
         <script>
-		    const BACKEND_URL = "";
+		    const BACKEND_URL = "http://127.0.0.1:7000";
             const dict = {
                 en: {
                     authDesc: "Welcome. Please authenticate.", login: "Login", register: "Register",
@@ -199,7 +213,25 @@
                    grpProc: "Subtitle Processing", chkTags: "Strip Formatting Tags", chkSdh: "Remove SDH Elements", chkStats: "Include Stats for Nerds", chkAuto: "Auto-Download Next Episode", chk4k: "Strict 4K Shield", chkRemux: "Separate Remux from BluRay", chkMatchCut: "Match Subtitles With Movie's Cut",
                     cutPanelDesc: "Only be strict for the cuts you select below — leave a cut unchecked to skip strict matching for it.", cutDirector: "Director's Cut", cutTheatrical: "Theatrical", cutExtended: "Extended",
                     grpMax: "Max Returned Subtitles", grpStrict: "Engine Strictness", descStrict: "0 = Bypass Math | 3 = Balanced | 5 = Cut Focus",
-                    btnSave: "Save Settings", btnStremio: "Install to Stremio", btnCopy: "Copy Manifest Link", btnLogout: "Logout", dir: "ltr", langToggle: "عربي"
+                    btnSave: "Save Settings", btnStremio: "Install to Stremio", btnCopy: "Copy Manifest Link", btnLogout: "Logout", dir: "ltr", langToggle: "عربي",
+                    btnReset: "Reset to Default Settings", resetConfirm: "Reset all settings to their defaults? Your API keys will be kept.",
+                    tipKeys: "Your personal API keys. OpenSubtitles is required. SubDL and SubSource are optional but highly recommened to get more results.",
+                    tipLang: "The language of subtitles you want.",
+                    tipUseOs: "Get subtitles from OpenSubtitles.",
+                    tipUseSubdl: "Get subtitles from SubDL.",
+                    tipUseSubsource: "Get subtitles from SubSource.",
+                    tipRouteA: "The smart sync engine: measures each subtitle against an English reference and auto-corrects the delay. Highest quality — leave ON.",
+                    tipRouteB: "Fallback: returns the best filename match without sync verification. Useful when Route A finds nothing.",
+                    tipRouteC: "Last resort: returns any usable subtitle found, unverified. Turn OFF if you would rather get nothing than a bad match.",
+                    tipTags: "Removes styling codes (HTML/ASS) like colors, italics and positioning from the final file.",
+                    tipSdh: "Removes deaf/hard-of-hearing extras: [sound effects], (grunts), and speaker names like 'JACK:'.",
+                    tipStats: "Adds a debug track showing engine mode, detected stream type, and result counts.",
+                    tipAuto: "Pre-fetches the next episode's subtitles in the background so it loads instantly. Uses extra API quota.",
+                    tip4k: "For 4K files, refuse to fall back to 1080p reference tracks. Safer sync, but often returns nothing. Usually best left OFF.",
+                    tipRemux: "Treats REMUX and regular BluRay as different sources. REMUX is an exact disc copy, BluRay rips are re-encoded and can differ in timing.",
+                    tipMatchCut: "Only accept subtitles matching your movie's edition. Pick which cuts to enforce in the panel that appears.",
+                    tipMax: "How many subtitle options to return. Higher gives more choice but a longer list to scroll.",
+                    tipStrict: "How closely a subtitle must sync to pass. 0 = accept anything, 3 = balanced, 5 = only near-perfect matches."
                 },
                 ar: {
                     authDesc: "مرحباً. يرجى تسجيل الدخول.", login: "دخول", register: "حساب جديد",
@@ -210,9 +242,27 @@
                     grpLang: "لغة الترجمة المطلوبة", langAr: "العربية", langEn: "الإنجليزية",
                     grpRoutes: "الخوادم والمسارات", routeA: "المسار A (المزامنة الذكية)", routeB: "المسار B (المطابقة المباشرة)", routeC: "المسار C (الاحتياطي)",
                     grpProc: "معالجة الترجمة", chkTags: "إزالة أكواد التنسيق (HTML)", chkSdh: "إزالة وصف الأصوات (SDH)", chkStats: "إظهار إحصائيات الأداء", chkAuto: "تحميل الحلقة القادمة مسبقاً", chk4k: "حماية دقة 4K", chkRemux: "فصل الـ Remux عن BluRay", chkMatchCut: "مطابقة الترجمة مع نسخة الفيلم",
-                    cutPanelDesc: "التدقيق الصارم يعمل فقط على النسخ التي تحددها هنا — اترك أي نسخة غير محددة لتخطي التدقيق الصارم لها.", cutDirector: "نسخة المخرج", cutTheatrical: "العرض السينمائي", cutExtended: "النسخة الموسعة",
+                    cutPanelDesc: "التدقيق الصارم يعمل فقط على النسخ التي تحددها هنا — اترك أي نسخة غير محددة لتخطي التدقيق الصارم لها.", cutDirector: "Director's Cut", cutTheatrical: "Theatrical Cut", cutExtended: "Extended Cut",
                     grpMax: "الحد الأقصى للترجمات", grpStrict: "قوة التدقيق", descStrict: "0 = بدون تدقيق | 3 = متوازن | 5 = تدقيق صارم للنسخة",
-                    btnSave: "حفظ الإعدادات", btnStremio: "تثبيت في Stremio", btnCopy: "نسخ الرابط", btnLogout: "خروج", dir: "rtl", langToggle: "English"
+                    btnSave: "حفظ الإعدادات", btnStremio: "تثبيت في Stremio", btnCopy: "نسخ الرابط", btnLogout: "خروج", dir: "rtl", langToggle: "English",
+                    btnReset: "استعادة الإعدادات الافتراضية", resetConfirm: "استعادة جميع الإعدادات إلى الوضع الافتراضي؟ سيتم الاحتفاظ بمفاتيح الـ API.",
+                    tipKeys: "مفاتيح الـ API الخاصة بك. مفتاح OpenSubtitles مطلوب. أما SubDL و SubSource فلن يعملا إلا بمفتاحك الخاص، لا يوجد مفتاح مشترك.",
+                    tipLang: "لغة الترجمة التي تريد الحصول عليها. النسخة الإنجليزية المرجعية تُجلب دائماً لأغراض المزامنة.",
+                    tipUseOs: "استخدام OpenSubtitles كمصدر. أكبر مكتبة، ومطلوب للنسخة المرجعية للمزامنة.",
+                    tipUseSubdl: "استخدام SubDL كمصدر. يتطلب مفتاح SubDL الخاص بك.",
+                    tipUseSubsource: "استخدام SubSource كمصدر. يتطلب مفتاح SubSource الخاص بك.",
+                    tipRouteA: "محرك المزامنة الذكي: يقيس كل ترجمة مقابل مرجع إنجليزي ويصحح التأخير تلقائياً. أعلى جودة، يُفضّل إبقاؤه مفعلاً.",
+                    tipRouteB: "احتياطي: يُرجع أفضل تطابق بالاسم دون التحقق من المزامنة. مفيد عندما لا يجد المسار A شيئاً.",
+                    tipRouteC: "الملاذ الأخير: يُرجع أي ترجمة صالحة دون تحقق. أوقفه إذا كنت تفضّل ألا تحصل على شيء بدلاً من ترجمة سيئة.",
+                    tipTags: "إزالة أكواد التنسيق (HTML/ASS) مثل الألوان والخط المائل وتحديد المواضع من الملف النهائي.",
+                    tipSdh: "إزالة إضافات ضعاف السمع: [المؤثرات الصوتية]، (الأنين)، وأسماء المتحدثين مثل 'JACK:'.",
+                    tipStats: "إضافة مسار تشخيصي يعرض وضع المحرك ونوع الملف المكتشف وعدد النتائج.",
+                    tipAuto: "جلب ترجمة الحلقة التالية مسبقاً في الخلفية لتحميلها فوراً. يستهلك حصة إضافية من الـ API.",
+                    tip4k: "لملفات 4K، رفض الرجوع إلى مراجع 1080p. مزامنة أأمن لكنه غالباً لا يُرجع نتائج. يُفضّل إبقاؤه متوقفاً.",
+                    tipRemux: "يعامل REMUX و BluRay العادي كمصدرين مختلفين. الـ REMUX نسخة طبق الأصل من القرص، أما نسخ BluRay فمُعاد ترميزها وقد تختلف في التوقيت.",
+                    tipMatchCut: "قبول الترجمات المطابقة لنسخة الفيلم فقط. اختر النسخ المطلوب تدقيقها من اللوحة التي تظهر.",
+                    tipMax: "عدد خيارات الترجمة التي تُعرض. الأعلى يعطي خيارات أكثر لكن قائمة أطول.",
+                    tipStrict: "مدى دقة المزامنة المطلوبة للقبول. 0 = قبول أي شيء، 3 = متوازن، 5 = المطابقات شبه المثالية فقط."
                 }
           };
 
@@ -443,6 +493,25 @@
                     document.getElementById('stremioBtn').href = data.installLink;
                     document.getElementById('installWrapper').style.display = 'block';
                     refreshProviderStatus();
+                } catch (e) { showMsg(document.getElementById('dashMsg'), "Network Error.", true); }
+            }
+
+            // 🔥 Restores every tuning option to the server-side defaults
+            // (CONFIG.DEFAULT_SETTINGS in addon.js). API keys are preserved.
+            // The form is re-rendered from the row the server returns, so the
+            // UI always reflects what was actually saved rather than a guess.
+            async function resetSettings() {
+                if (!confirm(dict[currentLang].resetConfirm)) return;
+                try {
+                    const res = await fetch(`${BACKEND_URL}/api/reset`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username: loggedUser, password: loggedPass })
+                    });
+                    const data = await res.json();
+                    if (!res.ok) return showMsg(document.getElementById('dashMsg'), data.error, true);
+                    loadDashboard(data.user);
+                    showMsg(document.getElementById('dashMsg'), data.message, false);
                 } catch (e) { showMsg(document.getElementById('dashMsg'), "Network Error.", true); }
             }
 
