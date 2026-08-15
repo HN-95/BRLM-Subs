@@ -91,7 +91,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.4.3",
+    ADDON_VERSION: "1.4.4",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -141,6 +141,31 @@ const CONFIG = {
     STRICT_TYPE_MATCHING: true,        // Force baselines to match stream type (WEB/BluRay/HDTV) 
 	CLONE_SAMPLE_SIZE: 400,            // Number of pure Arabic characters to sample for shift-invariant clone detection
 
+    // ─── 🔥 DEFAULT USER SETTINGS ─────────────────────────────────────────────
+    // Single source of truth for the "Reset to Default Settings" button.
+    // Change any value here and every future reset uses the new value —
+    // no other file needs touching. API keys are deliberately NOT listed:
+    // a reset must never wipe the keys a user pasted in.
+    DEFAULT_SETTINGS: {
+        targetLang: 'en',
+        stripTags: 0,
+        includeStats: 0,
+        removeSdh: 1,
+        maxSubs: 5,
+        engineStrength: 3,
+        useOs: 1,
+        useSubdl: 1,
+        useSubsource: 1,
+        allowRouteA: 1,
+        allowRouteB: 1,
+        allowRouteC: 1,
+        strict4k: 0,
+        autoFetchNext: 1,
+        matchCut: 1,
+        matchCutDirector: 1,
+        matchCutTheatrical: 0,
+        matchCutExtended: 1
+    }
 };
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1256,6 +1281,66 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
     } catch(e) { return null; }
 }
 
+// 🔥 NO-RESULTS DIAGNOSTIC
+// Builds a short on-screen explanation when the engine returns nothing.
+// Crucially, the "try X instead" advice is EVIDENCE-BASED: it tallies the
+// release types of the subtitles that actually exist for this title (from
+// the candidate pool we already fetched — no extra API calls), and only
+// suggests a type that genuinely has subtitles available. If nothing at
+// all exists, it says so instead of inventing a suggestion.
+function buildNoResultsDiagnostic(diagPool, detectedType, streamTypeGroup, userConfig, isTV) {
+    const TYPE_LABELS = {
+        'WEBDL': 'WEB-DL', 'WEBDL_4K': 'WEB-DL 4K',
+        'WEBRIP': 'WEBRip', 'WEBRIP_4K': 'WEBRip 4K',
+        'BLURAY': 'BluRay/REMUX', 'BLURAY_4K': 'BluRay/REMUX 4K',
+        'HDTV': 'HDTV', 'HDTV_4K': 'HDTV 4K',
+        'DVD': 'DVD', 'CAM': 'CAM'
+    };
+
+    // Tally what release types the available subtitles actually cover
+    const tally = {};
+    for (const c of diagPool) {
+        const g = getReleaseTypeGroup(tokeniseRelease(c.releaseName || ''));
+        if (!g) continue;
+        tally[g] = (tally[g] || 0) + 1;
+    }
+
+    const currentCount = tally[streamTypeGroup] || 0;
+    const alternatives = Object.entries(tally)
+        .filter(([g]) => g !== streamTypeGroup)
+        .sort((a, b) => b[1] - a[1]);
+
+    let reason;
+    let suggestion;
+
+    if (diagPool.length === 0) {
+        reason = `No subtitles exist for this title in your selected language.`;
+        suggestion = userConfig.targetLang === 'ar' || userConfig.targetLang === 'ara'
+            ? `Try switching Language to English in the dashboard, or check back later.`
+            : `Try switching Language in the dashboard, or check back later.`;
+    } else if (alternatives.length > 0) {
+        const list = alternatives.slice(0, 3).map(([g, n]) => `${TYPE_LABELS[g] || g} (${n})`).join(', ');
+        reason = `Found ${diagPool.length} subtitle(s) for this title, but ${currentCount} for your version (${detectedType}).`;
+        suggestion = `Play a different release instead — available: ${list}.`;
+    } else if (currentCount > 0) {
+        reason = `Found ${currentCount} subtitle(s) matching ${detectedType}, but none passed the sync/quality checks.`;
+        suggestion = `Lower "Engine Strictness" in the dashboard, or enable Route B / Route C for looser matching.`;
+    } else {
+        reason = `Found ${diagPool.length} subtitle(s), but none could be matched to your version (${detectedType}).`;
+        suggestion = `Try a different release, or lower "Engine Strictness" in the dashboard.`;
+    }
+
+    // Extra hints for settings that commonly cause an empty result
+    const hints = [];
+    if (userConfig.matchCut) hints.push(`"Match Subtitles With Movie's Cut" is ON — it may be filtering valid results.`);
+    if (userConfig.strict4k) hints.push(`"Strict 4K Shield" is ON — it blocks 1080p fallback baselines.`);
+    if (userConfig.engineStrength >= 4) hints.push(`Engine Strictness is ${userConfig.engineStrength} (high).`);
+    if (!userConfig.allowRouteB && !userConfig.allowRouteC) hints.push(`Route B and Route C are both OFF — no fallbacks available.`);
+    const text = `1\n00:00:01,000 --> 00:00:12,000\n{\\an8}<font color="#ff9500"><b>⚠️ ${CONFIG.ADDON_NAME}: No Subtitles Found</b></font>\n<font color="#ffffff">${reason}</font>\n<font color="#00ffcc">💡 ${suggestion}</font>${hints.length ? `\n<font color="#cccccc">${hints.join(' ')}</font>` : ''}`;
+
+    return { text, reason, suggestion };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN ENGINE (Detached for Background Tasks)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1397,6 +1482,9 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 
         let finalOutput = [];
         let bestFallback = null;
+        // 🔥 Raw target-language candidates seen this request (pre-filtering).
+        // Used ONLY to explain an empty result — costs no extra API calls.
+        let diagPool = [];
 
         // =====================================================================
         // PATH A: THE TV MULTI-CUT SWEEP
@@ -1519,6 +1607,8 @@ if (osRulers.length === 0) {
                 ...arSubdl.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode) })),
                 ...arSubsource.map(c => ({ ...c, fetchFn: () => getArchiveSrt(c.downloadUrl, season, episode, { 'X-API-Key': userConfig.subsourceKey }) }))
             ];
+            // 🔥 Snapshot for the no-results diagnostic (before any filtering)
+            diagPool = allCandidates.map(c => ({ releaseName: c.releaseName }));
 
             let allSurvivingTvArabic = [];
 
@@ -1685,6 +1775,11 @@ let routeBCount = 0;
                 console.log(`  🚀 [Route B] Pushing top match: ${c.releaseName}`);
                 try {
                     let routeBParsed = srtParser.fromSrt(c.fetchedText);
+                    // 🔥 Route B previously skipped SDH stripping entirely —
+                    // only Route A winners and the English rulers were ever
+                    // cleaned, so "Remove SDH Elements" silently did nothing
+                    // for any Route B result.
+                    if (userConfig.removeSdh) routeBParsed = stripSdhAndClean(routeBParsed);
                     routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
                     let finalRouteBText = srtParser.toSrt(routeBParsed);
                     if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
@@ -1789,6 +1884,8 @@ let routeBCount = 0;
                 ...arSubdl.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl) })),
                 ...arSubsource.map((c, index) => ({ ...c, trackNum: index + 1, fetchFn: () => getArchiveSrt(c.downloadUrl, null, null, { 'X-API-Key': userConfig.subsourceKey }) })),
             ];
+            // 🔥 Snapshot for the no-results diagnostic (before any filtering)
+            diagPool = allArabicCandidates.map(c => ({ releaseName: c.releaseName }));
 
             let allSurvivingArabic = [];
 let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
@@ -1976,7 +2073,9 @@ for (const champ of allSurvivingArabic) {
 
                     console.log(`  🚀 [Route B] Pushing top match: ${c.releaseName}`);
                     try {
-                        let routeBParsed = srtParser.fromSrt(c.fetchedText);
+                       let routeBParsed = srtParser.fromSrt(c.fetchedText);
+                        // 🔥 Route B previously skipped SDH stripping entirely (see TV-mode note).
+                        if (userConfig.removeSdh) routeBParsed = stripSdhAndClean(routeBParsed);
                         routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
                         let finalRouteBText = srtParser.toSrt(routeBParsed);
                         if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
@@ -1998,11 +2097,19 @@ finalOutput = finalOutput.filter(item => item !== null);
 
       // 🔥 ROUTE C: If Route A and Route B both failed entirely, serve the absolute fallback
         if (userConfig.allowRouteC && winnersCount === 0 && bestFallback) {
-            console.log(`⚠️ Route A & B failed. Serving Route C (Fallback) from ${bestFallback.candidate.source}.`);
+           console.log(`⚠️ Route A & B failed. Serving Route C (Fallback) from ${bestFallback.candidate.source}.`);
+            // 🔥 Build the same evidence-based diagnostic the no-results path
+            // uses, but MERGE it into the Route C subtitle instead of
+            // returning a separate dummy track — the user still gets a usable
+            // subtitle, plus an on-screen heads-up that it's unverified and
+            // which release would work better.
+            const routeCDiag = buildNoResultsDiagnostic(diagPool, detectedType, streamTypeGroup, userConfig, isTV);
             let fallbackParsed;
             try {
                 fallbackParsed = srtParser.fromSrt(bestFallback.text);
-                fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route C)` });
+                // 🔥 Route C previously skipped SDH stripping entirely.
+                if (userConfig.removeSdh) fallbackParsed = stripSdhAndClean(fallbackParsed);
+                fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:09,000", text: `{\\an8}<font color="#ff9500"><b>⚠️ ${CONFIG.ADDON_NAME}: Unverified Match (Route C)</b></font>\n<font color="#ffffff">${routeCDiag.reason}</font>\n<font color="#00ffcc">💡 ${routeCDiag.suggestion}</font>` });
                 bestFallback.text = srtParser.toSrt(fallbackParsed);
             } catch(e) {}
 
@@ -2010,7 +2117,7 @@ finalOutput = finalOutput.filter(item => item !== null);
             let finalSrtText = bestFallback.text;
             if (stripTags) finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
             subtitleCache.set(cacheId, finalSrtText);
-            finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[🔴 Route C | Fallback${cutUnverifiedNote(bestFallback.candidate)}]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
+            finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[🔴 Route C | Unverified — see note at 0:01${cutUnverifiedNote(bestFallback.candidate)}]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
         }
 
        if (finalOutput.length > 0) {
@@ -2051,8 +2158,19 @@ finalOutput = finalOutput.filter(item => item !== null);
             return { subtitles: finalOutput };
         }
 
-        console.log(`\n[Done] No subtitles found.`);
-        return { subtitles: [] };
+        // 🔥 Nothing to return — explain WHY, on-screen, in the first seconds.
+        {
+            const diag = buildNoResultsDiagnostic(diagPool, detectedType, streamTypeGroup, userConfig, isTV);
+            console.log(`\n[Done] No subtitles found. ${diag.reason} ${diag.suggestion}`);
+            const diagId = `diag_noresults_${Date.now()}.srt`;
+            subtitleCache.set(diagId, diag.text);
+            return { subtitles: [{
+                id: diagId,
+                url: `${HOST}/dl/${diagId}`,
+                lang: outputLang,
+                title: `⚠️ No Results — Tap for Reason & Fix`
+            }] };
+        }
 
    } catch (error) {
         console.error("❌ Fatal:", error.message);
@@ -2252,6 +2370,30 @@ app.get('/api/provider-status', (req, res) => {
         result[p] = entry ? entry.status : 'unknown';
     }
     res.json(result);
+});
+
+// 🔥 RESET TO DEFAULTS — restores every tuning option to
+// CONFIG.DEFAULT_SETTINGS. Built dynamically from that object, so adding or
+// changing a default there is all that's ever needed. API keys and the
+// panel language are intentionally preserved: a user resetting because
+// "nothing works" should not also lose the keys they pasted in.
+app.post('/api/reset', (req, res) => {
+    const { username, password } = req.body;
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
+    if (!user) return res.status(401).json({ error: "Authentication failed." });
+
+    try {
+        const keys = Object.keys(CONFIG.DEFAULT_SETTINGS);
+        const setClause = keys.map(k => `${k} = ?`).join(', ');
+        const values = keys.map(k => CONFIG.DEFAULT_SETTINGS[k]);
+        db.prepare(`UPDATE users SET ${setClause} WHERE LOWER(username) = LOWER(?)`).run(...values, username);
+
+        const updated = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username);
+        res.json({ success: true, message: "Settings restored to defaults!", user: updated });
+    } catch (e) {
+        console.error("Reset Error:", e.message);
+        res.status(500).json({ error: "Failed to reset settings." });
+    }
 });
 
 app.get('/dl/:cacheId', (req, res) => {
