@@ -42,7 +42,9 @@ db.exec(`
     matchCut INTEGER DEFAULT 0,
     matchCutDirector INTEGER DEFAULT 1,
     matchCutTheatrical INTEGER DEFAULT 1,
-    matchCutExtended INTEGER DEFAULT 1
+    matchCutExtended INTEGER DEFAULT 1,
+    matchStreamType INTEGER DEFAULT 1,
+    useCache INTEGER DEFAULT 1
   )
 `);
 
@@ -83,6 +85,31 @@ try {
         db.exec('ALTER TABLE users ADD COLUMN matchCutExtended INTEGER DEFAULT 1');
     } catch(err) {}
 }
+
+// 🔥 AUTO-MIGRATOR #4: Adds "Match Results With Content's Source Type"
+// (WEB-DL / BluRay / HDTV / DVD). Defaults to ON (1) — a subtitle labelled
+// for a different SOURCE is the single most common cause of a bad match, so
+// new and existing users both get the protection immediately.
+try {
+    db.prepare('SELECT matchStreamType FROM users LIMIT 1').get();
+} catch (e) {
+    console.log("⚠️ Updating database schema to include Source Type Matching toggle...");
+    try {
+        db.exec('ALTER TABLE users ADD COLUMN matchStreamType INTEGER DEFAULT 1');
+    } catch(err) {}
+}
+
+// 🔥 AUTO-MIGRATOR #5: Adds the "Save downloaded subtitles to cache" toggle.
+// Defaults to ON (1) — caching is what keeps repeat plays instant and saves
+// provider API quota, so it stays enabled unless a user opts out.
+try {
+    db.prepare('SELECT useCache FROM users LIMIT 1').get();
+} catch (e) {
+    console.log("⚠️ Updating database schema to include Cache toggle...");
+    try {
+        db.exec('ALTER TABLE users ADD COLUMN useCache INTEGER DEFAULT 1');
+    } catch(err) {}
+}
 // ═════════════════════════════════════════════════════════════════════════════
 // ═════════════════════════════════════════════════════════════════════════════
 // ⚙️ THE MASTER CONFIGURATION HUB
@@ -91,7 +118,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.4.4",
+    ADDON_VERSION: "1.4.5",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -158,13 +185,15 @@ const CONFIG = {
         useSubsource: 1,
         allowRouteA: 1,
         allowRouteB: 1,
-        allowRouteC: 1,
+        allowRouteC: 0,
         strict4k: 0,
-        autoFetchNext: 1,
+        autoFetchNext: 0,
         matchCut: 1,
         matchCutDirector: 1,
         matchCutTheatrical: 0,
-        matchCutExtended: 1
+        matchCutExtended: 1,
+        matchStreamType: 1,
+        useCache: 1
     }
 };
 // ═════════════════════════════════════════════════════════════════════════════
@@ -239,15 +268,29 @@ async function prefetchInBatches(candidates, batchSize = PREFETCH_BATCH_SIZE) {
 // to run on the request hot path.
 const MAX_SUBTITLE_CACHE_ENTRIES = 1500;
 setInterval(() => {
-    if (subtitleCache.size <= MAX_SUBTITLE_CACHE_ENTRIES) return;
-    const excess = subtitleCache.size - MAX_SUBTITLE_CACHE_ENTRIES;
-    const it = subtitleCache.keys();
-    for (let i = 0; i < excess; i++) {
-        const oldestKey = it.next().value;
-        if (oldestKey === undefined) break;
-        subtitleCache.delete(oldestKey);
+    if (subtitleCache.size > MAX_SUBTITLE_CACHE_ENTRIES) {
+        const excess = subtitleCache.size - MAX_SUBTITLE_CACHE_ENTRIES;
+        const it = subtitleCache.keys();
+        for (let i = 0; i < excess; i++) {
+            const oldestKey = it.next().value;
+            if (oldestKey === undefined) break;
+            subtitleCache.delete(oldestKey);
+        }
+        console.log(`🧹 [Cache Sweep] Trimmed ${excess} oldest subtitle cache entries (cap: ${MAX_SUBTITLE_CACHE_ENTRIES}).`);
     }
-    console.log(`🧹 [Cache Sweep] Trimmed ${excess} oldest subtitle cache entries (cap: ${MAX_SUBTITLE_CACHE_ENTRIES}).`);
+
+    // 🔥 AUDIT FIX — responseCache only ever deleted an expired entry when
+    // that exact key happened to be READ again. A key never requested a
+    // second time stayed in memory for the life of the process, holding a
+    // full result set (every subtitle title/url for that request). With
+    // enough distinct titles that grows without bound. Sweep it on the same
+    // timer as subtitleCache so expired entries are actively reclaimed.
+    let purged = 0;
+    const now = Date.now();
+    for (const [key, val] of responseCache) {
+        if (now - val.timestamp >= CACHE_TTL_MS) { responseCache.delete(key); purged++; }
+    }
+    if (purged) console.log(`🧹 [Cache Sweep] Purged ${purged} expired response cache entries.`);
 }, 15 * 60 * 1000);
 
 // 🔥 RELIABILITY #5 — IN-FLIGHT REQUEST COALESCING: if two requests for the
@@ -358,6 +401,43 @@ function filterBaselinesByType(candidates, streamTypeGroup) {
         const cGroup = getReleaseTypeGroup(cTokens);
         return cGroup === streamTypeGroup;
     });
+}
+
+// 🔥 "Match Results With Content's Source Type" (userConfig.matchStreamType,
+// ON by default). Stops a BluRay-labelled subtitle being returned for a
+// WEB-DL file and vice-versa — the #1 cause of "this sub is out of sync"
+// complaints, since different SOURCES can carry genuinely different timing.
+//
+// Two deliberate design choices:
+//   1. Resolution is IGNORED. WEBDL_4K and WEBDL are the same SOURCE — a
+//      2160p and 1080p rip of the same web master share identical timing,
+//      so rejecting across resolutions would starve results for zero gain.
+//      Only the base source (WEBDL / WEBRIP / BLURAY / HDTV / DVD / CAM)
+//      has to match.
+//   2. UNTAGGED candidates are allowed through, flagged `unverified`.
+//      A release with no source tag is *unlabelled*, not *confirmed wrong*
+//      — and a large share of uploads (especially non-English ones) carry
+//      no source tag at all. Rejecting them outright would wipe out most
+//      results. They still have to pass Route A's timing math, and they're
+//      marked in the title so the user knows the source wasn't confirmed.
+function baseTypeGroup(group) {
+    return group ? group.replace('_4K', '') : null;
+}
+function checkStreamTypeCompatibility(streamTypeGroup, candidateReleaseName) {
+    const userBase = baseTypeGroup(streamTypeGroup);
+    // We couldn't detect the played file's own source — there is nothing to
+    // match against, so this filter cannot make a judgement either way.
+    if (!userBase) return { compatible: true };
+
+    const candidateBase = baseTypeGroup(getReleaseTypeGroup(tokeniseRelease(candidateReleaseName)));
+
+    // 🔥 STRICT: a release with no source tag in its filename is NOT proof
+    // of a match, so it is rejected while this option is ON. Untagged
+    // uploads are only considered when the option is turned OFF — that is
+    // precisely what turning it off means.
+    if (candidateBase === null) return { compatible: false, untagged: true };
+
+    return { compatible: candidateBase === userBase };
 }
 
 // 🔥 "Match subtitles with the movie's cut" — user-configurable, OFF by
@@ -1383,7 +1463,10 @@ async function runSubtitleEngine(args) {
             matchCut: userRow.matchCut === 1,
             matchCutDirector: userRow.matchCutDirector === 1,
             matchCutTheatrical: userRow.matchCutTheatrical === 1,
-            matchCutExtended: userRow.matchCutExtended === 1
+            matchCutExtended: userRow.matchCutExtended === 1,
+            // Defaults ON: treat a legacy row with a NULL/missing value as enabled.
+            matchStreamType: userRow.matchStreamType !== 0,
+            useCache: userRow.useCache !== 0
         };
         const isTargetArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
         // 🔥 The real language tag every CONTENT winner (Route A/B/C, Blind
@@ -1453,8 +1536,12 @@ if (streamTypeGroup?.startsWith('WEBDL')) detectedType = 'WEB-DL' + resTag;
 // 🔥 Cache Key now tracks all active configurations to avoid crossover
        const providerKey = `${userConfig.useOs?1:0}${userConfig.useSubdl?1:0}${userConfig.useSubsource?1:0}`;
        const routeKey = `${userConfig.allowRouteA?1:0}${userConfig.allowRouteB?1:0}${userConfig.allowRouteC?1:0}`;
-       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_mcut${userConfig.matchCut?1:0}${[...enabledCutSet].sort().join('')}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
-       if (responseCache.has(requestCacheKey)) {
+       const requestCacheKey = `${args.id}_${detectedType}${editionKey}_${activeOsKey}_lang${userConfig.targetLang}_st${stripTags}_sdh${userConfig.removeSdh}_stth${userConfig.engineStrength}_p${providerKey}_r${routeKey}_4k${userConfig.strict4k?1:0}_mcut${userConfig.matchCut?1:0}${[...enabledCutSet].sort().join('')}_mst${userConfig.matchStreamType?1:0}_max${userConfig.maxSubs}_stats${userConfig.includeStats?1:0}`;
+       // 🔥 "Save downloaded subtitles to cache" OFF -> never serve a stored
+
+       // result; every play re-queries the providers for a fresh answer.
+
+       if (userConfig.useCache && responseCache.has(requestCacheKey)) {
             const cachedResult = responseCache.get(requestCacheKey);
             if (Date.now() - cachedResult.timestamp < CACHE_TTL_MS) {
                 console.log(`\n⚡ [CACHE HIT] Serving ${args.id} instantly! (Zero API credits used)`);
@@ -1641,6 +1728,20 @@ if (osRulers.length === 0) {
                     return true;
                 });
             }
+            // 🔥 NEW: "Match Results With Content's Source Type" (ON by default).
+            // Applied BEFORE prefetch so a wrong-source candidate is never even
+            // downloaded. See checkStreamTypeCompatibility() for the rules.
+            if (userConfig.matchStreamType) {
+                tvCandidatesToProcess = tvCandidatesToProcess.filter(c => {
+                    const result = checkStreamTypeCompatibility(streamTypeGroup, c.releaseName);
+                    if (!result.compatible) {
+                        const why = result.untagged ? 'no source tag in filename' : `source differs from ${detectedType}`;
+                        console.log(`  📼 [Source Match] Skipping ${c.releaseName} (${why})`);
+                        return false;
+                    }
+                    return true;
+                });
+            }
             await prefetchInBatches(tvCandidatesToProcess);
 
             console.log(`\n[TV Mode] Initiating Battle Royale against ${osRulers.length} OS Cuts...`);
@@ -1753,7 +1854,15 @@ if (osRulers.length === 0) {
   // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[TV Mode] Extracting Route B (Top 2 Raw Matches)...`);
-              const routeBCandidates = filterBaselinesByType(allCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
+              // 🔥 Route B now honours the same "Match Source Type" toggle as
+              // Route A. Previously it ALWAYS filtered strictly here (and
+              // rejected untagged uploads outright), which made Route B
+              // frequently return nothing while Route A returned wrong-source
+              // results — the two routes now behave consistently.
+              const routeBCandidates = allCandidates
+                  .filter(c => c.fetchedText)
+                  .filter(c => !userConfig.matchStreamType || checkStreamTypeCompatibility(effectiveTypeGroup, c.releaseName).compatible)
+                  .sort((a, b) => b.score - a.score);
 let routeBCount = 0;
             for (const c of routeBCandidates) {
                 if (routeBCount >= 2) break;
@@ -1918,6 +2027,20 @@ let sourceCounters = { 'OpenSubtitles': 0, 'SubDL': 0, 'SubSource': 0 };
                     return true;
                 });
             }
+            // 🔥 NEW: "Match Results With Content's Source Type" (ON by default).
+            // Applied BEFORE prefetch so a wrong-source candidate is never even
+            // downloaded. See checkStreamTypeCompatibility() for the rules.
+            if (userConfig.matchStreamType) {
+                movieCandidatesToProcess = movieCandidatesToProcess.filter(c => {
+                    const result = checkStreamTypeCompatibility(streamTypeGroup, c.releaseName);
+                    if (!result.compatible) {
+                        const why = result.untagged ? 'no source tag in filename' : `source differs from ${detectedType}`;
+                        console.log(`  📼 [Source Match] Skipping ${c.releaseName} (${why})`);
+                        return false;
+                    }
+                    return true;
+                });
+            }
             await prefetchInBatches(movieCandidatesToProcess);
 
             console.log(`\n[Movie Mode] Initiating 3-Ruler Cross-Matrix Gauntlet...`);
@@ -2051,7 +2174,11 @@ for (const champ of allSurvivingArabic) {
         // ─── ROUTE B: The Top 2 Raw Token Matches ───
             if (userConfig.allowRouteB) {
                 console.log(`\n[Movie Mode] Extracting Route B (Top 2 Raw Matches)...`);
-                const routeBCandidates = filterBaselinesByType(allArabicCandidates.filter(c => c.fetchedText), effectiveTypeGroup).sort((a, b) => b.score - a.score);
+                // 🔥 Route B now honours the same "Match Source Type" toggle as Route A.
+                const routeBCandidates = allArabicCandidates
+                    .filter(c => c.fetchedText)
+                    .filter(c => !userConfig.matchStreamType || checkStreamTypeCompatibility(effectiveTypeGroup, c.releaseName).compatible)
+                    .sort((a, b) => b.score - a.score);
                 let routeBCount = 0;
                 
                 for (const c of routeBCandidates) {
@@ -2149,7 +2276,7 @@ finalOutput = finalOutput.filter(item => item !== null);
             }
 
             // 🔥 Only save to cache if we actually found real winners.
-            if (contentSubs.length > 0) {
+            if (userConfig.useCache && contentSubs.length > 0) {
                 responseCache.set(requestCacheKey, { timestamp: Date.now(), subtitles: finalOutput });
             } else {
                 console.log(`⚠️ Zero winners generated. Skipping cache to allow immediate retries.`);
@@ -2332,7 +2459,7 @@ app.post('/api/login', (req, res) => {
 app.post('/api/update', (req, res) => {
     const { 
         username, password, osKey, subdlKey, subsourceKey, targetLang, panelLang, stripTags, includeStats, removeSdh, maxSubs, engineStrength,
-        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext, matchCut, matchCutDirector, matchCutTheatrical, matchCutExtended
+        useOs, useSubdl, useSubsource, allowRouteA, allowRouteB, allowRouteC, strict4k, autoFetchNext, matchCut, matchCutDirector, matchCutTheatrical, matchCutExtended, matchStreamType, useCache
     } = req.body;
     
     const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?) AND password = ?').get(username, password);
@@ -2343,12 +2470,12 @@ app.post('/api/update', (req, res) => {
             UPDATE users 
             SET osKey = ?, subdlKey = ?, subsourceKey = ?, targetLang = ?, panelLang = ?, stripTags = ?, includeStats = ?, removeSdh = ?, maxSubs = ?, engineStrength = ?,
                 useOs = ?, useSubdl = ?, useSubsource = ?, allowRouteA = ?, allowRouteB = ?, allowRouteC = ?, strict4k = ?, autoFetchNext = ?, matchCut = ?,
-                matchCutDirector = ?, matchCutTheatrical = ?, matchCutExtended = ?
+                matchCutDirector = ?, matchCutTheatrical = ?, matchCutExtended = ?, matchStreamType = ?, useCache = ?
             WHERE LOWER(username) = LOWER(?)
         `).run(
             osKey.trim(), subdlKey ? subdlKey.trim() : "", subsourceKey ? subsourceKey.trim() : "", targetLang || "ar", panelLang || "en", stripTags ? 1 : 0, includeStats ? 1 : 0, removeSdh ? 1 : 0, parseInt(maxSubs), parseInt(engineStrength),
             useOs ? 1 : 0, useSubdl ? 1 : 0, useSubsource ? 1 : 0, allowRouteA ? 1 : 0, allowRouteB ? 1 : 0, allowRouteC ? 1 : 0, strict4k ? 1 : 0, autoFetchNext ? 1 : 0, matchCut ? 1 : 0,
-            matchCutDirector ? 1 : 0, matchCutTheatrical ? 1 : 0, matchCutExtended ? 1 : 0,
+            matchCutDirector ? 1 : 0, matchCutTheatrical ? 1 : 0, matchCutExtended ? 1 : 0, matchStreamType ? 1 : 0, useCache ? 1 : 0,
             username
         );
         
