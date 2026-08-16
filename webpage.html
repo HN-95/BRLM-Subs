@@ -155,9 +155,11 @@
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStripTags"> <span data-i18n="chkTags">Strip Formatting Tags</span> <i class="info-icon">i<span class="tip" data-i18n="tipTags"></span></i></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgRemoveSdh"> <span data-i18n="chkSdh">Remove SDH Elements</span> <i class="info-icon">i<span class="tip" data-i18n="tipSdh"></span></i></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgIncludeStats"> <span data-i18n="chkStats">Include Stats for Nerds</span> <i class="info-icon">i<span class="tip" data-i18n="tipStats"></span></i></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgUseCache"> <span data-i18n="chkCache">Save Downloaded Subtitles to Cache</span> <i class="info-icon">i<span class="tip" data-i18n="tipCache"></span></i></label>
                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgAutoFetchNext"> <span data-i18n="chkAuto">Auto-Download Next Episode</span> <i class="info-icon">i<span class="tip" data-i18n="tipAuto"></span></i></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgStrict4k"> <b data-i18n="chk4k">Strict 4K Shield</b> <i class="info-icon">i<span class="tip" data-i18n="tip4k"></span></i></label>
                 <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgSeparateRemux"> <b data-i18n="chkRemux">Separate Remux from BluRay</b> <i class="info-icon">i<span class="tip" data-i18n="tipRemux"></span></i></label>
+                <label class="check-label" style="margin-bottom:8px;"><input type="checkbox" id="cfgMatchStreamType"> <b data-i18n="chkStreamType">Match Results With Content's Source</b> <i class="info-icon">i<span class="tip" data-i18n="tipStreamType"></span></i></label>
                 <label class="check-label"><input type="checkbox" id="cfgMatchCut" onchange="toggleCutPanel(this.checked, true)"> <b data-i18n="chkMatchCut">Match Subtitles With Movie's Cut</b> <i class="info-icon">i<span class="tip" data-i18n="tipMatchCut"></span></i></label>
 
                 <div class="cut-panel" id="cutPanel">
@@ -230,6 +232,10 @@
                     tip4k: "For 4K files, refuse to fall back to 1080p reference tracks. Safer sync, but often returns nothing. Usually best left OFF.",
                     tipRemux: "Treats REMUX and regular BluRay as different sources. REMUX is an exact disc copy, BluRay rips are re-encoded and can differ in timing.",
                     tipMatchCut: "Only accept subtitles matching your movie's edition. Pick which cuts to enforce in the panel that appears.",
+                    chkStreamType: "Match Results With Content's Source",
+                    chkCache: "Save Downloaded Subtitles to Cache",
+                    tipCache: "Remembers results for 2 hours so replaying the same episode is instant and costs no API quota. Turn OFF to force a fresh search every single time — slower and uses more of your API quota, but useful if a provider just added a better subtitle you want picked up immediately.",
+                    tipStreamType: "Only return subtitles made for the same source as your file (WEB-DL, BluRay, HDTV, DVD). Different sources can have different timing, so this prevents out-of-sync results.",
                     tipMax: "How many subtitle options to return. Higher gives more choice but a longer list to scroll.",
                     tipStrict: "How closely a subtitle must sync to pass. 0 = accept anything, 3 = balanced, 5 = only near-perfect matches."
                 },
@@ -261,6 +267,10 @@
                     tip4k: "لملفات 4K، رفض الرجوع إلى مراجع 1080p. مزامنة أأمن لكنه غالباً لا يُرجع نتائج. يُفضّل إبقاؤه متوقفاً.",
                     tipRemux: "يعامل REMUX و BluRay العادي كمصدرين مختلفين. الـ REMUX نسخة طبق الأصل من القرص، أما نسخ BluRay فمُعاد ترميزها وقد تختلف في التوقيت.",
                     tipMatchCut: "قبول الترجمات المطابقة لنسخة الفيلم فقط. اختر النسخ المطلوب تدقيقها من اللوحة التي تظهر.",
+                    chkStreamType: "مطابقة النتائج مع مصدر الملف",
+                    chkCache: "حفظ الترجمات المحمّلة في الذاكرة المؤقتة",
+                    tipCache: "يحفظ النتائج لمدة ساعتين ليكون تشغيل نفس الحلقة فورياً وبدون استهلاك حصة الـ API. أوقفه لإجبار بحث جديد في كل مرة — أبطأ ويستهلك حصة أكبر، لكنه مفيد إذا أضاف أحد المصادر ترجمة أفضل وتريد الحصول عليها فوراً.",
+                    tipStreamType: "إرجاع الترجمات المصنوعة لنفس مصدر ملفك فقط (WEB-DL أو BluRay أو HDTV أو DVD). المصادر المختلفة قد تختلف في التوقيت، وهذا يمنع النتائج غير المتزامنة. الدقة لا تؤثر — نسختا 4K و1080p من نفس المصدر لهما نفس التوقيت. الملفات التي لا تذكر المصدر تُقبل لكن تُوسم بأنها غير مؤكدة. يُنصح بتفعيله.",
                     tipMax: "عدد خيارات الترجمة التي تُعرض. الأعلى يعطي خيارات أكثر لكن قائمة أطول.",
                     tipStrict: "مدى دقة المزامنة المطلوبة للقبول. 0 = قبول أي شيء، 3 = متوازن، 5 = المطابقات شبه المثالية فقط."
                 }
@@ -454,6 +464,8 @@
                 document.getElementById('cfgStrict4k').checked = user.strict4k === 1;
                 document.getElementById('cfgSeparateRemux').checked = user.separateRemux === 1;
                 document.getElementById('cfgMatchCut').checked = user.matchCut === 1;
+                document.getElementById('cfgMatchStreamType').checked = user.matchStreamType !== 0;
+                document.getElementById('cfgUseCache').checked = user.useCache !== 0;
                 document.getElementById('chipDirector').classList.toggle('active', user.matchCutDirector !== 0);
                 document.getElementById('chipTheatrical').classList.toggle('active', user.matchCutTheatrical !== 0);
                 document.getElementById('chipExtended').classList.toggle('active', user.matchCutExtended !== 0);
@@ -476,7 +488,7 @@
                     useOs: document.getElementById('cfgUseOs').checked, useSubdl: document.getElementById('cfgUseSubdl').checked, useSubsource: document.getElementById('cfgUseSubsource').checked,
                     allowRouteA: document.getElementById('cfgAllowRouteA').checked, allowRouteB: document.getElementById('cfgAllowRouteB').checked, allowRouteC: document.getElementById('cfgAllowRouteC').checked,
                     stripTags: document.getElementById('cfgStripTags').checked, includeStats: document.getElementById('cfgIncludeStats').checked, removeSdh: document.getElementById('cfgRemoveSdh').checked,
-                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked, separateRemux: document.getElementById('cfgSeparateRemux').checked, matchCut: document.getElementById('cfgMatchCut').checked,
+                    autoFetchNext: document.getElementById('cfgAutoFetchNext').checked, strict4k: document.getElementById('cfgStrict4k').checked, separateRemux: document.getElementById('cfgSeparateRemux').checked, matchCut: document.getElementById('cfgMatchCut').checked, matchStreamType: document.getElementById('cfgMatchStreamType').checked, useCache: document.getElementById('cfgUseCache').checked,
                     matchCutDirector: document.getElementById('chipDirector').classList.contains('active'),
                     matchCutTheatrical: document.getElementById('chipTheatrical').classList.contains('active'),
                     matchCutExtended: document.getElementById('chipExtended').classList.contains('active'),
