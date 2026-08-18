@@ -118,7 +118,7 @@ try {
 const CONFIG = {
     // ─── BRANDING & IDENTITY ──────────────────────────────────────────────────
     ADDON_NAME: "BRLM Subs", // Changes Stremio Manifest, Watermarks, and Web UI
-    ADDON_VERSION: "1.4.5",
+    ADDON_VERSION: "1.4.6",
 
     // ─── API KEYS ─────────────────────────────────────────────────────────────
    
@@ -1054,17 +1054,34 @@ function stripSdhFromLine(text) {
     return clean;
 }
 
+// 🔥 CUE-LEVEL SDH CLEANER. Some releases wrap a sound description across
+// TWO display lines inside one cue, e.g.  "[HE talks\n   loud]". Cleaning
+// line-by-line can never catch that: neither half contains a matching pair
+// of brackets. So brackets/parens are stripped from the WHOLE cue first
+// (dotAll, so the match can span the newline), and only THEN is the
+// remainder split into lines for the per-line rules (speaker labels,
+// all-caps noise). The [^\[\]] / [^()] character classes keep each match
+// from greedily swallowing text between two separate bracketed groups.
+function stripSdhFromCue(cueText) {
+    if (!cueText) return '';
+    const cue = cueText
+        .replace(/\[[^\[\]]*\]/gs, '')
+        .replace(/\([^()]*\)/gs, '');
+
+    const cleanLines = [];
+    for (const raw of cue.split('\n')) {
+        const cleanL = stripSdhFromLine(raw);
+        if (cleanL.length > 0) cleanLines.push(cleanL);
+    }
+    return cleanLines.join('\n');
+}
+
 function stripSdhAndClean(parsedArray) {
     let cleanArray = [];
     for (const line of parsedArray) {
-        const rawLines = line.text.split('\n');
-        const cleanLines = [];
-        for (const raw of rawLines) {
-            const cleanL = stripSdhFromLine(raw);
-            if (cleanL.length > 0) cleanLines.push(cleanL);
-        }
-        if (cleanLines.length > 0) {
-            cleanArray.push({ ...line, text: cleanLines.join('\n') });
+        const cleanText = stripSdhFromCue(line.text);
+        if (cleanText.length > 0) {
+            cleanArray.push({ ...line, text: cleanText });
         }
     }
     return cleanArray;
@@ -1312,13 +1329,8 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
         // identical SDH treatment, not two independently-maintained cleaners.
         if (userConfig.removeSdh) {
             for (let i = 0; i < parsed.length; i++) {
-                let rawLines = parsed[i].text.split('\n');
-                let cleanLines = [];
-                for (let line of rawLines) {
-                    const cleanL = stripSdhFromLine(line);
-                    if (cleanL.length > 0) cleanLines.push(cleanL);
-                }
-                if (cleanLines.length > 0) cleanParsed.push({ ...parsed[i], text: cleanLines.join('\n') });
+                const cleanText = stripSdhFromCue(parsed[i].text);
+                if (cleanText.length > 0) cleanParsed.push({ ...parsed[i], text: cleanText });
             }
         } else {
             cleanParsed = parsed; // Keep original if stripping is off
