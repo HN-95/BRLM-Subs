@@ -1499,7 +1499,13 @@ async function runSubtitleEngine(args) {
         const maskedKey = `...${activeOsKey.slice(-3)}`;
         
         // 🔥 Pulled 'args.extra?.title' to ensure we never miss metadata
-        const streamName    = args.extra?.filename ?? args.extra?.title ?? args.extra?.name ?? null;
+       // 🔥 BUG FIX: Nuvio PC (and potentially other clients) sends the filename
+// URL-encoded (e.g. "Movie%20Name%202024%20REMUX.mkv") while Stremio and
+// Nuvio Android TV send it already decoded. decodeURIComponent on a string
+// that has no percent-encoded sequences is a no-op, so this is safe for
+// all clients — it only changes behaviour for the Nuvio PC case.
+const rawName = args.extra?.filename ?? args.extra?.title ?? args.extra?.name ?? null;
+const streamName = rawName ? (() => { try { return decodeURIComponent(rawName); } catch { return rawName; } })() : null;
         const idParts       = args.id.split(':');
         const imdbId        = idParts[0].replace('tt', '');
         const season        = idParts[1] ?? null;
