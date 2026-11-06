@@ -309,7 +309,8 @@ const manifest = {
     version: CONFIG.ADDON_VERSION,
     name: CONFIG.ADDON_NAME,
     description: "Perfectly Synced Arabic Subtitles",
-    types: ["movie", "series"],
+    types: ["movie", "series", "anime"],
+    idPrefixes: ["tt", "kitsu"],
     catalogs: [],
     resources: ["subtitles"],
 // 🔥 ADDED CONFIGURATION SUPPORT:
@@ -591,6 +592,236 @@ function formatTime(ms) {
     return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(x).padStart(3,'0')}`;
 }
 
+// 🔥 ASS / SSA (ANIME) SUBTITLE HELPERS
+function isAssSubtitle(text) {
+    if (!text || typeof text !== 'string') return false;
+    return text.includes('[Script Info]') || 
+           text.includes('[V4+ Styles]') || 
+           text.includes('[V4 Styles]') || 
+           text.includes('[Events]') || 
+           /^Dialogue\s*:/m.test(text);
+}
+
+function parseAssTimeToMs(t) {
+    if (!t) return 0;
+    const p = t.trim().split(':');
+    if (p.length !== 3) return 0;
+    const h = parseFloat(p[0]) || 0;
+    const m = parseFloat(p[1]) || 0;
+    const s = parseFloat(p[2]) || 0;
+    return Math.round((h * 3600 + m * 60 + s) * 1000);
+}
+
+function formatAssTime(ms) {
+    if (ms < 0) ms = 0;
+    const csTotal = Math.round(ms / 10);
+    const cs = csTotal % 100;
+    const totalSec = Math.floor(csTotal / 100);
+    const s = totalSec % 60;
+    const totalMin = Math.floor(totalSec / 60);
+    const m = totalMin % 60;
+    const h = Math.floor(totalMin / 60);
+    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+// Extracts pure dialogue text from ASS without formatting tags or headers
+function extractAssDialogueOnly(assText) {
+    if (!assText) return '';
+    const lines = assText.split(/\r?\n/);
+    let formatFields = null;
+    let textIdx = 9;
+    const dialogueTexts = [];
+    
+    for (const line of lines) {
+        if (/^Format\s*:/i.test(line)) {
+            formatFields = line.substring(line.indexOf(':') + 1).split(',').map(s => s.trim().toLowerCase());
+            const tIdx = formatFields.indexOf('text');
+            if (tIdx !== -1) textIdx = tIdx;
+            continue;
+        }
+        if (!/^Dialogue\s*:/i.test(line)) continue;
+        
+        const colonIdx = line.indexOf(':');
+        const rest = line.substring(colonIdx + 1).trimStart();
+        let cursor = 0;
+        const targetParts = (formatFields ? formatFields.length : 10);
+        for (let i = 0; i < targetParts - 1; i++) {
+            const nextComma = rest.indexOf(',', cursor);
+            if (nextComma === -1) break;
+            cursor = nextComma + 1;
+        }
+        const text = rest.substring(cursor);
+        const clean = text.replace(/\{[^}]*\}/g, '').replace(/\\[Nnh]/g, ' ').trim();
+        if (clean) dialogueTexts.push(clean);
+    }
+    return dialogueTexts.join('\n');
+}
+
+// Parses ASS into standard cue objects for synchronization calculation
+function parseAssToCues(assText) {
+    if (!assText) return [];
+    const lines = assText.split(/\r?\n/);
+    let formatFields = null;
+    let startIdx = 1, endIdx = 2, textIdx = 9;
+    const cues = [];
+    let cueId = 1;
+
+    for (const line of lines) {
+        if (/^Format\s*:/i.test(line)) {
+            formatFields = line.substring(line.indexOf(':') + 1).split(',').map(s => s.trim().toLowerCase());
+            const sIdx = formatFields.indexOf('start');
+            const eIdx = formatFields.indexOf('end');
+            const tIdx = formatFields.indexOf('text');
+            if (sIdx !== -1) startIdx = sIdx;
+            if (eIdx !== -1) endIdx = eIdx;
+            if (tIdx !== -1) textIdx = tIdx;
+            continue;
+        }
+        if (!/^Dialogue\s*:/i.test(line)) continue;
+        
+        const colonIdx = line.indexOf(':');
+        const rest = line.substring(colonIdx + 1).trimStart();
+        const parts = [];
+        let cursor = 0;
+        const targetParts = (formatFields ? formatFields.length : 10);
+        for (let i = 0; i < targetParts - 1; i++) {
+            const nextComma = rest.indexOf(',', cursor);
+            if (nextComma === -1) break;
+            parts.push(rest.substring(cursor, nextComma));
+            cursor = nextComma + 1;
+        }
+        parts.push(rest.substring(cursor));
+        
+        if (parts.length > Math.max(startIdx, endIdx)) {
+            const startMs = parseAssTimeToMs(parts[startIdx]);
+            const endMs = parseAssTimeToMs(parts[endIdx]);
+            const startSeconds = startMs / 1000;
+            const endSeconds = endMs / 1000;
+            const rawText = parts[textIdx] || '';
+            const cleanText = rawText.replace(/\{[^}]*\}/g, '').replace(/\\[Nnh]/g, '\n').trim();
+            cues.push({
+                id: String(cueId++),
+                startTime: formatTime(startMs),
+                startSeconds,
+                endTime: formatTime(endMs),
+                endSeconds,
+                text: cleanText || rawText
+            });
+        }
+    }
+    return cues;
+}
+
+// Shifts and optionally FPS-scales ASS dialogue timestamps directly in place
+function scaleAndShiftAssText(assText, ratio = 1, offsetMs = 0) {
+    if (ratio === 1 && Math.abs(offsetMs) <= CONFIG.MIN_ACCEPTABLE_DELAY_MS) return assText;
+    const lines = assText.split(/\r?\n/);
+    let formatFields = null;
+    let startIdx = 1, endIdx = 2;
+    const shouldShift = Math.abs(offsetMs) > CONFIG.MIN_ACCEPTABLE_DELAY_MS;
+    
+    const newLines = lines.map(line => {
+        if (/^Format\s*:/i.test(line)) {
+            formatFields = line.substring(line.indexOf(':') + 1).split(',').map(s => s.trim().toLowerCase());
+            const sIdx = formatFields.indexOf('start');
+            const eIdx = formatFields.indexOf('end');
+            if (sIdx !== -1) startIdx = sIdx;
+            if (eIdx !== -1) endIdx = eIdx;
+            return line;
+        }
+        if (!/^Dialogue\s*:/i.test(line)) return line;
+        
+        const colonIdx = line.indexOf(':');
+        const prefix = line.substring(0, colonIdx + 1) + ' ';
+        const rest = line.substring(colonIdx + 1).trimStart();
+        const parts = [];
+        let cursor = 0;
+        const targetParts = (formatFields ? formatFields.length : 10);
+        for (let i = 0; i < targetParts - 1; i++) {
+            const nextComma = rest.indexOf(',', cursor);
+            if (nextComma === -1) break;
+            parts.push(rest.substring(cursor, nextComma));
+            cursor = nextComma + 1;
+        }
+        parts.push(rest.substring(cursor));
+        
+        if (parts.length > Math.max(startIdx, endIdx)) {
+            let startMs = parseAssTimeToMs(parts[startIdx]);
+            let endMs = parseAssTimeToMs(parts[endIdx]);
+            if (ratio !== 1) {
+                startMs = Math.round(startMs * ratio);
+                endMs = Math.round(endMs * ratio);
+            }
+            if (shouldShift) {
+                startMs = Math.max(0, startMs - offsetMs);
+                endMs = Math.max(0, endMs - offsetMs);
+            }
+            parts[startIdx] = formatAssTime(startMs);
+            parts[endIdx] = formatAssTime(endMs);
+            return prefix + parts.join(',');
+        }
+        return line;
+    });
+    return newLines.join('\n');
+}
+
+// Injects watermark dialogue cue into ASS [Events] preserving all styles and tags
+function addAssWatermark(assText, watermarkText, durationMs = 5000, startMs = 1000) {
+    if (!assText) return '';
+    const lines = assText.split(/\r?\n/);
+    const startStr = formatAssTime(startMs);
+    const endStr = formatAssTime(startMs + durationMs);
+    const escapedText = watermarkText.replace(/\r?\n/g, '\\N');
+    
+    let eventsFound = false;
+    let insertIndex = -1;
+    let formatFields = ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text'];
+    let defaultStyle = 'Default';
+
+    for (let i = 0; i < lines.length; i++) {
+        const l = lines[i].trim();
+        if (/^\[v4\+?\s*styles\]/i.test(l)) {
+            for (let j = i + 1; j < lines.length; j++) {
+                if (/^\[/i.test(lines[j].trim())) break;
+                if (/^style\s*:/i.test(lines[j])) {
+                    const sName = lines[j].substring(lines[j].indexOf(':') + 1).split(',')[0].trim();
+                    if (sName) { defaultStyle = sName; break; }
+                }
+            }
+        }
+        if (/^\[events\]/i.test(l)) {
+            eventsFound = true;
+        } else if (eventsFound && /^format\s*:/i.test(l)) {
+            formatFields = l.substring(l.indexOf(':') + 1).split(',').map(s => s.trim().toLowerCase());
+            insertIndex = i + 1;
+            break;
+        }
+    }
+    
+    if (insertIndex === -1) {
+        if (!eventsFound) {
+            lines.push('[Events]');
+            lines.push('Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text');
+        }
+        insertIndex = lines.length;
+    }
+    
+    const parts = formatFields.map(f => {
+        if (f === 'layer') return '0';
+        if (f === 'start') return startStr;
+        if (f === 'end') return endStr;
+        if (f === 'style') return defaultStyle;
+        if (f === 'name') return '';
+        if (f.startsWith('margin')) return '0';
+        if (f === 'effect') return '';
+        if (f === 'text') return escapedText;
+        return '';
+    });
+    
+    lines.splice(insertIndex, 0, `Dialogue: ${parts.join(',')}`);
+    return lines.join('\n');
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SOURCE 1: OPENSUBTITLES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -816,20 +1047,36 @@ function findEpisodeInArchive(entries, season, episode) {
     const ep = parseInt(episode, 10);
     const s = parseInt(season, 10);
     
+    // Helper to prioritize ASS/SSA anime subtitles with styling over plain SRT
+    const filterPreferred = (matches) => {
+        if (!matches || matches.length === 0) return null;
+        if (matches.length === 1) return matches[0];
+        const assMatch = matches.find(e => {
+            const n = e.entryName.toLowerCase();
+            return n.endsWith('.ass') || n.endsWith('.ssa');
+        });
+        return assMatch || matches[0];
+    };
+
     // 1. Strict Match: S01E02, s1e2, 1x02
     const strictRegex = new RegExp(`s0?${s}[ex]0?${ep}\\b|0?${s}[x]0?${ep}\\b`, 'i');
-    let match = entries.find(e => strictRegex.test(e.entryName));
-    if (match) return match;
+    let matches = entries.filter(e => strictRegex.test(e.entryName));
+    if (matches.length > 0) return filterPreferred(matches);
 
     // 2. Loose Match: E02, Ep02, Episode 2
     const looseRegex = new RegExp(`\\b[e]0?${ep}\\b|\\bep0?${ep}\\b|\\bepisode\\s?0?${ep}\\b`, 'i');
-    match = entries.find(e => looseRegex.test(e.entryName));
-    if (match) return match;
+    matches = entries.filter(e => looseRegex.test(e.entryName));
+    if (matches.length > 0) return filterPreferred(matches);
 
-    // 3. Fallback Match: just the number at the end (02.srt)
-    const numRegex = new RegExp(`\\b0?${ep}\\.srt$`, 'i');
-    match = entries.find(e => numRegex.test(e.entryName));
-    if (match) return match;
+    // 3. Anime style: " - 02 ", " - 02.", "[02]", "_02."
+    const animeRegex = new RegExp(`(?:[\\s\\-_]|^|\\[)0?${ep}(?=[\\s\\-_\\.\\]\\)]|$)`, 'i');
+    matches = entries.filter(e => animeRegex.test(e.entryName));
+    if (matches.length > 0) return filterPreferred(matches);
+
+    // 4. Fallback Match: just the number at the end (02.srt, 02.ass, 02.ssa, 02.vtt)
+    const numRegex = new RegExp(`\\b0?${ep}\\.(srt|ass|ssa|vtt)$`, 'i');
+    matches = entries.filter(e => numRegex.test(e.entryName));
+    if (matches.length > 0) return filterPreferred(matches);
 
     // 🔥 FIX: Only fallback to guessing if there is exactly 1 subtitle in the zip/rar
     if (entries.length === 1) return entries[0];
@@ -848,9 +1095,11 @@ async function getArchiveSrt(url, season = null, episode = null, extraHeaders = 
         const buffer = await res.arrayBuffer();
         const uint8 = new Uint8Array(buffer);
         
-        // 1. Plain Text Check (Some APIs return the raw .srt immediately)
-        const preview = Buffer.from(buffer).toString('utf8', 0, 100);
-        if (preview.includes('1\n') || preview.includes('1\r') || preview.includes('-->')) {
+        // 1. Plain Text Check (Some APIs return the raw .srt or .ass immediately)
+        const preview = Buffer.from(buffer).toString('utf8', 0, 150);
+        if (preview.includes('1\n') || preview.includes('1\r') || preview.includes('-->') ||
+            preview.toLowerCase().includes('[script info]') || preview.toLowerCase().includes('[events]') ||
+            preview.toLowerCase().includes('dialogue:')) {
             return { text: decodeArabicFile(Buffer.from(buffer)) };
         }
         if (preview.includes('<html') || preview.includes('<!DOCTYPE')) return null;
@@ -861,7 +1110,10 @@ async function getArchiveSrt(url, season = null, episode = null, extraHeaders = 
         if (uint8[0] === 0x50 && uint8[1] === 0x4B) {
             const zip = new AdmZip(Buffer.from(buffer));
             entries = zip.getEntries()
-                .filter(e => e.entryName.toLowerCase().endsWith('.srt'))
+                .filter(e => {
+                    const n = e.entryName.toLowerCase();
+                    return n.endsWith('.srt') || n.endsWith('.ass') || n.endsWith('.ssa') || n.endsWith('.vtt');
+                })
                 .map(e => ({ entryName: e.entryName, getData: () => e.getData() }));
         } 
         // 3. MAGIC BYTES: RAR (Starts with Rar! -> 52 61 72 21)
@@ -869,11 +1121,14 @@ async function getArchiveSrt(url, season = null, episode = null, extraHeaders = 
             const extractor = await createExtractorFromData({ data: uint8 });
             const extracted = extractor.extract();
             for (const file of extracted.files) {
-                if (!file.fileHeader.flags.directory && file.fileHeader.name.toLowerCase().endsWith('.srt')) {
-                    entries.push({
-                        entryName: file.fileHeader.name,
-                        getData: () => Buffer.from(file.extraction) // Convert Wasm output back to standard Buffer
-                    });
+                if (!file.fileHeader.flags.directory) {
+                    const n = file.fileHeader.name.toLowerCase();
+                    if (n.endsWith('.srt') || n.endsWith('.ass') || n.endsWith('.ssa') || n.endsWith('.vtt')) {
+                        entries.push({
+                            entryName: file.fileHeader.name,
+                            getData: () => Buffer.from(file.extraction) // Convert Wasm output back to standard Buffer
+                        });
+                    }
                 }
             }
         } else {
@@ -1109,8 +1364,8 @@ function median(arr) {
 
 function isDistinctCut(textA, textB) {
     try {
-        const pA = stripSdhAndClean(srtParser.fromSrt(textA));
-        const pB = stripSdhAndClean(srtParser.fromSrt(textB));
+        const pA = stripSdhAndClean(isAssSubtitle(textA) ? parseAssToCues(textA) : srtParser.fromSrt(textA));
+        const pB = stripSdhAndClean(isAssSubtitle(textB) ? parseAssToCues(textB) : srtParser.fromSrt(textB));
         if (pA.length < 20 || pB.length < 20) return false;
 
         let diffs = [];
@@ -1133,7 +1388,11 @@ function isDistinctCut(textA, textB) {
 
 function getTextSignature(srtText, isArabic = true) {
     if (!srtText) return '';
-    const cleanLines = srtText.split('\n')
+    let textToAnalyze = srtText;
+    if (isAssSubtitle(srtText)) {
+        textToAnalyze = extractAssDialogueOnly(srtText);
+    }
+    const cleanLines = textToAnalyze.split('\n')
         .map(l => l.replace(/<[^>]+>/g, '').replace(/\{[^}]+\}/g, '').trim())
         .filter(l => l && !l.match(/^\d+$/) && !l.includes('-->'));
         
@@ -1154,7 +1413,7 @@ function getTextSignature(srtText, isArabic = true) {
 // the exact same subtitle looks "different" once with SDH lines and once
 // without — and Route B re-pushes it as if it were a new find.
 function getComparableSignature(rawText, isArabic, removeSdh) {
-    if (!removeSdh) return getTextSignature(rawText, isArabic);
+    if (!removeSdh || isAssSubtitle(rawText)) return getTextSignature(rawText, isArabic);
     try {
         const cleanedParsed = stripSdhAndClean(srtParser.fromSrt(rawText));
         return getTextSignature(srtParser.toSrt(cleanedParsed), isArabic);
@@ -1165,35 +1424,44 @@ function getComparableSignature(rawText, isArabic, removeSdh) {
 function computePrecisionShift(englishText, arabicText, label = '', sourceName = 'Unknown', mediaType = 'Unknown', releaseName = 'Unknown', isTV = false, userConfig = {}) {
     if (!englishText || !arabicText) return { passed: false, alignmentPct: 0 };
 
+    const isAss = isAssSubtitle(arabicText);
+
     // 🔥 LEVEL 0: RAW BYPASS (No math, no syncing, just raw pass-through)
     if (userConfig.engineStrength === 0) {
+        if (isAss) {
+            const watermarked = addAssWatermark(arabicText, `{\\an8}{\\b1}{\\c&H995A8A&}[ ${CONFIG.ADDON_NAME} ] By HN95\\N{\\b0}Type: ${mediaType} (Level 0 Bypass)`);
+            return { passed: true, fixedText: watermarked, offsetMs: 0, alignmentPct: 100, driftMs: 0, isAss: true };
+        }
         let parsed = [];
         try { parsed = srtParser.fromSrt(arabicText); } catch(e){ return { passed: false, alignmentPct: 0 }; }
         if (userConfig.removeSdh) parsed = stripSdhAndClean(parsed);
         parsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${mediaType} (Level 0 Bypass)` });
-        return { passed: true, fixedText: srtParser.toSrt(parsed), offsetMs: 0, alignmentPct: 100, driftMs: 0 };
+        return { passed: true, fixedText: srtParser.toSrt(parsed), offsetMs: 0, alignmentPct: 100, driftMs: 0, isAss: false };
     }
 
     const isArabic = userConfig.targetLang === 'ara' || userConfig.targetLang === 'ar';
     
     // 🔥 THE ULTIMATE CONTENT FIREWALL: The Ratio Check (Only runs for Arabic)
     if (isArabic) {
-        const arabicCharCount = (arabicText.match(/[\u0600-\u06FF]/g) || []).length;
-        const latinCharCount = (arabicText.match(/[a-zA-Z]/g) || []).length;
+        // If ASS, check characters from pure dialogue text to avoid style/header false positives
+        const textForRatio = isAss ? extractAssDialogueOnly(arabicText) : arabicText;
+        const arabicCharCount = (textForRatio.match(/[\u0600-\u06FF]/g) || []).length;
+        const latinCharCount = (textForRatio.match(/[a-zA-Z]/g) || []).length;
         if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) {
             console.log(`    ❌ [Blocked] Fake/Corrupted File Detected (Ar: ${arabicCharCount} | Latin: ${latinCharCount}). Trashing.`);
             return { passed: false, alignmentPct: 0 };
         }
     }
 
-let originalArParsed, engParsedClean, arParsedClean;
+    let originalArParsed, engParsedClean, arParsedClean;
     try {
-        const rawEng = srtParser.fromSrt(englishText);
-        originalArParsed = srtParser.fromSrt(arabicText); 
+        const engIsAss = isAssSubtitle(englishText);
+        const rawEng = engIsAss ? parseAssToCues(englishText) : srtParser.fromSrt(englishText);
+        originalArParsed = isAss ? parseAssToCues(arabicText) : srtParser.fromSrt(arabicText); 
         engParsedClean = stripSdhAndClean(rawEng);
         arParsedClean  = stripSdhAndClean(originalArParsed);
     } catch (e) {
-        console.log(`    ❌ [Blocked] ${label} | Malformed/unparseable SRT: ${e.message}`);
+        console.log(`    ❌ [Blocked] ${label} | Malformed/unparseable subtitle: ${e.message}`);
         return { passed: false, alignmentPct: 0 };
     }
 
@@ -1202,15 +1470,15 @@ let originalArParsed, engParsedClean, arParsedClean;
         return { passed: false, alignmentPct: 0 };
     }
 
-const engIndex   = buildEngIndex(engParsedClean);
-   const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
+    const engIndex   = buildEngIndex(engParsedClean);
+    const durationMs = engParsedClean[engParsedClean.length - 1].startSeconds * 1000;
     
     // 🔥 DYNAMIC CHUNKING: 1 chunk for every 10 minutes of runtime (Minimum of 3 chunks for short TV shows)
     const durationMinutes = durationMs / 60000;
     const dynamicChunks = Math.max(3, Math.floor(durationMinutes / 10)); 
     const chunkSizeMs = durationMs / dynamicChunks;
 
-   // 🔥 THE SYNC MEASURE HELPER
+    // 🔥 THE SYNC MEASURE HELPER
     const measureSync = (arLines) => {
         // Use dynamicChunks instead of CONFIG
         const chunks = Array.from({ length: dynamicChunks }, () => []); 
@@ -1235,6 +1503,7 @@ const engIndex   = buildEngIndex(engParsedClean);
 
     let bestMetrics = measureSync(arParsedClean);
     let bestParsed = originalArParsed;
+    let winningRatio = 1;
 
     // 🔥 FPS AUTO-SCALER: Rescue files with bad framerates
     // If it's a decent translation but tearing heavily, test common FPS conversions
@@ -1247,6 +1516,7 @@ const engIndex   = buildEngIndex(engParsedClean);
             // If scaling fixes the tear and bumps the alignment by at least 5%
             if (testMetrics.passed && testMetrics.driftMs < bestMetrics.driftMs && testMetrics.alignmentPct > bestMetrics.alignmentPct + 5) {
                 bestMetrics = testMetrics;
+                winningRatio = ratio;
                 
                 // Apply the winning ratio to the final output payload
                 bestParsed = originalArParsed.map(l => {
@@ -1264,16 +1534,16 @@ const engIndex   = buildEngIndex(engParsedClean);
         }
     }
 
-  let { passed, alignmentPct, driftMs, globalMedian } = bestMetrics;
+    let { passed, alignmentPct, driftMs, globalMedian } = bestMetrics;
     if (!passed) {
         console.log(`    ❌ [Blocked] ${label} | Not enough overlapping timing data to measure sync.`);
         return { passed: false, alignmentPct: 0 };
     }
 
-    const scaleLog = bestParsed !== originalArParsed ? ' [FPS Scaled ⚙️]' : '';
+    const scaleLog = (bestParsed !== originalArParsed || winningRatio !== 1) ? ' [FPS Scaled ⚙️]' : '';
     console.log(`    [Math] ${label} | Align: ${alignmentPct.toFixed(1)}% | Drift: ${driftMs.toFixed(0)}ms${scaleLog}`);
 
-// Penalties linked to CONFIG
+    // Penalties linked to CONFIG
     if (driftMs > CONFIG.PENALTY_SEVERE_MS) alignmentPct -= CONFIG.PENALTY_SEVERE_PCT;
     else if (driftMs > CONFIG.PENALTY_MODERATE_MS) alignmentPct -= CONFIG.PENALTY_MODERATE_PCT;
     else if (driftMs > CONFIG.PENALTY_LIGHT_MS) alignmentPct -= CONFIG.PENALTY_LIGHT_PCT;
@@ -1283,36 +1553,38 @@ const engIndex   = buildEngIndex(engParsedClean);
 
     if (alignmentPct < dynamicMinPct) return { passed: false, alignmentPct };
 
-    let finalParsed = bestParsed;
-    
-    // 🔥 Remove SDH from Arabic text if requested
-    if (userConfig.removeSdh) {
-        finalParsed = stripSdhAndClean(finalParsed);
+    let finalFixedText = '';
+    if (isAss) {
+        // Shift original ASS text preserving all styles, colors, and positioning
+        const shiftedAss = scaleAndShiftAssText(arabicText, winningRatio, globalMedian);
+        finalFixedText = addAssWatermark(shiftedAss, `{\\an8}{\\b1}{\\c&H995A8A&}[ ${CONFIG.ADDON_NAME} ] By HN95\\N{\\b0}Type: ${mediaType} (Route A)`);
+    } else {
+        let finalParsed = bestParsed;
+        
+        // 🔥 Remove SDH from Arabic text if requested
+        if (userConfig.removeSdh) {
+            finalParsed = stripSdhAndClean(finalParsed);
+        }
+
+        // Delay shift linked to CONFIG
+        if (Math.abs(globalMedian) > CONFIG.MIN_ACCEPTABLE_DELAY_MS) {
+            finalParsed = originalArParsed.map(line => ({
+                ...line,
+                startTime: formatTime(Math.max(0, line.startSeconds * 1000 - globalMedian)),
+                endTime:   formatTime(Math.max(0, line.endSeconds   * 1000 - globalMedian))
+            }));
+        }
+
+        finalParsed.unshift({
+            id: "0",
+            startTime: "00:00:01,000",
+            endTime: "00:00:06,000",
+            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${mediaType} (Route A)`
+        });
+        finalFixedText = srtParser.toSrt(finalParsed);
     }
 
-    // Delay shift linked to CONFIG
-    if (Math.abs(globalMedian) > CONFIG.MIN_ACCEPTABLE_DELAY_MS) {
-        finalParsed = originalArParsed.map(line => ({
-            ...line,
-            startTime: formatTime(Math.max(0, line.startSeconds * 1000 - globalMedian)),
-            endTime:   formatTime(Math.max(0, line.endSeconds   * 1000 - globalMedian))
-        }));
-    }
-
-    // Ratings linked to CONFIG
-    let rating = CONFIG.RATINGS.UNRELIABLE.label;
-    if (alignmentPct >= CONFIG.RATINGS.ACCURATE.minPct && driftMs <= CONFIG.RATINGS.ACCURATE.maxDriftMs) rating = CONFIG.RATINGS.ACCURATE.label;
-    else if (alignmentPct >= CONFIG.RATINGS.STABLE.minPct && driftMs <= CONFIG.RATINGS.STABLE.maxDriftMs) rating = CONFIG.RATINGS.STABLE.label;
-    else if (alignmentPct >= CONFIG.RATINGS.POOR.minPct) rating = CONFIG.RATINGS.POOR.label;
-
-   finalParsed.unshift({
-        id: "0",
-        startTime: "00:00:01,000",
-        endTime: "00:00:06,000",
-        text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${mediaType} (Route A)`
-    });
-
-    return { passed: true, fixedText: srtParser.toSrt(finalParsed), offsetMs: globalMedian, alignmentPct, driftMs };
+    return { passed: true, fixedText: finalFixedText, offsetMs: globalMedian, alignmentPct, driftMs, isAss };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1321,22 +1593,8 @@ const engIndex   = buildEngIndex(engParsedClean);
 function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false, releaseTokens = new Set(), userConfig = {}) {
     if (!baselineObj || !baselineObj.text || !baselineObj.candidate) return null;
     try {
-        let parsed = srtParser.fromSrt(baselineObj.text);
-        let cleanParsed = [];
-
-        // 🔥 Conditionally Remove SDH — now uses the SAME shared cleaner as
-        // stripSdhAndClean (used for winners), so baselines and winners get
-        // identical SDH treatment, not two independently-maintained cleaners.
-        if (userConfig.removeSdh) {
-            for (let i = 0; i < parsed.length; i++) {
-                const cleanText = stripSdhFromCue(parsed[i].text);
-                if (cleanText.length > 0) cleanParsed.push({ ...parsed[i], text: cleanText });
-            }
-        } else {
-            cleanParsed = parsed; // Keep original if stripping is off
-        }
-
-        // 🔥 Dynamic Cut Detection (Movies Only)
+        const isAss = isAssSubtitle(baselineObj.text);
+        const ext = isAss ? 'ass' : 'srt';
 
         // 🔥 Dynamic Cut Detection (Movies Only)
         let cutText = "";
@@ -1353,15 +1611,35 @@ function processEnglishRuler(baselineObj, rulerName, detectedType, isTV = false,
             }
         }
 
-        cleanParsed.unshift({
-            id: "0",
-            startTime: "00:00:01,000",
-            endTime: "00:00:06,000",
-            text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>${cutText}`
-        });
-        
-        const fixedText = srtParser.toSrt(cleanParsed);
-        const cacheId = `elite_eng_ruler_${rulerName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}.srt`;
+        let fixedText = '';
+        if (isAss) {
+            const watermarkText = `{\\an8}{\\b1}{\\c&H995A8A&}[ ${CONFIG.ADDON_NAME} ] By HN95\\N{\\b0}${cutText.replace(/\n/g, '\\N')}`;
+            fixedText = addAssWatermark(baselineObj.text, watermarkText);
+        } else {
+            let parsed = srtParser.fromSrt(baselineObj.text);
+            let cleanParsed = [];
+
+            // 🔥 Conditionally Remove SDH
+            if (userConfig.removeSdh) {
+                for (let i = 0; i < parsed.length; i++) {
+                    const cleanText = stripSdhFromCue(parsed[i].text);
+                    if (cleanText.length > 0) cleanParsed.push({ ...parsed[i], text: cleanText });
+                }
+            } else {
+                cleanParsed = parsed; // Keep original if stripping is off
+            }
+
+            cleanParsed.unshift({
+                id: "0",
+                startTime: "00:00:01,000",
+                endTime: "00:00:06,000",
+                text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>${cutText}`
+            });
+            
+            fixedText = srtParser.toSrt(cleanParsed);
+        }
+
+        const cacheId = `elite_eng_ruler_${rulerName.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}.${ext}`;
         subtitleCache.set(cacheId, fixedText);
         
         return {
@@ -1497,13 +1775,40 @@ async function runSubtitleEngine(args) {
         const activeOsKey = userConfig.osKey;
         const stripTags = userConfig.stripTags;
         const maskedKey = `...${activeOsKey.slice(-3)}`;
-        
-        // 🔥 Pulled 'args.extra?.title' to ensure we never miss metadata
-        const streamName    = args.extra?.filename ?? args.extra?.title ?? args.extra?.name ?? null;
+                // 🔥 Log the full args.extra so we can see exactly what Nuvio PC sends
+        // (and any other client) — remove this once the field name is confirmed.
+        console.log(`[DEBUG] args.id=${args.id} | args.extra=${JSON.stringify(args.extra)}`);
+
+        const rawName = args.extra?.filename
+            ?? args.extra?.title
+            ?? args.extra?.name
+            ?? args.extra?.releaseInfo
+            ?? args.extra?.fileTitle
+            ?? args.extra?.stream
+            ?? args.extra?.label
+            ?? null;
+        const streamName = rawName ? (() => { try { return decodeURIComponent(rawName); } catch { return rawName; } })() : null;
         const idParts       = args.id.split(':');
-        const imdbId        = idParts[0].replace('tt', '');
-        const season        = idParts[1] ?? null;
-        const episode       = idParts[2] ?? null;
+        let imdbId        = idParts[0].replace('tt', '');
+        let season        = idParts[1] ?? null;
+        let episode       = idParts[2] ?? null;
+
+        // 🔥 Support Kitsu anime IDs (e.g. kitsu:1234:2)
+        if (args.id.startsWith('kitsu:')) {
+            const kitsuId = idParts[1];
+            episode = idParts[2] ?? '1';
+            season = '1';
+            try {
+                const kRes = await fetchWithTimeout(`https://kitsu.io/api/edge/anime/${kitsuId}/mappings`, { timeout: 4000 });
+                if (kRes && kRes.ok) {
+                    const kData = await kRes.json();
+                    const imdbMap = kData.data?.find(m => m.attributes?.externalSite === 'imdb');
+                    if (imdbMap?.attributes?.externalId) {
+                        imdbId = imdbMap.attributes.externalId.replace('tt', '');
+                    }
+                }
+            } catch (e) {}
+        }
         const videoHash     = args.extra?.videoHash ?? null;
         const releaseTokens = tokeniseRelease(streamName || '');
         const streamTypeGroup = getReleaseTypeGroup(releaseTokens);
@@ -1847,11 +2152,13 @@ if (osRulers.length === 0) {
                 finalTvWinners.push(candidate);
                 cutWinnerTracker[cutName]++; 
 
-               // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
-                const cacheId = `Brlm-subs-[${candidate.alignmentPct.toFixed(0)}]-[${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms]_${Math.floor(Math.random()*10000)}.srt`;
+                // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].[srt|ass]
+                const isAss = candidate.isAss || isAssSubtitle(candidate.fixedText);
+                const ext = isAss ? 'ass' : 'srt';
+                const cacheId = `Brlm-subs-[${candidate.alignmentPct.toFixed(0)}]-[${candidate.offsetMs>0?'+':''}${candidate.offsetMs.toFixed(0)}ms]_${Math.floor(Math.random()*10000)}.${ext}`;
                 
                 let finalSrtText = candidate.fixedText;
-                if (stripTags) {
+                if (stripTags && !isAss) {
                     finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
                 }
                 
@@ -1880,8 +2187,9 @@ let routeBCount = 0;
                 if (routeBCount >= 2) break;
                 
                 if (isTargetArabic) {
-                    const arabicCharCount = (c.fetchedText.match(/[\u0600-\u06FF]/g) || []).length;
-                    const latinCharCount = (c.fetchedText.match(/[a-zA-Z]/g) || []).length;
+                    const textToCheck = isAssSubtitle(c.fetchedText) ? extractAssDialogueOnly(c.fetchedText) : c.fetchedText;
+                    const arabicCharCount = (textToCheck.match(/[\u0600-\u06FF]/g) || []).length;
+                    const latinCharCount = (textToCheck.match(/[a-zA-Z]/g) || []).length;
                     if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
                 }
 
@@ -1895,16 +2203,19 @@ let routeBCount = 0;
 
                 console.log(`  🚀 [Route B] Pushing top match: ${c.releaseName}`);
                 try {
-                    let routeBParsed = srtParser.fromSrt(c.fetchedText);
-                    // 🔥 Route B previously skipped SDH stripping entirely —
-                    // only Route A winners and the English rulers were ever
-                    // cleaned, so "Remove SDH Elements" silently did nothing
-                    // for any Route B result.
-                    if (userConfig.removeSdh) routeBParsed = stripSdhAndClean(routeBParsed);
-                    routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
-                    let finalRouteBText = srtParser.toSrt(routeBParsed);
-                    if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-                    const cacheId = `elite_tv_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                    const isAss = isAssSubtitle(c.fetchedText);
+                    const ext = isAss ? 'ass' : 'srt';
+                    let finalRouteBText = '';
+                    if (isAss) {
+                        finalRouteBText = addAssWatermark(c.fetchedText, `{\\an8}{\\b1}{\\c&H995A8A&}[ ${CONFIG.ADDON_NAME} ] By HN95\\N{\\b0}Type: ${detectedType} (Route B)`);
+                    } else {
+                        let routeBParsed = srtParser.fromSrt(c.fetchedText);
+                        if (userConfig.removeSdh) routeBParsed = stripSdhAndClean(routeBParsed);
+                        routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
+                        finalRouteBText = srtParser.toSrt(routeBParsed);
+                        if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                    }
+                    const cacheId = `elite_tv_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.${ext}`;
                     subtitleCache.set(cacheId, finalRouteBText);
                    finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Top Match${cutUnverifiedNote(c)}]\n[${c.source}] ${c.releaseName}` });
                     routeBCount++;
@@ -2167,12 +2478,14 @@ for (const champ of allSurvivingArabic) {
            }
 // 5. Push the Top Arabic Winners
           for (const champ of topArabic) {
-                // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].srt
-                const cacheId = `Brlm-subs-[${champ.alignmentPct.toFixed(0)}]-[${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms]_${Math.floor(Math.random()*10000)}.srt`;
+                // 🔥 Custom Filename Format: Brlm-subs-[Align]-[Offset]_[TinyID].[srt|ass]
+                const isAss = champ.isAss || isAssSubtitle(champ.fixedText);
+                const ext = isAss ? 'ass' : 'srt';
+                const cacheId = `Brlm-subs-[${champ.alignmentPct.toFixed(0)}]-[${champ.offsetMs>0?'+':''}${champ.offsetMs.toFixed(0)}ms]_${Math.floor(Math.random()*10000)}.${ext}`;
                 
                 // 🔥 NEW: The Tag Vaporizer
                 let finalSrtText = champ.fixedText;
-                if (stripTags) {
+                if (stripTags && !isAss) {
                     finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
                 }
                 
@@ -2197,8 +2510,9 @@ for (const champ of allSurvivingArabic) {
                     if (routeBCount >= 2) break;
                     
                     if (isTargetArabic) {
-                        const arabicCharCount = (c.fetchedText.match(/[\u0600-\u06FF]/g) || []).length;
-                        const latinCharCount = (c.fetchedText.match(/[a-zA-Z]/g) || []).length;
+                        const textToCheck = isAssSubtitle(c.fetchedText) ? extractAssDialogueOnly(c.fetchedText) : c.fetchedText;
+                        const arabicCharCount = (textToCheck.match(/[\u0600-\u06FF]/g) || []).length;
+                        const latinCharCount = (textToCheck.match(/[a-zA-Z]/g) || []).length;
                         if (arabicCharCount < CONFIG.Min_Arabic_Letters || latinCharCount > arabicCharCount) continue;
                     }
 
@@ -2212,13 +2526,20 @@ for (const champ of allSurvivingArabic) {
 
                     console.log(`  🚀 [Route B] Pushing top match: ${c.releaseName}`);
                     try {
-                       let routeBParsed = srtParser.fromSrt(c.fetchedText);
-                        // 🔥 Route B previously skipped SDH stripping entirely (see TV-mode note).
-                        if (userConfig.removeSdh) routeBParsed = stripSdhAndClean(routeBParsed);
-                        routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
-                        let finalRouteBText = srtParser.toSrt(routeBParsed);
-                        if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-                        const cacheId = `elite_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.srt`;
+                        const isAss = isAssSubtitle(c.fetchedText);
+                        const ext = isAss ? 'ass' : 'srt';
+                        let finalRouteBText = '';
+                        if (isAss) {
+                            finalRouteBText = addAssWatermark(c.fetchedText, `{\\an8}{\\b1}{\\c&H995A8A&}[ ${CONFIG.ADDON_NAME} ] By HN95\\N{\\b0}Type: ${detectedType} (Route B)`);
+                        } else {
+                            let routeBParsed = srtParser.fromSrt(c.fetchedText);
+                            // 🔥 Route B previously skipped SDH stripping entirely (see TV-mode note).
+                            if (userConfig.removeSdh) routeBParsed = stripSdhAndClean(routeBParsed);
+                            routeBParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:06,000", text: `{\\an8}<font color="#8A5A99"><b>[ ${CONFIG.ADDON_NAME} ] By HN95</b></font>\nType: ${detectedType} (Route B)` });
+                            finalRouteBText = srtParser.toSrt(routeBParsed);
+                            if (stripTags) finalRouteBText = finalRouteBText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+                        }
+                        const cacheId = `elite_ar_RouteB_${Date.now()}_${Math.floor(Math.random()*10000)}.${ext}`;
                         subtitleCache.set(cacheId, finalRouteBText);
                         
                        finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[⚠️ Route B | Raw Match${cutUnverifiedNote(c)}]\n[${c.source}[${c.trackNum}]] ${c.releaseName}` });
@@ -2243,19 +2564,27 @@ finalOutput = finalOutput.filter(item => item !== null);
             // subtitle, plus an on-screen heads-up that it's unverified and
             // which release would work better.
             const routeCDiag = buildNoResultsDiagnostic(diagPool, detectedType, streamTypeGroup, userConfig, isTV);
-            let fallbackParsed;
-            try {
-                fallbackParsed = srtParser.fromSrt(bestFallback.text);
-                // 🔥 Route C previously skipped SDH stripping entirely.
-                if (userConfig.removeSdh) fallbackParsed = stripSdhAndClean(fallbackParsed);
-                fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:09,000", text: `{\\an8}<font color="#ff9500"><b>⚠️ ${CONFIG.ADDON_NAME}: Unverified Match (Route C)</b></font>\n<font color="#ffffff">${routeCDiag.reason}</font>\n<font color="#00ffcc">💡 ${routeCDiag.suggestion}</font>` });
-                bestFallback.text = srtParser.toSrt(fallbackParsed);
-            } catch(e) {}
+            const isAss = isAssSubtitle(bestFallback.text);
+            const ext = isAss ? 'ass' : 'srt';
+            let finalRouteCText = '';
+            if (isAss) {
+                const diagNote = `{\\an8}{\\b1}{\\c&H0095FF&}⚠️ ${CONFIG.ADDON_NAME}: Unverified Match (Route C)\\N{\\c&HFFFFFF&}${routeCDiag.reason}\\N{\\c&HCCFF00&}💡 ${routeCDiag.suggestion}`;
+                finalRouteCText = addAssWatermark(bestFallback.text, diagNote, 9000, 1000);
+            } else {
+                let fallbackParsed;
+                try {
+                    fallbackParsed = srtParser.fromSrt(bestFallback.text);
+                    // 🔥 Route C previously skipped SDH stripping entirely.
+                    if (userConfig.removeSdh) fallbackParsed = stripSdhAndClean(fallbackParsed);
+                    fallbackParsed.unshift({ id: "0", startTime: "00:00:01,000", endTime: "00:00:09,000", text: `{\\an8}<font color="#ff9500"><b>⚠️ ${CONFIG.ADDON_NAME}: Unverified Match (Route C)</b></font>\n<font color="#ffffff">${routeCDiag.reason}</font>\n<font color="#00ffcc">💡 ${routeCDiag.suggestion}</font>` });
+                    bestFallback.text = srtParser.toSrt(fallbackParsed);
+                } catch(e) {}
+                finalRouteCText = bestFallback.text;
+                if (stripTags) finalRouteCText = finalRouteCText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
+            }
 
-            const cacheId = `elite_routeC_${Date.now()}.srt`;
-            let finalSrtText = bestFallback.text;
-            if (stripTags) finalSrtText = finalSrtText.replace(/\{[^}]+\}/g, '').replace(/<[^>]+>/g, '');
-            subtitleCache.set(cacheId, finalSrtText);
+            const cacheId = `elite_routeC_${Date.now()}.${ext}`;
+            subtitleCache.set(cacheId, finalRouteCText);
             finalOutput.push({ id: cacheId, url: `${HOST}/dl/${cacheId}`, lang: outputLang, title: `[🔴 Route C | Unverified — see note at 0:01${cutUnverifiedNote(bestFallback.candidate)}]\n[${bestFallback.candidate.source}] ${bestFallback.candidate.releaseName}` });
         }
 
@@ -2354,7 +2683,7 @@ builder.defineSubtitlesHandler(async (args) => {
         } catch (e) {}
     }
 
-    if (autoFetchNext && args.type === 'series' && args.id) {
+    if (autoFetchNext && (args.type === 'series' || args.type === 'anime') && args.id) {
         // Run completely in the background so we don't block the user's video from loading
         (async () => {
             const parts = args.id.split(':');
@@ -2537,7 +2866,11 @@ app.post('/api/reset', (req, res) => {
 
 app.get('/dl/:cacheId', (req, res) => {
     const subText = subtitleCache.get(req.params.cacheId);
-    if (subText) { res.setHeader('Content-Type', 'text/plain; charset=utf-8'); res.send(subText); } 
+    if (subText) {
+        const isAss = req.params.cacheId.endsWith('.ass') || req.params.cacheId.endsWith('.ssa') || isAssSubtitle(subText);
+        res.setHeader('Content-Type', isAss ? 'text/x-ssa; charset=utf-8' : 'text/plain; charset=utf-8');
+        res.send(subText);
+    } 
     else { res.status(404).send('Subtitle expired or not found.'); }
 });
 app.get('/', (req, res) => {
